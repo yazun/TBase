@@ -387,8 +387,8 @@
 
 
 /* all code written by Tencent Team must be in macro __TBASE__ block*/
-#define __TBASE__ 0
-#define __SUPPORT_DISTRIBUTED_TRANSACTION__ 0
+#define __TBASE__ 1
+#define __SUPPORT_DISTRIBUTED_TRANSACTION__ 1
 //#define __PAGE_TIMESTAMP_LOG__ 0
 //#define __USE_GLOBAL_SNAPSHOT__ 0
 #ifdef __SUPPORT_DISTRIBUTED_TRANSACTION__
@@ -404,11 +404,11 @@
 #define _MLS_ 0
 #define __AUDIT_FGA__
 #define __STORAGE_SCALABLE__ 0
-#define __XLOG__ 0
-#define __COLD_HOT__ 0
+#define __XLOG__ 1
+#define __COLD_HOT__ 1
 #define __SUBSCRIPTION__ 0
 #define _PUB_SUB_RELIABLE_ 0
-#define __TWO_PHASE_TRANS__ 0
+#define __TWO_PHASE_TRANS__ 1
 //#define __TWO_PHASE_TESTS__ 0
 /* MAX NODES NUMBER of the cluster */
 #define     MAX_NODES_NUMBER             4096
