@@ -5106,8 +5106,8 @@ send_fd_with_nodeid(char *sqname, int nodeid, int consumerIdx)
     if (fd < 0)
     {
         ereport(LOG,
-                (errmsg("could not connect to convert with cursor \"%s\", pid:%d",
-                        sqname, MyProcPid)));
+                (errmsg("could not connect to convert with cursor \"%s\", pid:%di to node %di",
+                        sqname, MyProcPid, nodeid)));
         return false;
     }
 
