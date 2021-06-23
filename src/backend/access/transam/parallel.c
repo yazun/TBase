@@ -38,7 +38,10 @@
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #ifdef __TBASE__
+#include "catalog/pg_collation.h"
 #include "pgxc/squeue.h"
+#include "utils/formatting.h"
+#include "utils/lsyscache.h"
 #endif
 
 /*
@@ -69,6 +72,7 @@
 #define PARALLEL_KEY_GLOBALXID                UINT64CONST(0xFFFFFFFFFFFF0010)
 #endif
 #define PARALLEL_KEY_ENTRYPOINT                UINT64CONST(0xFFFFFFFFFFFF0009)
+#define PARALLEL_KEY_SESSIONID              UINT64CONST(0xFFFFFFFFFFFF0011)
 
 
 
@@ -205,6 +209,7 @@ InitializeParallelDSM(ParallelContext *pcxt)
 #ifdef __SUPPORT_DISTRIBUTED_TRANSACTION__
     Size        gxidlen = 0;
 #endif
+	Size        sidlen = 0;
     Size        segsize = 0;
     int            i;
     FixedParallelState *fps;
@@ -241,8 +246,10 @@ InitializeParallelDSM(ParallelContext *pcxt)
         gxidlen = EstimateGlobalXidSpace();
         shm_toc_estimate_chunk(&pcxt->estimator, gxidlen);
 #endif
+		sidlen = PGXCSessionId[0] == '\0' ? 0 : strlen(PGXCSessionId) + 1;
+		shm_toc_estimate_chunk(&pcxt->estimator, sidlen);
         /* If you add more chunks here, you probably need to add keys. */
-        shm_toc_estimate_keys(&pcxt->estimator, 7);
+		shm_toc_estimate_keys(&pcxt->estimator, 8);
 
         /* Estimate space need for error queues. */
         StaticAssertStmt(BUFFERALIGN(PARALLEL_ERROR_QUEUE_SIZE) ==
@@ -312,6 +319,7 @@ InitializeParallelDSM(ParallelContext *pcxt)
 #ifdef __SUPPORT_DISTRIBUTED_TRANSACTION__
         char       *gxidspace;
 #endif
+		char       *sidspace;
         char       *error_queue_space;
         char       *entrypointstate;
         Size        lnamelen;
@@ -351,6 +359,10 @@ InitializeParallelDSM(ParallelContext *pcxt)
         SerializeGlobalXid(gxidlen, gxidspace);
         shm_toc_insert(pcxt->toc, PARALLEL_KEY_GLOBALXID, gxidspace);
 #endif
+		/* global session id */
+		sidspace = shm_toc_allocate(pcxt->toc, sidlen);
+		SerializeSessionId(sidlen, sidspace);
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_SESSIONID, sidspace);
 
         /* Allocate space for worker information. */
         pcxt->worker = palloc0(sizeof(ParallelWorkerInfo) * pcxt->nworkers);
@@ -405,8 +417,6 @@ void
 ReinitializeParallelDSM(ParallelContext *pcxt)
 {
     FixedParallelState *fps;
-    char       *error_queue_space;
-    int            i;
 
     /* Wait for any old workers to exit. */
     if (pcxt->nworkers_launched > 0)
@@ -420,18 +430,24 @@ ReinitializeParallelDSM(ParallelContext *pcxt)
     fps = shm_toc_lookup(pcxt->toc, PARALLEL_KEY_FIXED, false);
     fps->last_xlog_end = 0;
 
-    /* Recreate error queues. */
-    error_queue_space =
-        shm_toc_lookup(pcxt->toc, PARALLEL_KEY_ERROR_QUEUE, false);
-    for (i = 0; i < pcxt->nworkers; ++i)
+    /* Recreate error queues (if they exist). */
+    if (pcxt->nworkers > 0)
     {
-        char       *start;
-        shm_mq       *mq;
+        char       *error_queue_space;
+        int                     i;
 
-        start = error_queue_space + i * PARALLEL_ERROR_QUEUE_SIZE;
-        mq = shm_mq_create(start, PARALLEL_ERROR_QUEUE_SIZE);
-        shm_mq_set_receiver(mq, MyProc);
-        pcxt->worker[i].error_mqh = shm_mq_attach(mq, pcxt->seg, NULL);
+		error_queue_space =
+			shm_toc_lookup(pcxt->toc, PARALLEL_KEY_ERROR_QUEUE, false);
+		for (i = 0; i < pcxt->nworkers; ++i)
+		{
+			char	   *start;
+			shm_mq	   *mq;
+
+			start = error_queue_space + i * PARALLEL_ERROR_QUEUE_SIZE;
+			mq = shm_mq_create(start, PARALLEL_ERROR_QUEUE_SIZE);
+			shm_mq_set_receiver(mq, MyProc);
+			pcxt->worker[i].error_mqh = shm_mq_attach(mq, pcxt->seg, NULL);
+		}
     }
 }
 
@@ -978,6 +994,7 @@ ParallelWorkerMain(Datum main_arg)
 #ifdef __SUPPORT_DISTRIBUTED_TRANSACTION__
     char        *gxidspace;
 #endif
+	char       *sidspace;
     StringInfoData msgbuf;
 
     /* Set flag to indicate that we're initializing a parallel worker. */
@@ -1088,6 +1105,14 @@ ParallelWorkerMain(Datum main_arg)
     StartTransactionCommand();
     /* Initialize XL executor. This must be done inside a transaction block. */
     InitMultinodeExecutor(false);
+	/* set PGXCNodeIdentifier for workers */
+	if (PGXCNodeIdentifier == 0)
+	{
+		char *node_name;
+		node_name = str_tolower(PGXCNodeName, strlen(PGXCNodeName), DEFAULT_COLLATION_OID);
+		PGXCNodeIdentifier = get_pgxc_node_id(get_pgxc_nodeoid(node_name));
+		pfree(node_name);
+	}
     CommitTransactionCommand();
 
     /*
@@ -1111,6 +1136,10 @@ ParallelWorkerMain(Datum main_arg)
     StartParallelWorkerGlobalXid(gxidspace);
 #endif
 
+	/* Restore session id */
+	sidspace = shm_toc_lookup(toc, PARALLEL_KEY_SESSIONID, false);
+	StartParallelWorkerSessionId(sidspace);
+	
     /* Restore combo CID state. */
     combocidspace = shm_toc_lookup(toc, PARALLEL_KEY_COMBO_CID, false);
     RestoreComboCIDState(combocidspace);

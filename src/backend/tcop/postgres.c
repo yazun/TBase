@@ -106,6 +106,7 @@
 #include "executor/execParallel.h"
 #include "pgxc/poolutils.h"
 #include "commands/vacuum.h"
+#include "commands/explain_dist.h"
 #endif
 #endif
 
@@ -654,6 +655,7 @@ SocketBackend(StringInfo inBuf)
 #ifdef __TBASE__
         case 'N':
 		case 'U':				/* coord info: coord_pid and top_xid */
+		case 'o':               /* global session id */
 #endif
         case 'M':                /* Command ID */
         case 'g':                /* GXID */
@@ -975,8 +977,8 @@ pg_analyze_and_rewrite_params(RawStmt *parsetree,
  */
 static List *
 pg_rewrite_query(Query *query)
-{// #lizard forgives
-    List       *querytree_list;
+{
+	List	   *querytree_list;
 
     if (Debug_print_parse)
         elog_node_display(LOG, "parse tree", query,
@@ -987,16 +989,16 @@ pg_rewrite_query(Query *query)
 
 #ifdef PGXC
     if (query->commandType == CMD_UTILITY &&
-        IsA(query->utilityStmt, CreateTableAsStmt))
-    {
-        /*
-         * CREATE TABLE AS SELECT and SELECT INTO are rewritten so that the
-         * target table is created first. The SELECT query is then transformed
-         * into an INSERT INTO statement
-         */
-        querytree_list = QueryRewriteCTAS(query);
-    }
-    else
+	    IsA(query->utilityStmt, CreateTableAsStmt))
+	{
+		/*
+		 * CREATE TABLE AS SELECT and SELECT INTO are rewritten so that the
+		 * target table is created first. The SELECT query is then transformed
+		 * into an INSERT INTO statement
+		 */
+		querytree_list = QueryRewriteCTAS(query);
+	}
+	else
 #endif
     if (query->commandType == CMD_UTILITY)
     {
@@ -1647,8 +1649,9 @@ exec_parse_message(const char *query_string,    /* string to execute */
                    const char *stmt_name,    /* name for prepared stmt */
                    Oid *paramTypes, /* parameter types */
                    char **paramTypeNames,    /* parameter type names */
-                   int numParams)    /* number of parameters */
-{// #lizard forgives
+				   int numParams, /* number of parameters */
+				   const char need_rewrite) /* plancache need to be rewritted */
+{
     MemoryContext unnamed_stmt_context = NULL;
     MemoryContext oldcontext;
     List       *parsetree_list;
@@ -1928,11 +1931,11 @@ exec_parse_message(const char *query_string,    /* string to execute */
 #ifdef __TBASE__
         if (use_resowner)
         {
-            StorePreparedStatement(stmt_name, psrc, false, true);
+			StorePreparedStatement(stmt_name, psrc, false, true, need_rewrite);
         }
         else
 #endif
-        StorePreparedStatement(stmt_name, psrc, false, false);
+		StorePreparedStatement(stmt_name, psrc, false, false, need_rewrite);
     }
     else
     {
@@ -1995,8 +1998,9 @@ exec_plan_message(const char *query_string,    /* source of the query */
                   const char *stmt_name,        /* name for prepared stmt */
                   const char *plan_string,        /* encoded plan to execute */
                   char **paramTypeNames,    /* parameter type names */
-                  int numParams)        /* number of parameters */
-{// #lizard forgives
+				  int numParams,		/* number of parameters */
+				  int instrument_options)		/* explain analyze option */
+{
     MemoryContext oldcontext;
     bool        save_log_statement_stats = log_statement_stats;
     char        msec_str[32];
@@ -2091,9 +2095,11 @@ exec_plan_message(const char *query_string,    /* source of the query */
     /*
      * Store the query as a prepared statement.  See above comments.
      */
-    StorePreparedStatement(stmt_name, psrc, false, true);
+	StorePreparedStatement(stmt_name, psrc, false, true, 'N');
 
     SetRemoteSubplan(psrc, plan_string);
+	/* set instrument_options, default 0 */
+	psrc->instrument_options = instrument_options;
 
     MemoryContextSwitchTo(oldcontext);
 
@@ -2151,6 +2157,7 @@ exec_bind_message(StringInfo input_message)
     int16       *pformats = NULL;
     int            numParams;
     int            numRFormats;
+	int         num_epq_tuple;
     int16       *rformats = NULL;
     CachedPlanSource *psrc;
     CachedPlan *cplan;
@@ -2687,6 +2694,31 @@ exec_bind_message(StringInfo input_message)
             rformats[i] = pq_getmsgint(input_message, 2);
     }
 
+	/* Get epq context, only datanodes need them */
+	if (IS_PGXC_DATANODE && (IsConnFromCoord() || IsConnFromDatanode()))
+	{
+        num_epq_tuple = pq_getmsgint(input_message, 2);
+        if (num_epq_tuple > 0)
+        {
+            int			i;
+            
+            portal->epqContext = palloc(sizeof(RemoteEPQContext));
+            portal->epqContext->ntuples = num_epq_tuple;
+            portal->epqContext->tid = palloc(num_epq_tuple * sizeof(ItemPointerData));
+            portal->epqContext->rtidx = palloc(num_epq_tuple * sizeof(int));
+            portal->epqContext->nodeid = palloc(num_epq_tuple * sizeof(uint32));
+            
+            for (i = 0; i < num_epq_tuple; i++)
+            {
+                portal->epqContext->rtidx[i] = pq_getmsgint(input_message, 2);
+                portal->epqContext->tid[i].ip_blkid.bi_hi = pq_getmsgint(input_message, 2);
+                portal->epqContext->tid[i].ip_blkid.bi_lo = pq_getmsgint(input_message, 2);
+                portal->epqContext->tid[i].ip_posid = pq_getmsgint(input_message, 2);
+                portal->epqContext->nodeid[i] = pq_getmsgint(input_message, 4);
+            }
+        }
+	}
+	
     pq_getmsgend(input_message);
 
     /*
@@ -2734,6 +2766,9 @@ exec_bind_message(StringInfo input_message)
                       cplan->stmt_list,
                       cplan);
 
+	/* set instrument before PortalStart, default 0 */
+	portal->up_instrument = psrc->instrument_options;
+	
     /* Done with the snapshot used for parameter I/O and parsing/planning */
     if (snapshot_set)
         PopActiveSnapshot();
@@ -2804,6 +2839,8 @@ exec_execute_message(const char *portal_name, long max_rows)
     bool        execute_is_fetch;
     bool        was_logged = false;
     char        msec_str[32];
+	int         instrument;
+	QueryDesc  *desc;
 
     /* Adjust destination to tell printtup.c what to do */
     dest = whereToSendOutput;
@@ -2971,6 +3008,9 @@ exec_execute_message(const char *portal_name, long max_rows)
         portal->cplan->stmt_list = portal->cplan->stmt_list_backup;
         portal->cplan->stmt_list_backup = NULL;
     }
+	
+	desc = PortalGetQueryDesc(portal);
+	instrument = portal->up_instrument;
 #endif
 
 #ifdef __AUDIT__
@@ -2999,6 +3039,14 @@ exec_execute_message(const char *portal_name, long max_rows)
             CommandCounterIncrement();
         }
 
+#ifdef __TBASE__
+		if (instrument &&
+		    desc != NULL &&
+		    desc->myindex == -1)
+		{
+			SendLocalInstr(desc->planstate);
+		}
+#endif
         /* Send appropriate CommandComplete to client */
         EndCommand(completionTag, dest);
 
@@ -3468,9 +3516,11 @@ finish_xact_command(void)
         MemoryContextStats(TopMemoryContext);
 #endif
 
-        xact_started = false;
-
-    }
+		xact_started = false;
+#ifdef __TBASE__
+        is_txn_has_parallel_ddl = false;
+#endif
+	}
 }
 
 
@@ -5103,61 +5153,66 @@ PostgresMain(int argc, char *argv[],
             AuditProcessResultInfo(false);
         }
 #endif
-        /*
-         * Abort the current transaction in order to recover.
-         */
-        AbortCurrentTransaction();
+		/*
+		 * Abort the current transaction in order to recover.
+		 */
+		AbortCurrentTransaction();
 
-        if (am_walsender)
-            WalSndErrorCleanup();
+		if (am_walsender)
+			WalSndErrorCleanup();
 
-        /*
-         * We can't release replication slots inside AbortTransaction() as we
-         * need to be able to start and abort transactions while having a slot
-         * acquired. But we never need to hold them across top level errors,
-         * so releasing here is fine. There's another cleanup in ProcKill()
-         * ensuring we'll correctly cleanup on FATAL errors as well.
-         */
-        if (MyReplicationSlot != NULL)
-            ReplicationSlotRelease();
+		/*
+		 * We can't release replication slots inside AbortTransaction() as we
+		 * need to be able to start and abort transactions while having a slot
+		 * acquired. But we never need to hold them across top level errors,
+		 * so releasing here is fine. There's another cleanup in ProcKill()
+		 * ensuring we'll correctly cleanup on FATAL errors as well.
+		 */
+		if (MyReplicationSlot != NULL)
+			ReplicationSlotRelease();
 
-        /* We also want to cleanup temporary slots on error. */
-        ReplicationSlotCleanup();
+		/* We also want to cleanup temporary slots on error. */
+		ReplicationSlotCleanup();
 
-        /*
-         * Now return to normal top-level context and clear ErrorContext for
-         * next time.
-         */
-        MemoryContextSwitchTo(TopMemoryContext);
-        FlushErrorState();
+		/*
+		 * Now return to normal top-level context and clear ErrorContext for
+		 * next time.
+		 */
+		MemoryContextSwitchTo(TopMemoryContext);
+		FlushErrorState();
 
-        /*
-         * If we were handling an extended-query-protocol message, initiate
-         * skip till next Sync.  This also causes us not to issue
-         * ReadyForQuery (until we get Sync).
-         */
-        if (doing_extended_query_message)
-            ignore_till_sync = true;
+		/*
+		 * If we were handling an extended-query-protocol message, initiate
+		 * skip till next Sync.  This also causes us not to issue
+		 * ReadyForQuery (until we get Sync).
+		 */
+		if (doing_extended_query_message)
+			ignore_till_sync = true;
 
-        /* We don't have a transaction command open anymore */
-        xact_started = false;
+		/* We don't have a transaction command open anymore */
+		xact_started = false;
 
-        /*
-         * If an error occurred while we were reading a message from the
-         * client, we have potentially lost track of where the previous
-         * message ends and the next one begins.  Even though we have
-         * otherwise recovered from the error, we cannot safely read any more
-         * messages from the client, so there isn't much we can do with the
-         * connection anymore.
-         */
-        if (pq_is_reading_msg())
-            ereport(FATAL,
-                    (errcode(ERRCODE_PROTOCOL_VIOLATION),
-                     errmsg("terminating connection because protocol synchronization was lost")));
+#ifdef __TBASE__
+		/* Clear parallel DDL flag */
+		is_txn_has_parallel_ddl = false;
+#endif
 
-        /* Now we can allow interrupts again */
-        RESUME_INTERRUPTS();
-    }
+		/*
+		 * If an error occurred while we were reading a message from the
+		 * client, we have potentially lost track of where the previous
+		 * message ends and the next one begins.  Even though we have
+		 * otherwise recovered from the error, we cannot safely read any more
+		 * messages from the client, so there isn't much we can do with the
+		 * connection anymore.
+		 */
+		if (pq_is_reading_msg())
+			ereport(FATAL,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("terminating connection because protocol synchronization was lost")));
+
+		/* Now we can allow interrupts again */
+		RESUME_INTERRUPTS();
+	}
 
 #ifdef __TBASE__
     /* for error code contrib */
@@ -5411,6 +5466,7 @@ PostgresMain(int argc, char *argv[],
                     int            numParams;
                     Oid           *paramTypes = NULL;
                     char       **paramTypeNames = NULL;
+					char		need_rewrite = 'N';
 
                     forbidden_in_wal_sender(firstchar);
 
@@ -5430,6 +5486,8 @@ PostgresMain(int argc, char *argv[],
                             paramTypeNames = (char **)palloc(numParams * sizeof(char *));
                             for (i = 0; i < numParams; i++)
                                 paramTypeNames[i] = (char *)pq_getmsgstring(&input_message);
+
+							need_rewrite = pq_getmsgbyte(&input_message);
                         }
                         else
 #endif /* PGXC */
@@ -5441,7 +5499,8 @@ PostgresMain(int argc, char *argv[],
                     pq_getmsgend(&input_message);
 
                     exec_parse_message(query_string, stmt_name,
-                                       paramTypes, paramTypeNames, numParams);
+									   paramTypes, paramTypeNames,
+									   numParams, need_rewrite);
                 }
                 break;
 
@@ -5453,6 +5512,7 @@ PostgresMain(int argc, char *argv[],
                     const char *plan_string;
                     int            numParams;
                     char       **paramTypes = NULL;
+					int         instrument_options = 0;
 
                     /* Set statement_timestamp() */
                     SetCurrentStatementStartTimestamp();
@@ -5469,10 +5529,14 @@ PostgresMain(int argc, char *argv[],
                             paramTypes[i] = (char *)
                                     pq_getmsgstring(&input_message);
                     }
+					
+					instrument_options = pq_getmsgint(&input_message, 4);
+					
                     pq_getmsgend(&input_message);
 
                     exec_plan_message(query_string, stmt_name, plan_string,
-                                      paramTypes, numParams);
+									  paramTypes, numParams,
+									  instrument_options);
                 }
                 break;
 #endif
@@ -5669,6 +5733,13 @@ PostgresMain(int argc, char *argv[],
 					elog(DEBUG5, "Received coord_pid: %d, coord_vxid: %u", coord_pid, coord_vxid);
 				}
 				break;
+			case 'o':       /* session id */
+				{
+					const char *sessionid = pq_getmsgstring(&input_message);
+					pq_getmsgend(&input_message);
+					strncpy((char *) PGXCSessionId, sessionid, NAMEDATALEN);
+				}
+				break;
 #endif
                 /*
                  * 'X' means that the frontend is closing down the socket. EOF
@@ -5743,56 +5814,56 @@ PostgresMain(int argc, char *argv[],
                 SetGlobalTimestamp(gts, SNAPSHOT_COORDINATOR);
                 break;
 #ifdef __SUPPORT_DISTRIBUTED_TRANSACTION__
-            case 'Z':            /* global prepare timestamp */
-                timestamp = (GlobalTimestamp) pq_getmsgint64(&input_message);
-                pq_getmsgend(&input_message);
-            
-                /*
-                 * Set Xact global prepare timestamp 
-                 */
-                if(enable_distri_print)
-                {
-                    elog(LOG, "set global prepare gts " INT64_FORMAT, timestamp);
-                }
-                SetGlobalPrepareTimestamp(timestamp);
-                
-                break;
-            
-            
-            case 'T':            /* global timestamp */
-                timestamp = (GlobalTimestamp) pq_getmsgint64(&input_message);
-                pq_getmsgend(&input_message);
-            
-                /*
-                 * Set Xact global commit timestamp 
-                 */
-                if(enable_distri_print)
-                {
-                    elog(LOG, "set global commit gts " INT64_FORMAT, timestamp);
-                }
-                SetGlobalCommitTimestamp(timestamp);
-                break;
+			case 'Z':			/* global prepare timestamp */
+				timestamp = (GlobalTimestamp) pq_getmsgint64(&input_message);
+				pq_getmsgend(&input_message);
+			
+				/*
+				 * Set Xact global prepare timestamp 
+				 */
+				if(enable_distri_print)
+				{
+					elog(LOG, "set global prepare gts " INT64_FORMAT, timestamp);
+				}
+				SetGlobalPrepareTimestamp(timestamp);
+				
+				break;
 
-            case 'G':   /* Explicit prepared gid */
-                {
-                    const char *gid;
-                    gid = pq_getmsgstring(&input_message);
-                    pq_getmsgend(&input_message);
-                    remotePrepareGID = MemoryContextStrdup(TopMemoryContext, gid);
-                    elog(DEBUG8, "receive remote prepare gid %s", remotePrepareGID);
-                }
-                break;
-            case 'W':    /* Prefinish phase */
-                timestamp = (GlobalTimestamp) pq_getmsgint64(&input_message);
-                pq_getmsgend(&input_message);
-                elog(DEBUG8, "get prefinish timestamp " INT64_FORMAT "for gid %s", timestamp, remotePrepareGID);
-                SetGlobalPrepareTimestamp(timestamp);
-                EndExplicitGlobalPrepare(remotePrepareGID);
-                pfree(remotePrepareGID);
-                remotePrepareGID = NULL;
-                ReadyForCommit(whereToSendOutput);
-                
-                break;
+			case 'T':			/* global timestamp */
+				timestamp = (GlobalTimestamp) pq_getmsgint64(&input_message);
+				pq_getmsgend(&input_message);
+			
+				/*
+				 * Set Xact global commit timestamp 
+				 */
+				if(enable_distri_print)
+				{
+					elog(LOG, "set global commit gts " INT64_FORMAT, timestamp);
+				}
+				SetGlobalCommitTimestamp(timestamp);
+				break;
+
+			case 'G':   /* Explicit prepared gid */
+				{
+					const char *gid;
+					gid = pq_getmsgstring(&input_message);
+					pq_getmsgend(&input_message);
+					remotePrepareGID = MemoryContextStrdup(TopMemoryContext, gid);
+					elog(DEBUG8, "receive remote prepare gid %s", remotePrepareGID);
+				}
+				break;
+
+			case 'W':	/* Prefinish phase */
+				timestamp = (GlobalTimestamp) pq_getmsgint64(&input_message);
+				pq_getmsgend(&input_message);
+				elog(DEBUG8, "get prefinish timestamp " INT64_FORMAT "for gid %s", timestamp, remotePrepareGID);
+				SetGlobalPrepareTimestamp(timestamp);
+				EndExplicitGlobalPrepare(remotePrepareGID);
+				pfree(remotePrepareGID);
+				remotePrepareGID = NULL;
+				ReadyForCommit(whereToSendOutput);
+
+				break;
 
 #endif
             case 't':            /* timestamp */

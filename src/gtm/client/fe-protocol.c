@@ -737,287 +737,368 @@ result->gr_status = GTM_RESULT_ERROR;
             }
 #endif
 
-            /* communication protocol: total data len, pkg number, {pkg_len,pkg_data}, {pkg_len,pkg_data},*/
-            if (gtmpqGetInt(&result->grd_storage_data.len,
-                            sizeof(uint32), conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
+			/* communication protocol: total data len, pkg number, {pkg_len,pkg_data}, {pkg_len,pkg_data},*/
+			if (gtmpqGetInt(&result->grd_storage_data.len,
+							sizeof(uint32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
 
-            /* get loop count */
-            if (gtmpqGetInt(&loop_count,
-                            sizeof(uint32), conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
+			/* get loop count */
+			if (gtmpqGetInt(&loop_count,
+							sizeof(uint32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
 
-            result->grd_storage_data.data = (char *) malloc(result->grd_storage_data.len);
-            data_buf = result->grd_storage_data.data;
-            for (i = 0; i < loop_count; i++)
-            {
-                /* a length of the next send pkg */
-                if (gtmpqGetInt(&data_len, sizeof(int32), conn))
-                {
-                    result->gr_status = GTM_RESULT_ERROR;
-                    break;
-                }
+			result->grd_storage_data.data = (char *) malloc(result->grd_storage_data.len);
+			data_buf = result->grd_storage_data.data;
+			for (i = 0; i < loop_count; i++)
+			{
+				/* a length of the next send pkg */
+				if (gtmpqGetInt(&data_len, sizeof(int32), conn))
+				{
+					result->gr_status = GTM_RESULT_ERROR;
+					break;
+				}
 
-                /* pkg body */
-                if (gtmpqGetnchar(data_buf + offset, data_len, conn))
-                {
-                    result->gr_status = GTM_RESULT_ERROR;
-                    break;
-                }
-                offset += data_len;
-            }
+				/* pkg body */
+				if (gtmpqGetnchar(data_buf + offset, data_len, conn))
+				{
+					result->gr_status = GTM_RESULT_ERROR;
+					break;
+				}
+				offset += data_len;
+			}
 
-            if (result->gr_status != GTM_RESULT_OK)
-            {
-                if (offset != result->grd_storage_data.len)
-                {
-                    abort();
-                }
-            }
-        }
-            break;
+			if (result->gr_status != GTM_RESULT_OK)
+			{
+				if (offset != result->grd_storage_data.len)
+				{
+					abort();
+				}
+			}
+		}
+			break;
 
-        case TXN_FINISH_GID_RESULT:
+		case TXN_FINISH_GID_RESULT:
+		{
+			if (gtmpqGetInt(&result->gr_finish_status,
+							sizeof(uint32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+			break;
+		}
+
+		case MSG_LIST_GTM_STORE_RESULT:
+		{
+			if (gtmpqGetInt64(&result->gtm_status.header.m_identifier, conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			if (gtmpqGetInt(&result->gtm_status.header.m_major_version, sizeof(int32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			if (gtmpqGetInt(&result->gtm_status.header.m_minor_version, sizeof(int32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			if (gtmpqGetInt(&result->gtm_status.header.m_gtm_status, sizeof(int32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			if (gtmpqGetInt64(&result->gtm_status.header.m_next_gts, conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			if (gtmpqGetInt((int32 *) &result->gtm_status.header.m_global_xmin, sizeof(int32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			if (gtmpqGetInt((int32 *) &result->gtm_status.header.m_next_gxid, sizeof(int32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			if (gtmpqGetInt((int32 *) &result->gtm_status.header.m_seq_freelist, sizeof(int32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			if (gtmpqGetInt((int32 *) &result->gtm_status.header.m_txn_freelist, sizeof(int32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			if (gtmpqGetInt64(&result->gtm_status.header.m_lsn, conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+
+			if (gtmpqGetInt64(&result->gtm_status.header.m_last_update_time, conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			if (gtmpqGetInt((int32 *) &result->gtm_status.header.m_crc, sizeof(int32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			if (gtmpqGetInt((int32 *) &result->gtm_status.seq_total, sizeof(int32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			if (gtmpqGetInt((int32 *) &result->gtm_status.seq_used, sizeof(int32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			if (gtmpqGetInt((int32 *) &result->gtm_status.txn_total, sizeof(int32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			if (gtmpqGetInt((int32 *) &result->gtm_status.txn_used, sizeof(int32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+			break;
+		}
+
+		case MSG_LIST_GTM_STORE_SEQ_RESULT:    /* List  gtm running sequence info */
+		{
+			if (conn->result->grd_store_seq.count && conn->result->grd_store_seq.seqs)
+			{
+				free(conn->result->grd_store_seq.seqs);
+				conn->result->grd_store_seq.seqs = NULL;
+				conn->result->grd_store_seq.count = 0;
+			}
+
+			if (gtmpqGetInt(&conn->result->grd_store_seq.count,
+							sizeof(int32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			conn->result->grd_store_seq.seqs =
+					(GTM_StoredSeqInfo *) malloc(sizeof(GTM_StoredSeqInfo) *
+												 conn->result->grd_store_seq.count);
+			for (i = 0; i < conn->result->grd_store_seq.count; i++)
+			{
+				if (gtmpqGetnchar((char *) &conn->result->grd_store_seq.seqs[i], sizeof(GTM_StoredSeqInfo), conn))
+				{
+					result->gr_status = GTM_RESULT_ERROR;
+					break;
+				}
+			}
+			break;
+		}
+
+		case MSG_LIST_GTM_TXN_STORE_RESULT:    /* List  gtm running sequence info */
+		{
+			if (conn->result->grd_store_txn.count && conn->result->grd_store_txn.txns)
+			{
+				free(conn->result->grd_store_txn.txns);
+				conn->result->grd_store_txn.txns = NULL;
+				conn->result->grd_store_txn.count = 0;
+			}
+
+			if (gtmpqGetInt(&conn->result->grd_store_txn.count,
+							sizeof(int32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			conn->result->grd_store_txn.txns =
+					(GTM_StoredTransactionInfo *) malloc(sizeof(GTM_StoredTransactionInfo) *
+														 conn->result->grd_store_txn.count);
+			for (i = 0; i < conn->result->grd_store_txn.count; i++)
+			{
+				if (gtmpqGetnchar((char *) &conn->result->grd_store_txn.txns[i], sizeof(GTM_StoredTransactionInfo),
+								  conn))
+				{
+					result->gr_status = GTM_RESULT_ERROR;
+					break;
+				}
+			}
+			break;
+		}
+
+
+		case MSG_CHECK_GTM_SEQ_STORE_RESULT:    /* Check gtm sequence valid info */
+		{
+			if (conn->result->grd_store_check_seq.count && conn->result->grd_store_check_seq.seqs)
+			{
+				free(conn->result->grd_store_check_seq.seqs);
+				conn->result->grd_store_check_seq.seqs = NULL;
+				conn->result->grd_store_check_seq.count = 0;
+			}
+
+			if (gtmpqGetInt(&conn->result->grd_store_check_seq.count,
+							sizeof(int32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			conn->result->grd_store_check_seq.seqs =
+					(GTMStorageSequneceStatus *) malloc(sizeof(GTMStorageSequneceStatus) *
+														conn->result->grd_store_check_seq.count);
+			for (i = 0; i < conn->result->grd_store_check_seq.count; i++)
+			{
+				if (gtmpqGetnchar((char *) &conn->result->grd_store_check_seq.seqs[i], sizeof(GTMStorageSequneceStatus),
+								  conn))
+				{
+					result->gr_status = GTM_RESULT_ERROR;
+					break;
+				}
+			}
+			break;
+		}
+
+		case MSG_CHECK_GTM_TXN_STORE_RESULT:    /* Check gtm transaction usage info */
+		{
+			if (conn->result->grd_store_check_txn.count && conn->result->grd_store_check_txn.txns)
+			{
+				free(conn->result->grd_store_check_txn.txns);
+				conn->result->grd_store_check_txn.txns = NULL;
+				conn->result->grd_store_check_txn.count = 0;
+			}
+
+			if (gtmpqGetInt(&conn->result->grd_store_check_txn.count,
+							sizeof(int32), conn))
+			{
+				result->gr_status = GTM_RESULT_ERROR;
+				break;
+			}
+
+			conn->result->grd_store_check_txn.txns =
+					(GTMStorageTransactionStatus *) malloc(sizeof(GTMStorageTransactionStatus) *
+														   conn->result->grd_store_check_txn.count);
+			for (i = 0; i < conn->result->grd_store_check_txn.count; i++)
+			{
+				if (gtmpqGetnchar((char *) &conn->result->grd_store_check_txn.txns[i],
+								  sizeof(GTMStorageTransactionStatus), conn))
+				{
+					result->gr_status = GTM_RESULT_ERROR;
+					break;
+				}
+			}
+			break;
+		}
+
+        case MSG_GET_GTM_STATISTICS_RESULT:
         {
-            if (gtmpqGetInt(&result->gr_finish_status,
-                            sizeof(uint32), conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
-            break;
-        }
-
-        case MSG_LIST_GTM_STORE_RESULT:
-        {
-            if (gtmpqGetInt64(&result->gtm_status.header.m_identifier, conn))
+            if (gtmpqGetInt64(&result->gr_resdata.statistic_result.start_time, conn))
             {
                 result->gr_status = GTM_RESULT_ERROR;
                 break;
             }
 
-            if (gtmpqGetInt(&result->gtm_status.header.m_major_version, sizeof(int32), conn))
+            if (gtmpqGetInt64(&result->gr_resdata.statistic_result.end_time, conn))
             {
                 result->gr_status = GTM_RESULT_ERROR;
                 break;
             }
 
-            if (gtmpqGetInt(&result->gtm_status.header.m_minor_version, sizeof(int32), conn))
+            if (gtmpqGetInt(&result->gr_resdata.statistic_result.sequences_remained,
+                              sizeof(int32), conn))
             {
                 result->gr_status = GTM_RESULT_ERROR;
                 break;
             }
 
-            if (gtmpqGetInt(&result->gtm_status.header.m_gtm_status, sizeof(int32), conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
-
-            if (gtmpqGetInt64(&result->gtm_status.header.m_next_gts, conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
-
-            if (gtmpqGetInt((int32 *) &result->gtm_status.header.m_global_xmin, sizeof(int32), conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
-
-            if (gtmpqGetInt((int32 *) &result->gtm_status.header.m_next_gxid, sizeof(int32), conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
-
-            if (gtmpqGetInt((int32 *) &result->gtm_status.header.m_seq_freelist, sizeof(int32), conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
-
-            if (gtmpqGetInt((int32 *) &result->gtm_status.header.m_txn_freelist, sizeof(int32), conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
-
-            if (gtmpqGetInt64(&result->gtm_status.header.m_lsn, conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
-
-
-            if (gtmpqGetInt64(&result->gtm_status.header.m_last_update_time, conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
-
-            if (gtmpqGetInt((int32 *) &result->gtm_status.header.m_crc, sizeof(int32), conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
-
-            if (gtmpqGetInt((int32 *) &result->gtm_status.seq_total, sizeof(int32), conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
-
-            if (gtmpqGetInt((int32 *) &result->gtm_status.seq_used, sizeof(int32), conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
-
-            if (gtmpqGetInt((int32 *) &result->gtm_status.txn_total, sizeof(int32), conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
-
-            if (gtmpqGetInt((int32 *) &result->gtm_status.txn_used, sizeof(int32), conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
-            break;
-        }
-
-        case MSG_LIST_GTM_STORE_SEQ_RESULT:    /* List  gtm running sequence info */
-        {
-            if (conn->result->grd_store_seq.count && conn->result->grd_store_seq.seqs)
-            {
-                free(conn->result->grd_store_seq.seqs);
-                conn->result->grd_store_seq.seqs = NULL;
-                conn->result->grd_store_seq.count = 0;
-            }
-
-            if (gtmpqGetInt(&conn->result->grd_store_seq.count,
+            if (gtmpqGetInt(&result->gr_resdata.statistic_result.txn_remained,
                             sizeof(int32), conn))
             {
                 result->gr_status = GTM_RESULT_ERROR;
                 break;
             }
 
-            conn->result->grd_store_seq.seqs =
-                    (GTM_StoredSeqInfo *) malloc(sizeof(GTM_StoredSeqInfo) *
-                                                 conn->result->grd_store_seq.count);
-            for (i = 0; i < conn->result->grd_store_seq.count; i++)
+            for (i = 0; i < CMD_STATISTICS_TYPE_COUNT; i++)
             {
-                if (gtmpqGetnchar((char *) &conn->result->grd_store_seq.seqs[i], sizeof(GTM_StoredSeqInfo), conn))
+                if (gtmpqGetInt((int32*) &result->gr_resdata.statistic_result.stat_info[i].total_request_times,
+                                sizeof(int32), conn))
+                {
+                    result->gr_status = GTM_RESULT_ERROR;
+                    break;
+                }
+
+                if (gtmpqGetInt((int32*) &result->gr_resdata.statistic_result.stat_info[i].avg_costtime,
+                                sizeof(int32), conn))
+                {
+                    result->gr_status = GTM_RESULT_ERROR;
+                    break;
+                }
+
+                if (gtmpqGetInt((int32*) &result->gr_resdata.statistic_result.stat_info[i].max_costtime,
+                                sizeof(int32), conn))
+                {
+                    result->gr_status = GTM_RESULT_ERROR;
+                    break;
+                }
+
+                if (gtmpqGetInt((int32*) &result->gr_resdata.statistic_result.stat_info[i].min_costtime,
+                                sizeof(int32), conn))
                 {
                     result->gr_status = GTM_RESULT_ERROR;
                     break;
                 }
             }
+
             break;
         }
-
-        case MSG_LIST_GTM_TXN_STORE_RESULT:    /* List  gtm running sequence info */
+	    case MSG_GET_GTM_ERRORLOG_RESULT:
         {
-            if (conn->result->grd_store_txn.count && conn->result->grd_store_txn.txns)
+            result->grd_errlog.len = result->gr_msglen;
+            if (result->gr_msglen == 0)
             {
-                free(conn->result->grd_store_txn.txns);
-                conn->result->grd_store_txn.txns = NULL;
-                conn->result->grd_store_txn.count = 0;
+                break;
             }
 
-            if (gtmpqGetInt(&conn->result->grd_store_txn.count,
-                            sizeof(int32), conn))
+            result->grd_errlog.errlog =
+                    (char *) malloc(result->gr_msglen);
+            if (gtmpqGetnchar((char *) result->grd_errlog.errlog,
+                              result->gr_msglen, conn))
             {
                 result->gr_status = GTM_RESULT_ERROR;
                 break;
             }
-
-            conn->result->grd_store_txn.txns =
-                    (GTM_StoredTransactionInfo *) malloc(sizeof(GTM_StoredTransactionInfo) *
-                                                         conn->result->grd_store_txn.count);
-            for (i = 0; i < conn->result->grd_store_txn.count; i++)
-            {
-                if (gtmpqGetnchar((char *) &conn->result->grd_store_txn.txns[i], sizeof(GTM_StoredTransactionInfo),
-                                  conn))
-                {
-                    result->gr_status = GTM_RESULT_ERROR;
-                    break;
-                }
-            }
             break;
         }
 
-
-        case MSG_CHECK_GTM_SEQ_STORE_RESULT:    /* Check gtm sequence valid info */
-        {
-            if (conn->result->grd_store_check_seq.count && conn->result->grd_store_check_seq.seqs)
-            {
-                free(conn->result->grd_store_check_seq.seqs);
-                conn->result->grd_store_check_seq.seqs = NULL;
-                conn->result->grd_store_check_seq.count = 0;
-            }
-
-            if (gtmpqGetInt(&conn->result->grd_store_check_seq.count,
-                            sizeof(int32), conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
-
-            conn->result->grd_store_check_seq.seqs =
-                    (GTMStorageSequneceStatus *) malloc(sizeof(GTMStorageSequneceStatus) *
-                                                        conn->result->grd_store_check_seq.count);
-            for (i = 0; i < conn->result->grd_store_check_seq.count; i++)
-            {
-                if (gtmpqGetnchar((char *) &conn->result->grd_store_check_seq.seqs[i], sizeof(GTMStorageSequneceStatus),
-                                  conn))
-                {
-                    result->gr_status = GTM_RESULT_ERROR;
-                    break;
-                }
-            }
-            break;
-        }
-
-        case MSG_CHECK_GTM_TXN_STORE_RESULT:    /* Check gtm transaction usage info */
-        {
-            if (conn->result->grd_store_check_txn.count && conn->result->grd_store_check_txn.txns)
-            {
-                free(conn->result->grd_store_check_txn.txns);
-                conn->result->grd_store_check_txn.txns = NULL;
-                conn->result->grd_store_check_txn.count = 0;
-            }
-
-            if (gtmpqGetInt(&conn->result->grd_store_check_txn.count,
-                            sizeof(int32), conn))
-            {
-                result->gr_status = GTM_RESULT_ERROR;
-                break;
-            }
-
-            conn->result->grd_store_check_txn.txns =
-                    (GTMStorageTransactionStatus *) malloc(sizeof(GTMStorageTransactionStatus) *
-                                                           conn->result->grd_store_check_txn.count);
-            for (i = 0; i < conn->result->grd_store_check_txn.count; i++)
-            {
-                if (gtmpqGetnchar((char *) &conn->result->grd_store_check_txn.txns[i],
-                                  sizeof(GTMStorageTransactionStatus), conn))
-                {
-                    result->gr_status = GTM_RESULT_ERROR;
-                    break;
-                }
-            }
-            break;
-        }
 #endif
         case SEQUENCE_LIST_RESULT:
             if (gtmpqGetInt(&result->gr_resdata.grd_seq_list.seq_count,
@@ -1181,9 +1262,11 @@ result->gr_status = GTM_RESULT_ERROR;
 
             break;
 
-        case NODE_LIST_RESULT:
-        {
-            int i;
+		case NODE_LIST_RESULT:
+		{
+			int i;
+            char *buf = NULL;
+            int   buf_size = 8192;
 
             if (gtmpqGetInt(&result->gr_resdata.grd_node_list.num_node, sizeof(int32), conn))
             {
@@ -1191,48 +1274,65 @@ result->gr_status = GTM_RESULT_ERROR;
                 break;
             }
 
-            for (i = 0; i < result->gr_resdata.grd_node_list.num_node; i++)
+            buf = (char *) malloc(buf_size);
+            if (buf == NULL)
             {
-                int size;
-                char buf[8092];
-                GTM_PGXCNodeInfo *data = (GTM_PGXCNodeInfo *) malloc(sizeof(GTM_PGXCNodeInfo));
-
-                if (gtmpqGetInt(&size, sizeof(int32), conn))
-                {
-                    result->gr_status = GTM_RESULT_ERROR;
-                    free(data);
-                    break;
-                }
-                if (size > 8092)
-                {
-                    result->gr_status = GTM_RESULT_ERROR;
-                    printfGTMPQExpBuffer(&conn->errorMessage, "buffer size not large enough for node list data");
-                    free(data);
-                    continue;
-                }
-
-                if (gtmpqGetnchar((char *) &buf, size, conn))
-                {
-                    result->gr_status = GTM_RESULT_ERROR;
-                    free(data);
-                    break;
-                }
-                if (!gtm_deserialize_pgxcnodeinfo(data, buf, size, &conn->errorMessage))
-                {
-                    result->gr_status = GTM_RESULT_ERROR;
-                    free(data);
-                    break;
-                }
-                else
-                {
-                    result->gr_resdata.grd_node_list.nodeinfo[i] = data;
-                }
+                result->gr_status = GTM_RESULT_ERROR;
+                printfGTMPQExpBuffer(&conn->errorMessage, "malloc buffer for node list data failed");
+                break;
             }
 
-            break;
-        }
-        case BARRIER_RESULT:
-            break;
+			for (i = 0; i < result->gr_resdata.grd_node_list.num_node; i++)
+			{
+				int size;
+				GTM_PGXCNodeInfo *data = (GTM_PGXCNodeInfo *) malloc(sizeof(GTM_PGXCNodeInfo));
+
+				if (gtmpqGetInt(&size, sizeof(int32), conn))
+				{
+					result->gr_status = GTM_RESULT_ERROR;
+					free(data);
+					break;
+				}
+
+				if (size > buf_size)
+				{
+                    buf = (char *) realloc(buf, size);
+                    if (buf == NULL)
+                    {
+                        result->gr_status = GTM_RESULT_ERROR;
+                        printfGTMPQExpBuffer(&conn->errorMessage, "realloc buffer for node list data failed");
+                        free(data);
+                        break;
+                    }
+                    buf_size = size;
+				}
+
+				if (gtmpqGetnchar(buf, size, conn))
+				{
+					result->gr_status = GTM_RESULT_ERROR;
+					free(data);
+					break;
+				}
+				if (!gtm_deserialize_pgxcnodeinfo(data, buf, size, &conn->errorMessage))
+				{
+					result->gr_status = GTM_RESULT_ERROR;
+					free(data);
+					break;
+				}
+				else
+				{
+					result->gr_resdata.grd_node_list.nodeinfo[i] = data;
+				}
+			}
+
+			if (buf != NULL)
+            {
+			    free(buf);
+            }
+			break;
+		}
+		case BARRIER_RESULT:
+			break;
 
         case REPORT_XMIN_RESULT:
             if (gtmpqGetnchar((char *) &result->gr_resdata.grd_report_xmin.latest_completed_xid,

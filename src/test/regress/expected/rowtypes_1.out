@@ -398,10 +398,14 @@ UPDATE price
     SET active = true, price = input_prices.price
     FROM unnest(ARRAY[(10, 123.00), (11, 99.99)]::price_input[]) input_prices
     WHERE price_key_from_table(price.*) = price_key_from_input(input_prices.*);
-ERROR:  could not plan this distributed update
-DETAIL:  correlated UPDATE or updating distribution column currently not supported in Postgres-XL.
 select * from price;
-ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ id | active | price  
+----+--------+--------
+  1 | f      |     42
+ 10 | t      | 123.00
+ 11 | t      |  99.99
+(3 rows)
+
 rollback;
 --
 -- Test case derived from bug #9085: check * qualification of composite
@@ -696,7 +700,7 @@ from (values (1,row(1,2)), (1,row(null,null)), (1,null),
 (6 rows)
 
 explain (verbose, costs off)
-with r(a,b) as
+with r(a,b) as materialized
   (values (1,row(1,2)), (1,row(null,null)), (1,null),
           (null,row(1,2)), (null,row(null,null)), (null,null) )
 select r, r is null as isnull, r is not null as isnotnull from r;
@@ -709,7 +713,7 @@ select r, r is null as isnull, r is not null as isnotnull from r;
            Output: "*VALUES*".column1, "*VALUES*".column2
 (5 rows)
 
-with r(a,b) as
+with r(a,b) as materialized
   (values (1,row(1,2)), (1,row(null,null)), (1,null),
           (null,row(1,2)), (null,row(null,null)), (null,null) )
 select r, r is null as isnull, r is not null as isnotnull from r;

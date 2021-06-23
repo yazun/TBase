@@ -71,6 +71,7 @@
 #include "utils/lsyscache.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
+#include "utils/inval.h"
 #include "pgxc/shardmap.h"
 #include "pgxc/pgxc.h"
 #include "pgxc/pgxcnode.h"
@@ -112,7 +113,11 @@
 #include "utils/ruleutils.h"
 #endif
 
+/* 12 month for a year */
+#define COLD_HOT_INTERVAL_YEAR 12
+
 bool g_IsExtension;
+bool enable_cold_hot_router_print;
 extern bool trace_extent;
 
 typedef struct
@@ -767,62 +772,72 @@ static bool SyncShardMapList_Node_DN(void)
         return false;
     }
 
-    self_node_oid = get_pgxc_nodeoid_extend(PGXCNodeName, PGXCMainClusterName);
-    if (InvalidOid == self_node_oid)
-    {
-        elog(LOG, "SyncShardMapList_Node_DN failed to get nodeoid, node:%s", PGXCNodeName);
-        return false;
-    }
-    curr_groupoid = GetGroupOidByNode(self_node_oid);
-    if (InvalidOid == curr_groupoid)
-    {
-        elog(LOG, "SyncShardMapList_Node_DN failed to get groupoid, node:%s, nodeoid:%d", PGXCNodeName, self_node_oid);
-        return false;
-    }            
-    
-    if (is_group_sharding_inited(curr_groupoid))
-    {
-        bms_clear(g_DatanodeShardgroupBitmap);
-        
-        /* If the group sharding has not been inited */
-        if (!g_GroupShardingMgr_DN->used)
-        {
-            g_GroupShardingMgr_DN->members->shardMapStatus = SHMEM_SHRADMAP_STATUS_LOADING;
-            g_GroupShardingMgr_DN->members->group = curr_groupoid;
-            g_GroupShardingMgr_DN->used = true;
-        }
-            
-        shardrel = heap_open(PgxcShardMapRelationId, AccessShareLock);
-        ScanKeyInit(&skey,
-            Anum_pgxc_shard_map_nodegroup,
-            BTEqualStrategyNumber, F_OIDEQ,
-            ObjectIdGetDatum(curr_groupoid));
+	self_node_oid = get_pgxc_nodeoid_extend(PGXCNodeName, PGXCMainClusterName);
+	if (InvalidOid == self_node_oid)
+	{
+		elog(LOG, "SyncShardMapList_Node_DN failed to get nodeoid, node:%s", PGXCNodeName);
+		return false;
+	}
+	curr_groupoid = GetGroupOidByNode(self_node_oid);
+	if (InvalidOid == curr_groupoid)
+	{
+		elog(LOG, "SyncShardMapList_Node_DN failed to get groupoid, node:%s, nodeoid:%d", PGXCNodeName, self_node_oid);
+		return false;
+	}			
+	
+	if (is_group_sharding_inited(curr_groupoid))
+	{
+		bms_clear(g_DatanodeShardgroupBitmap);
+		
+		/* 
+		 * If sharding of the group has not been inited, or this sharding map is in use but 
+		 * store overdue information, possibly caused by group syncing backend crashing right
+		 * before the shmem sync.
+		 */
+		if (!g_GroupShardingMgr_DN->used || curr_groupoid != g_GroupShardingMgr_DN->members->group)
+		{
+			/* 
+			 * Datanodes can only be in one node group, so we save the effort of
+			 * removing entry and skip right into resetting the mgr.
+			 */
+			g_GroupShardingMgr_DN->members->shardMapStatus = SHMEM_SHRADMAP_STATUS_LOADING;
+			SpinLockAcquire(&g_GroupShardingMgr_DN->lock);
+			g_GroupShardingMgr_DN->members->group = curr_groupoid;
+			g_GroupShardingMgr_DN->used = true;
+			SpinLockRelease(&g_GroupShardingMgr_DN->lock);
+		}
+			
+		shardrel = heap_open(PgxcShardMapRelationId, AccessShareLock);
+		ScanKeyInit(&skey,
+			Anum_pgxc_shard_map_nodegroup,
+			BTEqualStrategyNumber, F_OIDEQ,
+			ObjectIdGetDatum(curr_groupoid));
 
-        sysscan = systable_beginscan(shardrel,
-                                  PgxcShardMapGroupIndexId, 
-                                  true,
-                                  NULL, 1, &skey);
-        
-        while(HeapTupleIsValid(oldtup = systable_getnext(sysscan)))
-        {
-            pgxc_shard = (Form_pgxc_shard_map)GETSTRUCT(oldtup);
-            InsertShardMap_DN(pgxc_shard);
+		sysscan = systable_beginscan(shardrel,
+								  PgxcShardMapGroupIndexId, 
+								  true,
+								  NULL, 1, &skey);
+		
+		while(HeapTupleIsValid(oldtup = systable_getnext(sysscan)))
+		{
+			pgxc_shard = (Form_pgxc_shard_map)GETSTRUCT(oldtup);
+			InsertShardMap_DN(pgxc_shard);
 
-            /* 
-             * If node is DN AND pgxc_shard_map tuple's primary copy is itself,
-             * Add this shardid to bitmap.
-             */
-            BuildDatanodeVisibilityMap(pgxc_shard, self_node_oid);
-        }
-        systable_endscan(sysscan);
-        heap_close(shardrel, AccessShareLock);    
-        ShardMapInitDone_DN(curr_groupoid, false);                    
-    }
-    else
-    {
-        elog(LOG, "SyncShardMapList_Node_DN group %d is not inited.", curr_groupoid);
-        return false;
-    }
+			/* 
+			 * If node is DN AND pgxc_shard_map tuple's primary copy is itself,
+			 * Add this shardid to bitmap.
+			 */
+			BuildDatanodeVisibilityMap(pgxc_shard, self_node_oid);
+		}
+		systable_endscan(sysscan);
+		heap_close(shardrel, AccessShareLock);	
+		ShardMapInitDone_DN(curr_groupoid, false);					
+	}
+	else
+	{
+		elog(LOG, "SyncShardMapList_Node_DN group %d is not inited.", curr_groupoid);
+		return false;
+	}
 
     return true;
 }
@@ -874,7 +889,9 @@ static void InsertShardMap_CN(int32 map, Form_pgxc_shard_map record)
             nodeindex = PGXCNodeGetNodeId(record->primarycopy, &node_type);
             if (nodeindex < 0)
             {
-                elog(ERROR, " get node:%u for index failed", record->primarycopy);
+				elog(ERROR,
+					"InsertShardMap_CN get node:%u for index failed",
+					record->primarycopy);
             }
             
             g_GroupShardingMgr->members[map]->shmemshardmap[record->shardgroupid].primarycopy  = record->primarycopy;
@@ -883,7 +900,11 @@ static void InsertShardMap_CN(int32 map, Form_pgxc_shard_map record)
         }
         else
         {
-            elog(ERROR, " invalid pgxc_shard_map record with shardgroupid:%d", record->shardgroupid);
+			elog(ERROR,
+				"invalid pgxc_shard_map record with shardgroupid: %d, map %d "
+				"and shmemNum: %d",
+				record->shardgroupid, map,
+				g_GroupShardingMgr->members[map]->shmemNumShardGroups);
         }        
     }
 }
@@ -903,7 +924,9 @@ static void InsertShardMap_DN(Form_pgxc_shard_map record)
         nodeindex = PGXCNodeGetNodeId(record->primarycopy, &node_type);
         if (nodeindex < 0)
         {
-            elog(ERROR, " get node:%u for index failed", record->primarycopy);
+			elog(ERROR,
+				"InsertShardMap_DN get node:%u for index failed",
+				record->primarycopy);
         }
         
         g_GroupShardingMgr_DN->members->shmemshardmap[record->shardgroupid].primarycopy  = record->primarycopy;
@@ -912,7 +935,10 @@ static void InsertShardMap_DN(Form_pgxc_shard_map record)
     }
     else
     {
-        elog(ERROR, "[InsertShardMap_DN]invalid pgxc_shard_map record with shardgroupid:%d", record->shardgroupid);
+		elog(ERROR,
+			"InsertShardMap_DN has invalid pgxc_shard_map record with shardgroupid: "
+			"%d and shmemNum: %d",
+			record->shardgroupid, g_GroupShardingMgr_DN->members->shmemNumShardGroups);
     }
 }
 
@@ -1028,26 +1054,27 @@ static void ShardMapInitDone_CN(int32 map, Oid group, bool need_lock)
 
 
 static void ShardMapInitDone_DN(Oid group, bool need_lock)
-{// #lizard forgives
-    bool           dup = false;
-    int32           maxNodeIndex = 0;
-    int32          i;
-    int32          j;
-    int32          nodeindex = 0;
-    int32          nodeCnt = 0;
-    ShardMapItemDef item;
+{
+	bool           dup = false;
+	int32		   maxNodeIndex = 0;
+	int32          i;
+	int32          j;
+	int32          nodeindex = 0;
+	int32          nodeCnt = 0;
+	ShardMapItemDef item;
 
-    if(!IS_PGXC_DATANODE)
-    {
-        elog(ERROR, "ShardMapInitDone_DN should only be called in datanode");
-        return;
-    }
-    
-    if(group != g_GroupShardingMgr_DN->members->group)
-    {
-        elog(PANIC, "groupoid %d in mgr is not group %d", g_GroupShardingMgr_DN->members->group, group);
-        return;
-    }
+	if(!IS_PGXC_DATANODE)
+	{
+		elog(ERROR, "ShardMapInitDone_DN should only be called in datanode");
+		return;
+	}
+	
+	if(group != g_GroupShardingMgr_DN->members->group)
+	{
+		/* PANIC here is to reset shmem, although a more elegant way should be provided by ShardMapShmem AM */
+		elog(PANIC, "groupoid %d in mgr is not group %d", g_GroupShardingMgr_DN->members->group, group);
+		return;
+	}
 
     if (need_lock)
     {
@@ -1921,6 +1948,12 @@ void ForceRefreshShardMap(Oid groupoid)
         }
     }
     LWLockRelease(ShardMapLock);
+	
+        /*
+         * Invalidate the relcache after refresh shard map in shmem,
+         * because Relation->rd_locator_info changed.
+         */
+	CacheInvalidateRelcacheAll();
 }
 
 /*
@@ -4558,12 +4591,24 @@ static bool IsTempColdData(Datum secValue, RelationAccessType access, int32 inte
 bool IsHotData(Datum secValue, RelationAccessType access, int32 interval,
                   int step, Datum startValue)
 {
-    //int32 gap;
     Timestamp hotDataTime;    
     
+	if (enable_cold_hot_router_print)
+	{
+		elog(LOG, "IsHotData Check value "INT64_FORMAT" access %d interval %d step %d "INT64_FORMAT,
+		     DatumGetInt64(secValue),
+		     access, interval, step,
+		     DatumGetInt64(startValue));
+	}
+
+
     /* trade temp cold data as cold data. checking is needed if data would satisfy temp_cold_date guc option */
     if (true == IsTempColdData(secValue, access, interval, step, startValue))
     {
+    	if (enable_cold_hot_router_print)
+	    {
+		    elog(LOG, "Return from TempColdData Value: %s", g_TempColdDate ? g_TempColdDate : "(null)");
+	    }
         return false;
     }
 #if 0
@@ -4577,6 +4622,27 @@ bool IsHotData(Datum secValue, RelationAccessType access, int32 interval,
             (errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
              errmsg("timestamp out of range")));
     }
+
+	if (enable_cold_hot_router_print)
+	{
+		elog(LOG,"IsHotData Check hotDateTime "INT64_FORMAT
+				" Manual hot data time "
+				"{ tm_sec:%d tm_min:%d tm_hour:%d tm_mday:%d tm_mon:%d tm_year:%d tm_wday:%d tm_yday:%d"
+				"  tm_isdst:%d tm_gmtoff:%ld tm_zone:%s } ret: %d",
+             (int64)hotDataTime,
+			 g_ManualHotDataTime.tm_sec,
+			 g_ManualHotDataTime.tm_min,
+			 g_ManualHotDataTime.tm_hour,
+			 g_ManualHotDataTime.tm_mday,
+			 g_ManualHotDataTime.tm_mon,
+			 g_ManualHotDataTime.tm_year,
+			 g_ManualHotDataTime.tm_wday,
+			 g_ManualHotDataTime.tm_yday,
+			 g_ManualHotDataTime.tm_isdst,
+			 g_ManualHotDataTime.tm_gmtoff,
+			 g_ManualHotDataTime.tm_zone,
+			 ((Timestamp)secValue >= hotDataTime));
+	}
 
     return ((Timestamp)secValue >= hotDataTime);
 }
@@ -4607,6 +4673,7 @@ List* ShardMapRouter(Oid group, Oid coldgroup, Oid relation, Oid type, Datum dva
     TimestampTz  start_timestamp          = 0;
     Relation                 rel          = NULL;
     Form_pg_partition_interval routerinfo = NULL;    
+	bool         router_log_print         = false;
 
     rel = relation_open(relation, NoLock);
 
@@ -4616,6 +4683,9 @@ List* ShardMapRouter(Oid group, Oid coldgroup, Oid relation, Oid type, Datum dva
     }
 
     relation_close(rel, NoLock);
+
+	router_log_print = (enable_cold_hot_router_print && accessType == RELATION_ACCESS_INSERT &&
+						(RELATION_IS_INTERVAL(rel) || RELATION_IS_CHILD(rel)));
 
     if (g_EnableKeyValue)
     {
@@ -4644,7 +4714,11 @@ List* ShardMapRouter(Oid group, Oid coldgroup, Oid relation, Oid type, Datum dva
         bdualwrite = false;
     }
     
-    
+	if (router_log_print)
+	{
+		elog(LOG, "Group %d coldgroup %d relation %d secAttr %d isSecNull %d dualwrite %d",
+		     group, coldgroup, relation, secAttr, isSecNull, bdualwrite);
+	}
     
     /* get partition stragegy first */
     if (!isSecNull && secAttr != InvalidAttrNumber)
@@ -4658,7 +4732,7 @@ List* ShardMapRouter(Oid group, Oid coldgroup, Oid relation, Oid type, Datum dva
                 partitionStrategy = routerinfo->partinterval_type;
 
                 if (partitionStrategy == IntervalType_Month &&
-                    routerinfo->partinterval_int == 12)
+					routerinfo->partinterval_int == COLD_HOT_INTERVAL_YEAR)
                 {
                     partitionStrategy = IntervalType_Year;
                 }
@@ -4666,7 +4740,17 @@ List* ShardMapRouter(Oid group, Oid coldgroup, Oid relation, Oid type, Datum dva
 
             interval_step = routerinfo->partinterval_int;
             start_timestamp = routerinfo->partstartvalue_ts;
+
+			if (router_log_print)
+			{
+                elog(LOG, "has routerinfo %d", partitionStrategy);
+			}
         }
+		else if (router_log_print)
+        {
+            elog(LOG, "no routerinfo %d", partitionStrategy);
+        }
+
         relation_close(rel, NoLock);
     }
 

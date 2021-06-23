@@ -363,10 +363,7 @@ Datum pg_trsprt_crypt_support_datatype(PG_FUNCTION_ARGS)
  */
 bool mls_check_relation_permission(Oid relid, bool * schema_bound)
 {
-    bool found;
     Oid  parent_oid;
-
-    found = false;
 
     if (!IS_SYSTEM_REL(relid))
     {
@@ -377,20 +374,27 @@ bool mls_check_relation_permission(Oid relid, bool * schema_bound)
         
         parent_oid = mls_get_parent_oid_by_relid(relid);
         
-        found = datamask_check_table_has_datamask(parent_oid);
-        if (true == found)
+        if (datamask_check_table_has_datamask(parent_oid) ||
+		        datamask_check_table_has_datamask(relid))
         {
-            return found;
+            return true;
         }
 
-        found = trsprt_crypt_check_table_has_crypt(parent_oid,  true, schema_bound);
-        if (true == found)
+        if (trsprt_crypt_check_table_has_crypt(parent_oid,  true, schema_bound) ||
+		        trsprt_crypt_check_table_has_crypt(relid,  true, schema_bound))
         {
-            return found;
+            return true;
         }
+
+        if (cls_check_table_has_policy(parent_oid) ||
+                cls_check_table_has_policy(relid))
+        {
+        	return true;
+        }
+
     }
 
-    return found;
+    return false;
 }
 
 bool mls_check_schema_permission(Oid schemaoid)
@@ -429,31 +433,31 @@ bool mls_check_schema_permission(Oid schemaoid)
 bool mls_check_column_permission(Oid relid, int attnum)
 {
     Oid  parent_oid;
-    bool found = false;
 
     if (!IS_SYSTEM_REL(relid))
     {
         parent_oid = mls_get_parent_oid_by_relid(relid);
-        found = dmask_check_table_col_has_dmask(parent_oid, attnum);
-        if (true == found)
+
+        if (dmask_check_table_col_has_dmask(parent_oid, attnum) ||
+		        dmask_check_table_col_has_dmask(relid, attnum))
         {
-            return found;
+            return true;
         }
 
-        found = trsprt_crypt_chk_tbl_col_has_crypt(parent_oid, attnum);
-        if (true == found)
+        if (trsprt_crypt_chk_tbl_col_has_crypt(parent_oid, attnum) ||
+		        trsprt_crypt_chk_tbl_col_has_crypt(relid, attnum))
         {
-            return found;
+            return true;
         }
 
-        found = cls_check_table_col_has_policy(parent_oid, attnum);
-        if (true == found)
+        if (cls_check_table_col_has_policy(parent_oid, attnum) ||
+		        cls_check_table_col_has_policy(relid, attnum))
         {
-            return found;
+            return true;
         }        
     }
 
-    return found;
+    return false;
 
 }
 
@@ -713,6 +717,8 @@ static void* mls_crypt_worker(void * input)
 
     for (;;)
     {
+        bool need_mprotect = false;
+
         if (false == g_crypt_parellel_main_running)
         {
             break;
@@ -743,7 +749,16 @@ static void* mls_crypt_worker(void * input)
         buf_need_encrypt = page_new + BLCKSZ;
 
         /* 2.2 do the encrypt */
+        need_mprotect = enable_buffer_mprotect && !BufferIsLocal(encrypt_element.buf_id);
+        if (need_mprotect)
+        {
+            BufDisableMemoryProtection(buf, false);
+        }
         ret      = rel_crypt_page_encrypting_parellel(encrypt_element.algo_id, buf, buf_need_encrypt, page_new, encrypt_element.cryptkey, workerid);
+        if (need_mprotect)
+        {
+            BufEnableMemoryProtection(buf, false);
+        }
 
         /* 3. put it to crypted queue */
         while (QueueIsFull(crypted_queue))

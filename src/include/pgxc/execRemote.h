@@ -52,6 +52,7 @@
 #endif
 
 #ifdef __TBASE__
+#define RESPONSE_INSTR 13
 #define     UINT32_BITS_NUM              32
 #define     WORD_NUMBER_FOR_NODES      (MAX_NODES_NUMBER / UINT32_BITS_NUM)
 
@@ -86,6 +87,16 @@ typedef enum
     REMOTE_COPY_FILE,        /* Write in file */
     REMOTE_COPY_TUPLESTORE    /* Store data in tuplestore */
 } RemoteCopyType;
+
+/*
+ * Type of remote param from init-plan or subplan
+ */
+typedef enum
+{
+	REMOTE_PARAM_UNUSED,
+	REMOTE_PARAM_INITPLAN,
+	REMOTE_PARAM_SUBPLAN
+} RemoteParamType;
 
 /* Combines results of INSERT statements using multiple values */
 typedef struct CombineTag
@@ -174,6 +185,10 @@ typedef struct ResponseCombiner
     PGXCNodeHandle **conns;        
     int                 ccount;    
     uint64     recv_datarows;
+	
+	/* for remote instrument */
+	HTAB            *recv_instr_htbl;        /* received str hash table for each plan_node_id */
+	bool    remote_parallel_estimated;  /* hint for remote instrument in parallel mode */
 #endif
 }    ResponseCombiner;
 
@@ -408,9 +423,9 @@ extern void set_dbcleanup_callback(xact_callback function, void *paraminfo, int 
 extern void ExecRemoteSubPlanInitializeDSM(RemoteSubplanState *node, ParallelContext *pcxt);
 extern void ExecRemoteQueryInitializeDSM(RemoteQueryState *node, ParallelContext *pcxt);
 extern void ExecRemoteSubPlanInitDSMWorker(RemoteSubplanState *node,
-                                                  shm_toc *toc);
+                                                  ParallelWorkerContext *pwcxt);
 extern void ExecRemoteQueryInitializeDSMWorker(RemoteQueryState *node,
-                                                   shm_toc *toc);
+                                               ParallelWorkerContext *pwcxt);
 
 extern bool ExecRemoteDML(ModifyTableState *mtstate, ItemPointer tupleid, HeapTuple oldtuple,
               TupleTableSlot *slot, TupleTableSlot *planSlot, EState *estate, EPQState *epqstate,
@@ -422,6 +437,7 @@ extern void SetCurrentHandlesReadonly(void);
 extern TupleDesc create_tuple_desc(char *msg_body, size_t len);
 
 extern void ExecFinishRemoteSubplan(RemoteSubplanState *node);
+extern void ExecShutdownRemoteSubplan(RemoteSubplanState *node);
 #endif
 
 #ifdef __SUBSCRIPTION__

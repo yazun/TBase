@@ -66,7 +66,7 @@ int   SQueueSize = 64;
 #ifdef __TBASE__
 extern ProtocolVersion FrontendProtocol;
 
-bool  g_UseDataPump         = false;/* Use data pumb, true default. */
+bool  g_UseDataPump         = true;/* Use data pumb, true default. */
 bool  g_DataPumpDebug       = false;/* enable debug info */
 int32 g_SndThreadNum        = 8;    /* Two sender threads default.  */
 int32 g_SndThreadBufferSize = 16;   /* in Kilo bytes. */
@@ -839,7 +839,9 @@ tryagain:
         int        qsize;   /* Size of one queue */
         int        i;
         char   *heapPtr;
-
+#ifdef __TBASE__
+        SQueueSync *sqsync = NULL;
+#endif
         elog(DEBUG1, "Create a new SQueue %s and format it for %d consumers", sqname, ncons);
 
         /* Initialize the shared queue */
@@ -899,6 +901,13 @@ tryagain:
         heapPtr = (char *) sq;
         /* Skip header */
         heapPtr += SQUEUE_HDR_SIZE(sq->sq_nconsumers);
+
+#ifdef __TBASE__
+		/* Init latch */
+		sqsync = sq->sq_sync;
+        InitSharedLatch(&sqsync->sqs_producer_latch);
+#endif
+
         /* Set up consumer queues */
         for (i = 0; i < sq->sq_nconsumers; i++)
         {
@@ -915,6 +924,7 @@ tryagain:
 #ifdef __TBASE__
             cstate->send_fd = false;
             cstate->cs_done = false;
+            InitSharedLatch(&sqsync->sqs_consumer_sync[i].cs_latch);
 #endif
             heapPtr += qsize;
         }
@@ -977,11 +987,11 @@ tryagain:
             if (old_squeue)
             {
                 LWLockRelease(SQueuesLock);
-                pg_usleep(1000000L);
+				(trycount < 10) ? pg_usleep(10000L) : pg_usleep(1000000L);
                 elog(DEBUG1, "SQueue race condition, give the old producer to "
                         "finish the work and retry again");
                 trycount++;
-                if (trycount >= 10)
+                if (trycount >= 20)
                     elog(ERROR, "Couldn't resolve SQueue race condition after"
                             " %d tries", trycount);
                 goto tryagain;
@@ -9433,3 +9443,9 @@ int PipeLength(PGPipe *pPipe)
 }
 
 #endif
+
+const char *
+SqueueName(SharedQueue sq)
+{
+	return sq->sq_key;
+}

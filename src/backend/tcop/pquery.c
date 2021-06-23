@@ -45,6 +45,7 @@
 #include "optimizer/planner.h"
 #include "executor/execParallel.h"
 #include "commands/defrem.h"
+#include "commands/explain_dist.h"
 #include "commands/vacuum.h"
 #include "postmaster/postmaster.h"
 #include "optimizer/planmain.h"
@@ -53,6 +54,10 @@
 #ifdef __TBASE__
 bool     paramPassDown = false;
 #endif
+
+/* Hooks for plugins to get control in PortalStart */
+PortalStart_hook_type PortalStart_hook = NULL;
+
 /*
  * ActivePortal is the currently executing Portal (the most closely nested,
  * if there are several).
@@ -65,7 +70,8 @@ static void ProcessQuery(PlannedStmt *plan,
              ParamListInfo params,
              QueryEnvironment *queryEnv,
              DestReceiver *dest,
-             char *completionTag);
+			 char *completionTag,
+			 int instrument);
 static void FillPortalStore(Portal portal, bool isTopLevel);
 static uint64 RunFromStore(Portal portal, ScanDirection direction, uint64 count,
              DestReceiver *dest);
@@ -129,6 +135,7 @@ CreateQueryDesc(PlannedStmt *plannedstmt,
 #ifdef __TBASE__
     qd->sender = NULL;
     qd->es_param_exec_vals = NULL;
+	qd->epqContext = NULL;
 #endif
 
     /* not yet executed */
@@ -178,8 +185,9 @@ ProcessQuery(PlannedStmt *plan,
              ParamListInfo params,
              QueryEnvironment *queryEnv,
              DestReceiver *dest,
-             char *completionTag)
-{// #lizard forgives
+			 char *completionTag,
+			 int instrument)
+{
     QueryDesc  *queryDesc;
 
     /*
@@ -190,13 +198,13 @@ ProcessQuery(PlannedStmt *plan,
     {
         queryDesc = CreateQueryDesc(plan, sourceText,
                             InvalidSnapshot, InvalidSnapshot,
-                            dest, params, queryEnv, 0);
+							dest, params, queryEnv, instrument);
     }
     else
 #endif
     queryDesc = CreateQueryDesc(plan, sourceText,
                                 GetActiveSnapshot(), InvalidSnapshot,
-                                dest, params, queryEnv, 0);
+								dest, params, queryEnv, instrument);
 
     /*
      * Call ExecutorStart to prepare the plan for execution
@@ -246,6 +254,13 @@ ProcessQuery(PlannedStmt *plan,
                 break;
         }
     }
+
+#ifdef __TBASE__
+	if (instrument && queryDesc->planstate)
+	{
+		SendLocalInstr(queryDesc->planstate);
+	}
+#endif
 
     /*
      * Now, we close down all the scans and free allocated resources.
@@ -661,6 +676,10 @@ PortalStart(Portal portal, ParamListInfo params,
         {
 #ifdef XCP
             case PORTAL_DISTRIBUTED:
+			{
+				int  i;
+				bool paramNeedPassDown = false;
+				
                 /* No special ability is needed */
                 eflags = 0;
                 /* Must set snapshot before starting executor. */
@@ -680,7 +699,17 @@ PortalStart(Portal portal, ParamListInfo params,
                                             None_Receiver,
                                             params,
                                             NULL,
+#ifdef __TBASE__
+                                            portal->up_instrument);
+#else
                                             0);
+#endif
+				/*
+				 * set information about EvalPlanQual if any, they will be fill in
+				 * estate later after it been created.
+				 */
+				queryDesc->epqContext = portal->epqContext;
+				
                 /*
                  * If parent node have sent down parameters, and at least one
                  * of them is PARAM_EXEC we should avoid "single execution"
@@ -696,10 +725,23 @@ PortalStart(Portal portal, ParamListInfo params,
                  * NB: Check queryDesc->plannedstmt->nParamExec > 0 is incorrect
                  * here since queryDesc->plannedstmt->nParamExec may be used
                  * just to allocate space for them and no actual values passed.
+				 *
+				 * Also, if we are doing EvalPlanQual, we will be rescan soon, which
+				 * is not supported in SharedQueue mode. Force to do it traditionally.
                  */
 #ifdef __TBASE__
-                if (!paramPassDown && queryDesc->plannedstmt->nParamRemote > 0 &&
-                        queryDesc->plannedstmt->remoteparams[queryDesc->plannedstmt->nParamRemote-1].paramkind == PARAM_EXEC)
+                for (i = 0; i < queryDesc->plannedstmt->nParamRemote; i++)
+                {
+                        RemoteParam *rparam = &queryDesc->plannedstmt->remoteparams[i];
+                        if (rparam->paramkind == PARAM_EXEC &&
+                            rparam->paramused != REMOTE_PARAM_INITPLAN) /* if it's from initplan, still work with shared queue */
+                        {
+                                paramNeedPassDown = true;
+                                break;
+                        }
+                }
+
+                if ((!paramPassDown && paramNeedPassDown) || queryDesc->epqContext != NULL)   
 #else
                 if (queryDesc->plannedstmt->nParamRemote > 0 &&
                         queryDesc->plannedstmt->remoteparams[queryDesc->plannedstmt->nParamRemote-1].paramkind == PARAM_EXEC)
@@ -708,7 +750,6 @@ PortalStart(Portal portal, ParamListInfo params,
                     int        *consMap;
                     int         len;
                     ListCell   *lc;
-                    int         i;
                     Locator       *locator;
                     Oid            keytype;
                     DestReceiver *dest;
@@ -766,6 +807,9 @@ PortalStart(Portal portal, ParamListInfo params,
                     RemoteSubplanMakeUnique(
                             (Node *) queryDesc->plannedstmt->planTree,
                             PGXC_PARENT_NODE_ID);
+
+                    elog(DEBUG3, "RemoteSubplanMakeUnique for PARAM_EXEC unique: %d, portal: %s",
+                         PGXC_PARENT_NODE_ID, portal->name);
                     /*
                      * Call ExecutorStart to prepare the plan for execution
                      */
@@ -951,6 +995,7 @@ PortalStart(Portal portal, ParamListInfo params,
                 portal->portalPos = 0;
 
                 PopActiveSnapshot();
+			}
                 break;
 #endif
 
@@ -991,7 +1036,7 @@ PortalStart(Portal portal, ParamListInfo params,
                                                 None_Receiver,
                                                 params,
                                                 portal->queryEnv,
-                                                0);
+                                                portal->up_instrument);
                 }
                 else
 #endif
@@ -1002,9 +1047,18 @@ PortalStart(Portal portal, ParamListInfo params,
                                             None_Receiver,
                                             params,
                                             portal->queryEnv,
+#ifdef __TBASE__
+                                            portal->up_instrument);
+#else
                                             0);
-
+#endif
                 /*
+				 * set information about EvalPlanQual if any, they will be fill in
+				 * estate later after it been created.
+				 */
+				queryDesc->epqContext = portal->epqContext;
+				
+				/*
                  * If it's a scrollable cursor, executor needs to support
                  * REWIND and backwards scan, as well as whatever the caller
                  * might've asked for.
@@ -1055,11 +1109,16 @@ PortalStart(Portal portal, ParamListInfo params,
                  */
                 {
                     PlannedStmt *pstmt;
+					List *list = NIL;
 
                     pstmt = PortalGetPrimaryStmt(portal);
+					if (portal->strategy == PORTAL_ONE_RETURNING &&
+						pstmt->parseTree && pstmt->parseTree->returningList)
+						list = pstmt->parseTree->returningList;
+					else
+						list = pstmt->planTree->targetlist;
                     portal->tupDesc =
-                        ExecCleanTypeFromTL(pstmt->planTree->targetlist,
-                                            false);
+						ExecCleanTypeFromTL(list, false);
                 }
 
                 /*
@@ -1096,6 +1155,9 @@ PortalStart(Portal portal, ParamListInfo params,
                 portal->tupDesc = NULL;
                 break;
         }
+		
+		if (PortalStart_hook)
+			PortalStart_hook(portal);
     }
     PG_CATCH();
     {
@@ -1401,6 +1463,11 @@ PortalRun(Portal portal, long count, bool isTopLevel, bool run_once,
                     SharedQueue        squeue = queryDesc->squeue;
                     int             myindex = queryDesc->myindex;
                     TupleTableSlot *slot;
+
+                    if (squeue == NULL)
+                    {
+                        elog(ERROR, "squeue: %s is null, myindex: %d, atStart: %d, atEnd: %d", portal->name, myindex, portal->atStart, portal->atEnd);
+                    }
 
                     /*
                      * We are the consumer.
@@ -1864,27 +1931,31 @@ PortalRunUtility(Portal portal, PlannedStmt *pstmt,
     GetGtmInfoFromUserCmd(utilityStmt);
 #endif
 
-    /*
-     * Set snapshot if utility stmt needs one.  Most reliable way to do this
-     * seems to be to enumerate those that do not need one; this is a short
-     * list.  Transaction control, LOCK, and SET must *not* set a snapshot
-     * since they need to be executable at the start of a transaction-snapshot
-     * mode transaction without freezing a snapshot.  By extension we allow
-     * SHOW not to set a snapshot.  The other stmts listed are just efficiency
-     * hacks.  Beware of listing anything that can modify the database --- if,
-     * say, it has to update an index with expressions that invoke
-     * user-defined functions, then it had better have a snapshot.
-     */
-    if (!(IsA(utilityStmt, TransactionStmt) ||
-          IsA(utilityStmt, LockStmt) ||
-          IsA(utilityStmt, VariableSetStmt) ||
-          IsA(utilityStmt, VariableShowStmt) ||
-          IsA(utilityStmt, ConstraintsSetStmt) ||
-    /* efficiency hacks from here down */
-          IsA(utilityStmt, FetchStmt) ||
-          IsA(utilityStmt, ListenStmt) ||
-          IsA(utilityStmt, NotifyStmt) ||
-          IsA(utilityStmt, UnlistenStmt) ||
+	/*
+	 * Set snapshot if utility stmt needs one.  Most reliable way to do this
+	 * seems to be to enumerate those that do not need one; this is a short
+	 * list.  Transaction control, LOCK, and SET must *not* set a snapshot
+	 * since they need to be executable at the start of a transaction-snapshot
+	 * mode transaction without freezing a snapshot.  By extension we allow
+	 * SHOW not to set a snapshot.  The other stmts listed are just efficiency
+	 * hacks.  Beware of listing anything that can modify the database --- if,
+	 * say, it has to update an index with expressions that invoke
+	 * user-defined functions, then it had better have a snapshot.
+	 */
+	if (!(IsA(utilityStmt, TransactionStmt) ||
+		  IsA(utilityStmt, LockStmt) ||
+		  IsA(utilityStmt, VariableSetStmt) ||
+		  IsA(utilityStmt, VariableShowStmt) ||
+		  IsA(utilityStmt, ConstraintsSetStmt) ||
+	/* efficiency hacks from here down */
+		  IsA(utilityStmt, FetchStmt) ||
+		  IsA(utilityStmt, ListenStmt) ||
+		  IsA(utilityStmt, NotifyStmt) ||
+		  IsA(utilityStmt, UnlistenStmt) ||
+#ifdef __TBASE__
+		  /* Node Lock/Unlock do not modify any data */
+		  IsA(utilityStmt, LockNodeStmt) ||
+#endif
 #ifdef PGXC
           IsA(utilityStmt, PauseClusterStmt) ||
           IsA(utilityStmt, BarrierStmt) ||
@@ -1894,12 +1965,15 @@ PortalRunUtility(Portal portal, PlannedStmt *pstmt,
 #endif
     {
 #ifdef __SUPPORT_DISTRIBUTED_TRANSACTION__
-        /* Avoid the start timestamp to be too old to execute on DNs */
-        if(IsA(utilityStmt, VacuumStmt) || IsA(utilityStmt, AlterNodeStmt))
+		/* Avoid the start timestamp to be too old to execute on DNs */
+		if(IsA(utilityStmt, VacuumStmt) || IsA(utilityStmt, AlterNodeStmt))
+		{
+			snapshot = GetLocalTransactionSnapshot();
+		}
+		else
         {
-            snapshot = GetLocalTransactionSnapshot();
-        }else
             snapshot = GetTransactionSnapshot();
+        }
 #else
         snapshot = GetTransactionSnapshot();
 #endif
@@ -2051,7 +2125,8 @@ PortalRunMulti(Portal portal,
                              portal->sourceText,
                              portal->portalParams,
                              portal->queryEnv,
-                             dest, completionTag);
+							 dest, completionTag,
+							 portal->up_instrument);
 #ifdef PGXC
                 /* it's special for INSERT */
                 if (IS_PGXC_COORDINATOR &&
@@ -2067,7 +2142,8 @@ PortalRunMulti(Portal portal,
                              portal->sourceText,
                              portal->portalParams,
                              portal->queryEnv,
-                             altdest, NULL);
+							 altdest, NULL,
+							 portal->up_instrument);
             }
 
             if (log_executor_stats)

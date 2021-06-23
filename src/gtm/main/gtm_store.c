@@ -236,8 +236,8 @@ static int32  GTM_StoreSync(char *data, size_t size);
 static int32  GTM_StoreInitSync(char *data, size_t size);
 static bool   GTM_StoreCheckHeaderCRC(void);
 static int32  GTM_StoreGetHeader(GTMControlHeader *header);
-static int32  GTM_StoreGetUsedSeq(void);
-static int32  GTM_StoreGetUsedTxn(void);
+int32  GTM_StoreGetUsedSeq(void);
+int32  GTM_StoreGetUsedTxn(void);
 static bool   GTM_StoreCheckSeqCRC(GTM_StoredSeqInfo *seq);
 static bool   GTM_StoreCheckTxnCRC(GTM_StoredTransactionInfo *txn);
 static bool   GTM_StoreSeqInFreelist(GTM_StoredSeqInfo *seq);
@@ -3117,9 +3117,9 @@ ProcessStorageTransferCommand(Port *myport, StringInfo message)
     g_GTM_Backup_Timer =  GTM_AddTimer(LockStoreStandbyCrashHandler, GTM_TIMER_TYPE_ONCE, LOCK_STORE_CRASH_HANDL_TIMEOUT, GetMyThreadInfo);
     if(g_GTM_Backup_Timer == INVALID_TIMER_HANDLE)
     {
+        GTM_RWLockRelease(&g_GTM_Backup_Timer_Lock);
         elog(ERROR, "Failed to register lock store crash handler, will exit!");
-        exit(1);
-    }   
+    }
     GTM_RWLockRelease(&g_GTM_Backup_Timer_Lock);
 
     /* send xlog replication relative data */

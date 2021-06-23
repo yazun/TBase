@@ -201,7 +201,8 @@ PrepareQuery(PrepareStmt *stmt, const char *queryString,
     StorePreparedStatement(stmt->name,
                            plansource,
                            true,
-                           false);
+						   false,
+						   'N');
 }
 
 /*
@@ -584,45 +585,64 @@ void
 StorePreparedStatement(const char *stmt_name,
                        CachedPlanSource *plansource,
                        bool from_sql,
-                       bool use_resowner)
+					   bool use_resowner,
+					   const char need_rewrite)
 {
-    PreparedStatement *entry;
-    TimestampTz cur_ts = GetCurrentStatementStartTimestamp();
-    bool        found;
+	PreparedStatement *entry;
+	TimestampTz cur_ts = GetCurrentStatementStartTimestamp();
+	bool		found;
 
-    /* Initialize the hash table, if necessary */
-    if (!prepared_queries)
-        InitQueryHashTable();
+	/* Initialize the hash table, if necessary */
+	if (!prepared_queries)
+		InitQueryHashTable();
 
-    /* Add entry to hash table */
-    entry = (PreparedStatement *) hash_search(prepared_queries,
-                                              stmt_name,
-                                              HASH_ENTER,
-                                              &found);
+	/* Add entry to hash table */
+	entry = (PreparedStatement *) hash_search(prepared_queries,
+											  stmt_name,
+											  HASH_ENTER,
+											  &found);
 
-    /* Shouldn't get a duplicate entry */
-    if (found)
-        ereport(ERROR,
-                (errcode(ERRCODE_DUPLICATE_PSTATEMENT),
-                 errmsg("prepared statement \"%s\" already exists",
-                        stmt_name)));
+	/* Shouldn't get a duplicate entry */
+	if (found)
+	{
+		if (need_rewrite == 'Y' &&
+			plansource->commandTag == entry->plansource->commandTag &&
+			strcmp(plansource->query_string, entry->plansource->query_string) != 0)
+		{
+			entry->plansource->query_string = plansource->query_string;
+		}
+		else if (!(plansource->commandTag == entry->plansource->commandTag &&
+				strcmp(plansource->query_string, entry->plansource->query_string) == 0))
+		{
+			ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_PSTATEMENT),
+					errmsg("prepared statement \"%s\" already exists, and plansource is not the same.",
+					stmt_name)));
+		}
+		else
+		{
+			elog(LOG, " \"%s\" already exists in prepared_queries, skip it.", stmt_name);
+			return ;
+		}
+	}
 
-    /* Fill in the hash table entry */
-    entry->plansource = plansource;
-    entry->from_sql = from_sql;
-    entry->prepare_time = cur_ts;
-    entry->use_resowner = use_resowner;
+	/* Fill in the hash table entry */
+	entry->plansource = plansource;
+	entry->from_sql = from_sql;
+	entry->prepare_time = cur_ts;
+	entry->use_resowner = use_resowner;
 
-    /* Now it's safe to move the CachedPlanSource to permanent memory */
-    SaveCachedPlan(plansource);
-#ifdef XCP    
-    if (use_resowner)
-    {
-        ResourceOwnerEnlargePreparedStmts(CurTransactionResourceOwner);
-        ResourceOwnerRememberPreparedStmt(CurTransactionResourceOwner,
-                entry->stmt_name);
-    }
-#endif        
+	/* Now it's safe to move the CachedPlanSource to permanent memory */
+	SaveCachedPlan(plansource);
+
+#ifdef XCP	
+	if (use_resowner)
+	{
+		ResourceOwnerEnlargePreparedStmts(CurTransactionResourceOwner);
+		ResourceOwnerRememberPreparedStmt(CurTransactionResourceOwner,
+				entry->stmt_name);
+	}
+#endif		
 }
 
 /*
@@ -727,6 +747,13 @@ DropPreparedStatement(const char *stmt_name, bool showError)
 
     if (entry)
     {
+#ifdef XCP
+	    /* if a process SharedQueueRelease in DropCachedPlan, this SharedQueue
+	     * Can be created by another process, and SharedQueueDisconnectConsumer
+	     * will change the SharedQueue of another process's status,
+	     * so let SharedQueueDisconnectConsumer be in front of DropCachedPlan */
+        SharedQueueDisconnectConsumer(entry->stmt_name);
+#endif
         /* Release the plancache entry */
         DropCachedPlan(entry->plansource);
 
@@ -738,7 +765,6 @@ DropPreparedStatement(const char *stmt_name, bool showError)
         if (entry->use_resowner)
             ResourceOwnerForgetPreparedStmt(CurTransactionResourceOwner,
                     entry->stmt_name);
-        SharedQueueDisconnectConsumer(entry->stmt_name);
 #endif
 #ifdef __TBASE__
         if (distributed_query_analyze)
@@ -1071,7 +1097,7 @@ HaveActiveDatanodeStatements(void)
  * prepared on the node
  */
 bool
-ActivateDatanodeStatementOnNode(const char *stmt_name, int noid)
+ActivateDatanodeStatementOnNode(const char *stmt_name, int nodeidx)
 {
     DatanodeStatement *entry;
     int i;
@@ -1081,13 +1107,55 @@ ActivateDatanodeStatementOnNode(const char *stmt_name, int noid)
 
     /* see if statement already active on the node */
     for (i = 0; i < entry->number_of_nodes; i++)
-        if (entry->dns_node_indices[i] == noid)
+		if (entry->dns_node_indices[i] == nodeidx)
             return true;
 
     /* statement is not active on the specified node append item to the list */
-    entry->dns_node_indices[entry->number_of_nodes++] = noid;
+	entry->dns_node_indices[entry->number_of_nodes++] = nodeidx;
     return false;
 }
+
+
+/*
+ * Mark datanode statement as inactive on specified node
+ */
+void
+InactivateDatanodeStatementOnNode(int nodeidx)
+{
+	HASH_SEQ_STATUS seq;
+	DatanodeStatement *entry;
+	int i;
+
+	/* nothing cached */
+	if (!datanode_queries)
+		return;
+
+	/* walk over cache */
+	hash_seq_init(&seq, datanode_queries);
+	while ((entry = hash_seq_search(&seq)) != NULL)
+	{
+		/* see if statement already active on the node */
+		for (i = 0; i < entry->number_of_nodes; i++)
+		{
+			if (entry->dns_node_indices[i] == nodeidx)
+			{
+				elog(DEBUG5, "InactivateDatanodeStatementOnNode: node index %d, "
+						"number_of_nodes %d, statement name %s", nodeidx,
+						entry->number_of_nodes, entry->stmt_name);
+
+				/* remove nodeidx from list */
+				entry->number_of_nodes--;
+				if (i < entry->number_of_nodes)
+				{
+					entry->dns_node_indices[i] =
+						entry->dns_node_indices[entry->number_of_nodes];
+				}
+				break;
+			}
+		}
+	}
+}
+
 #endif
 #ifdef __TBASE__
 /* prepare remoteDML statement on coordinator */

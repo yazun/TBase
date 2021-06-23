@@ -23,6 +23,11 @@
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
 #include "statistics/statistics.h"
+#ifdef __TBASE__
+#include "access/htup_details.h"
+#include "catalog/pg_operator.h"
+#include "utils/syscache.h"
+#endif
 
 
 /*
@@ -97,230 +102,244 @@ static RelOptInfo *find_single_rel_for_clauses(PlannerInfo *root,
  */
 Selectivity
 clauselist_selectivity(PlannerInfo *root,
-                       List *clauses,
-                       int varRelid,
-                       JoinType jointype,
-                       SpecialJoinInfo *sjinfo)
-{// #lizard forgives
-    Selectivity s1 = 1.0;
-    RelOptInfo *rel;
-    Bitmapset  *estimatedclauses = NULL;
-    RangeQueryClause *rqlist = NULL;
-    ListCell   *l;
-    int            listidx;
+					   List *clauses,
+					   int varRelid,
+					   JoinType jointype,
+					   SpecialJoinInfo *sjinfo)
+{
+	Selectivity s1 = 1.0;
+	RelOptInfo *rel;
+	Bitmapset  *estimatedclauses = NULL;
+	RangeQueryClause *rqlist = NULL;
+	ListCell   *l;
+	int			listidx;
 
-    /*
-     * If there's exactly one clause, just go directly to
-     * clause_selectivity(). None of what we might do below is relevant.
-     */
-    if (list_length(clauses) == 1)
-        return clause_selectivity(root, (Node *) linitial(clauses),
-                                  varRelid, jointype, sjinfo);
+	/*
+	 * If there's exactly one clause, just go directly to
+	 * clause_selectivity(). None of what we might do below is relevant.
+	 */
+	if (list_length(clauses) == 1)
+		return clause_selectivity(root, (Node *) linitial(clauses),
+								  varRelid, jointype, sjinfo);
 
-    /*
-     * Determine if these clauses reference a single relation.  If so, and if
-     * it has extended statistics, try to apply those.
-     */
-    rel = find_single_rel_for_clauses(root, clauses);
-    if (rel && rel->rtekind == RTE_RELATION && rel->statlist != NIL)
-    {
-        /*
-         * Perform selectivity estimations on any clauses found applicable by
-         * dependencies_clauselist_selectivity.  'estimatedclauses' will be
-         * filled with the 0-based list positions of clauses used that way, so
-         * that we can ignore them below.
-         */
-        s1 *= dependencies_clauselist_selectivity(root, clauses, varRelid,
-                                                  jointype, sjinfo, rel,
-                                                  &estimatedclauses);
+	/*
+	 * Determine if these clauses reference a single relation.  If so, and if
+	 * it has extended statistics, try to apply those.
+	 */
+	rel = find_single_rel_for_clauses(root, clauses);
+	if (rel && rel->rtekind == RTE_RELATION && rel->statlist != NIL)
+	{
+#ifdef __TBASE__
+		/*
+		 * Perform subset eliminations on any clauses found applicable by
+		 * subset_clauselist_selectivity. Subset dependencies got higher
+		 * priority over statistic-based dependencies. 'estimatedclauses'
+		 * will be filled with the 0-based list positions of clauses used
+		 * that way, so that we can ignore them below in both dependencies
+		 * selectivity calculation and independent basic selectivity
+		 * calculation.
+		 */
+		s1 *= subset_clauselist_selectivity(root, clauses, varRelid, jointype,
+											sjinfo, rel, &estimatedclauses);
+#endif
 
-        /*
-         * This would be the place to apply any other types of extended
-         * statistics selectivity estimations for remaining clauses.
-         */
-    }
+		/*
+		 * Perform selectivity estimations on any clauses found applicable by
+		 * dependencies_clauselist_selectivity.  'estimatedclauses' will be
+		 * filled with the 0-based list positions of clauses used that way, so
+		 * that we can ignore them below.
+		 */
+		s1 *= dependencies_clauselist_selectivity(root, clauses, varRelid,
+												  jointype, sjinfo, rel,
+												  &estimatedclauses);
 
-    /*
-     * Apply normal selectivity estimates for remaining clauses. We'll be
-     * careful to skip any clauses which were already estimated above.
-     *
-     * Anything that doesn't look like a potential rangequery clause gets
-     * multiplied into s1 and forgotten. Anything that does gets inserted into
-     * an rqlist entry.
-     */
-    listidx = -1;
-    foreach(l, clauses)
-    {
-        Node       *clause = (Node *) lfirst(l);
-        RestrictInfo *rinfo;
-        Selectivity s2;
+		/*
+		 * This would be the place to apply any other types of extended
+		 * statistics selectivity estimations for remaining clauses.
+		 */
+	}
 
-        listidx++;
+	/*
+	 * Apply normal selectivity estimates for remaining clauses. We'll be
+	 * careful to skip any clauses which were already estimated above.
+	 *
+	 * Anything that doesn't look like a potential rangequery clause gets
+	 * multiplied into s1 and forgotten. Anything that does gets inserted into
+	 * an rqlist entry.
+	 */
+	listidx = -1;
+	foreach(l, clauses)
+	{
+		Node	   *clause = (Node *) lfirst(l);
+		RestrictInfo *rinfo;
+		Selectivity s2;
 
-        /*
-         * Skip this clause if it's already been estimated by some other
-         * statistics above.
-         */
-        if (bms_is_member(listidx, estimatedclauses))
-            continue;
+		listidx++;
 
-        /* Always compute the selectivity using clause_selectivity */
-        s2 = clause_selectivity(root, clause, varRelid, jointype, sjinfo);
+		/*
+		 * Skip this clause if it's already been estimated by some other
+		 * statistics above.
+		 */
+		if (bms_is_member(listidx, estimatedclauses))
+			continue;
 
-        /*
-         * Check for being passed a RestrictInfo.
-         *
-         * If it's a pseudoconstant RestrictInfo, then s2 is either 1.0 or
-         * 0.0; just use that rather than looking for range pairs.
-         */
-        if (IsA(clause, RestrictInfo))
-        {
-            rinfo = (RestrictInfo *) clause;
-            if (rinfo->pseudoconstant)
-            {
-                s1 = s1 * s2;
-                continue;
-            }
-            clause = (Node *) rinfo->clause;
-        }
-        else
-            rinfo = NULL;
+		/* Always compute the selectivity using clause_selectivity */
+		s2 = clause_selectivity(root, clause, varRelid, jointype, sjinfo);
 
-        /*
-         * See if it looks like a restriction clause with a pseudoconstant on
-         * one side.  (Anything more complicated than that might not behave in
-         * the simple way we are expecting.)  Most of the tests here can be
-         * done more efficiently with rinfo than without.
-         */
-        if (is_opclause(clause) && list_length(((OpExpr *) clause)->args) == 2)
-        {
-            OpExpr       *expr = (OpExpr *) clause;
-            bool        varonleft = true;
-            bool        ok;
+		/*
+		 * Check for being passed a RestrictInfo.
+		 *
+		 * If it's a pseudoconstant RestrictInfo, then s2 is either 1.0 or
+		 * 0.0; just use that rather than looking for range pairs.
+		 */
+		if (IsA(clause, RestrictInfo))
+		{
+			rinfo = (RestrictInfo *) clause;
+			if (rinfo->pseudoconstant)
+			{
+				s1 = s1 * s2;
+				continue;
+			}
+			clause = (Node *) rinfo->clause;
+		}
+		else
+			rinfo = NULL;
 
-            if (rinfo)
-            {
-                ok = (bms_membership(rinfo->clause_relids) == BMS_SINGLETON) &&
-                    (is_pseudo_constant_clause_relids(lsecond(expr->args),
-                                                      rinfo->right_relids) ||
-                     (varonleft = false,
-                      is_pseudo_constant_clause_relids(linitial(expr->args),
-                                                       rinfo->left_relids)));
-            }
-            else
-            {
-                ok = (NumRelids(clause) == 1) &&
-                    (is_pseudo_constant_clause(lsecond(expr->args)) ||
-                     (varonleft = false,
-                      is_pseudo_constant_clause(linitial(expr->args))));
-            }
+		/*
+		 * See if it looks like a restriction clause with a pseudoconstant on
+		 * one side.  (Anything more complicated than that might not behave in
+		 * the simple way we are expecting.)  Most of the tests here can be
+		 * done more efficiently with rinfo than without.
+		 */
+		if (is_opclause(clause) && list_length(((OpExpr *) clause)->args) == 2)
+		{
+			OpExpr	   *expr = (OpExpr *) clause;
+			bool		varonleft = true;
+			bool		ok;
 
-            if (ok)
-            {
-                /*
-                 * If it's not a "<" or ">" operator, just merge the
-                 * selectivity in generically.  But if it's the right oprrest,
-                 * add the clause to rqlist for later processing.
-                 */
-                switch (get_oprrest(expr->opno))
-                {
-                    case F_SCALARLTSEL:
-                        addRangeClause(&rqlist, clause,
-                                       varonleft, true, s2);
-                        break;
-                    case F_SCALARGTSEL:
-                        addRangeClause(&rqlist, clause,
-                                       varonleft, false, s2);
-                        break;
-                    default:
-                        /* Just merge the selectivity in generically */
-                        s1 = s1 * s2;
-                        break;
-                }
-                continue;        /* drop to loop bottom */
-            }
-        }
+			if (rinfo)
+			{
+				ok = (bms_membership(rinfo->clause_relids) == BMS_SINGLETON) &&
+					(is_pseudo_constant_clause_relids(lsecond(expr->args),
+													  rinfo->right_relids) ||
+					 (varonleft = false,
+					  is_pseudo_constant_clause_relids(linitial(expr->args),
+													   rinfo->left_relids)));
+			}
+			else
+			{
+				ok = (NumRelids(clause) == 1) &&
+					(is_pseudo_constant_clause(lsecond(expr->args)) ||
+					 (varonleft = false,
+					  is_pseudo_constant_clause(linitial(expr->args))));
+			}
 
-        /* Not the right form, so treat it generically. */
-        s1 = s1 * s2;
-    }
+			if (ok)
+			{
+				/*
+				 * If it's not a "<" or ">" operator, just merge the
+				 * selectivity in generically.  But if it's the right oprrest,
+				 * add the clause to rqlist for later processing.
+				 */
+				switch (get_oprrest(expr->opno))
+				{
+					case F_SCALARLTSEL:
+						addRangeClause(&rqlist, clause,
+									   varonleft, true, s2);
+						break;
+					case F_SCALARGTSEL:
+						addRangeClause(&rqlist, clause,
+									   varonleft, false, s2);
+						break;
+					default:
+						/* Just merge the selectivity in generically */
+						s1 = s1 * s2;
+						break;
+				}
+				continue;		/* drop to loop bottom */
+			}
+		}
 
-    /*
-     * Now scan the rangequery pair list.
-     */
-    while (rqlist != NULL)
-    {
-        RangeQueryClause *rqnext;
+		/* Not the right form, so treat it generically. */
+		s1 = s1 * s2;
+	}
 
-        if (rqlist->have_lobound && rqlist->have_hibound)
-        {
-            /* Successfully matched a pair of range clauses */
-            Selectivity s2;
+	/*
+	 * Now scan the rangequery pair list.
+	 */
+	while (rqlist != NULL)
+	{
+		RangeQueryClause *rqnext;
 
-            /*
-             * Exact equality to the default value probably means the
-             * selectivity function punted.  This is not airtight but should
-             * be good enough.
-             */
-            if (rqlist->hibound == DEFAULT_INEQ_SEL ||
-                rqlist->lobound == DEFAULT_INEQ_SEL)
-            {
-                s2 = DEFAULT_RANGE_INEQ_SEL;
-            }
-            else
-            {
-                s2 = rqlist->hibound + rqlist->lobound - 1.0;
+		if (rqlist->have_lobound && rqlist->have_hibound)
+		{
+			/* Successfully matched a pair of range clauses */
+			Selectivity s2;
 
-                /* Adjust for double-exclusion of NULLs */
-                s2 += nulltestsel(root, IS_NULL, rqlist->var,
-                                  varRelid, jointype, sjinfo);
+			/*
+			 * Exact equality to the default value probably means the
+			 * selectivity function punted.  This is not airtight but should
+			 * be good enough.
+			 */
+			if (rqlist->hibound == DEFAULT_INEQ_SEL ||
+				rqlist->lobound == DEFAULT_INEQ_SEL)
+			{
+				s2 = DEFAULT_RANGE_INEQ_SEL;
+			}
+			else
+			{
+				s2 = rqlist->hibound + rqlist->lobound - 1.0;
 
-                /*
-                 * A zero or slightly negative s2 should be converted into a
-                 * small positive value; we probably are dealing with a very
-                 * tight range and got a bogus result due to roundoff errors.
-                 * However, if s2 is very negative, then we probably have
-                 * default selectivity estimates on one or both sides of the
-                 * range that we failed to recognize above for some reason.
-                 */
-                if (s2 <= 0.0)
-                {
-                    if (s2 < -0.01)
-                    {
-                        /*
-                         * No data available --- use a default estimate that
-                         * is small, but not real small.
-                         */
-                        s2 = DEFAULT_RANGE_INEQ_SEL;
-                    }
-                    else
-                    {
-                        /*
-                         * It's just roundoff error; use a small positive
-                         * value
-                         */
-                        s2 = 1.0e-10;
-                    }
-                }
-            }
-            /* Merge in the selectivity of the pair of clauses */
-            s1 *= s2;
-        }
-        else
-        {
-            /* Only found one of a pair, merge it in generically */
-            if (rqlist->have_lobound)
-                s1 *= rqlist->lobound;
-            else
-                s1 *= rqlist->hibound;
-        }
-        /* release storage and advance */
-        rqnext = rqlist->next;
-        pfree(rqlist);
-        rqlist = rqnext;
-    }
+				/* Adjust for double-exclusion of NULLs */
+				s2 += nulltestsel(root, IS_NULL, rqlist->var,
+								  varRelid, jointype, sjinfo);
 
-    return s1;
+				/*
+				 * A zero or slightly negative s2 should be converted into a
+				 * small positive value; we probably are dealing with a very
+				 * tight range and got a bogus result due to roundoff errors.
+				 * However, if s2 is very negative, then we probably have
+				 * default selectivity estimates on one or both sides of the
+				 * range that we failed to recognize above for some reason.
+				 */
+				if (s2 <= 0.0)
+				{
+					if (s2 < -0.01)
+					{
+						/*
+						 * No data available --- use a default estimate that
+						 * is small, but not real small.
+						 */
+						s2 = DEFAULT_RANGE_INEQ_SEL;
+					}
+					else
+					{
+						/*
+						 * It's just roundoff error; use a small positive
+						 * value
+						 */
+						s2 = 1.0e-10;
+					}
+				}
+			}
+			/* Merge in the selectivity of the pair of clauses */
+			s1 *= s2;
+		}
+		else
+		{
+			/* Only found one of a pair, merge it in generically */
+			if (rqlist->have_lobound)
+				s1 *= rqlist->lobound;
+			else
+				s1 *= rqlist->hibound;
+		}
+		/* release storage and advance */
+		rqnext = rqlist->next;
+		pfree(rqlist);
+		rqlist = rqnext;
+	}
+
+	return s1;
 }
 
 /*
@@ -852,3 +871,103 @@ clause_selectivity(PlannerInfo *root,
 
     return s1;
 }
+
+#ifdef __TBASE__
+/*
+ * clause_selectivity_could_under_estimated
+ *	  Check whether BaseRelOpt of the path might got under estimated rows.
+ *
+ * In real user scenarios, multiple columns could have correlation. It needs
+ * more statistic hints for the optimizer to know the data model
+ * characteristics. Since the extended mutli-column statistic calculation only
+ * supports '=' operation, we introduced this function to check if the
+ * selectivity of input path is under estimated.
+ */
+bool
+clause_selectivity_could_under_estimated(PlannerInfo *root, Path *path)
+{
+	RelOptInfo *rel = NULL;
+
+	/* We only support 1-depth nestloop outer path for now. */
+	if (path->pathtype == T_SeqScan ||
+		path->pathtype == T_IndexScan ||
+		path->pathtype == T_IndexOnlyScan ||
+		path->pathtype == T_BitmapIndexScan ||
+		path->pathtype == T_BitmapHeapScan)
+	{
+		rel = path->parent;
+	}
+	else
+	{
+		return false;
+	}
+
+	Assert(rel);
+
+	/*
+	 * The correlation problem only happens when there are multiple
+	 * restrictions.
+	 */
+	if (list_length(rel->baserestrictinfo) > 1)
+	{
+		ListCell 	*lc;
+		Node 		*clause;
+		int 		count = 0;
+
+		/* Walk through all restrictions */
+		foreach (lc, rel->baserestrictinfo)
+		{
+			RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+
+			/*
+			 * Proceed with examination of contained clause.  If the clause is
+			 * an OR-clause.
+			 */
+			if (ri->orclause)
+				clause = (Node *) ri->orclause;
+			else
+				clause = (Node *) ri->clause;
+
+			/*
+			 * The multi-column statistic only supports '=' operator based on
+			 * single column histograms. Thus we count all unsupported cases
+			 * here. is_opclause() covers the NULL check for 'clause'
+			 *
+			 * TODO(Tbase): Be more precise on other type of clauses.
+			 */
+			if (is_opclause(clause))
+			{
+				OpExpr	   		   *opclause = (OpExpr *) clause;
+				char		 	   *oprname;
+				Oid					opno = opclause->opno;
+				HeapTuple 			opTuple;
+				Form_pg_operator 	operform;
+
+				opTuple = SearchSysCache1(OPEROID, ObjectIdGetDatum(opno));
+				if (HeapTupleIsValid(opTuple))
+				{
+					operform = (Form_pg_operator)GETSTRUCT(opTuple);
+					oprname = NameStr(operform->oprname);
+				}
+				ReleaseSysCache(opTuple);
+
+				/* Supported case, skip the count. */
+				if (oprname && strcmp(oprname, "=") == 0)
+					continue;
+			}
+
+			/* Unsupported case */
+			count++;
+		}
+
+		/*
+		 * The path got some restrictions which could lead to selectivity
+		 * under estimation.
+		 */
+		if (count > 0)
+			return true;
+	}
+
+	return false;
+}
+#endif

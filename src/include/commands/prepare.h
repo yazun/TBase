@@ -121,7 +121,8 @@ extern void ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into,
 extern void StorePreparedStatement(const char *stmt_name,
                        CachedPlanSource *plansource,
                        bool from_sql,
-                       bool use_resowner);
+					   bool use_resowner,
+					   const char need_rewrite);
 extern PreparedStatement *FetchPreparedStatement(const char *stmt_name,
                        bool throwError);
 extern void DropPreparedStatement(const char *stmt_name, bool showError);
@@ -132,9 +133,10 @@ extern void DropAllPreparedStatements(void);
 
 #ifdef PGXC
 extern DatanodeStatement *FetchDatanodeStatement(const char *stmt_name, bool throwError);
-extern bool ActivateDatanodeStatementOnNode(const char *stmt_name, int noid);
+extern bool ActivateDatanodeStatementOnNode(const char *stmt_name, int nodeidx);
 extern bool HaveActiveDatanodeStatements(void);
 extern void DropDatanodeStatement(const char *stmt_name);
+extern void InactivateDatanodeStatementOnNode(int nodeidx);
 extern int SetRemoteStatementName(Plan *plan, const char *stmt_name, int num_params,
                         Oid *param_types, int n);
 #endif

@@ -406,7 +406,8 @@ PostPrepare_Twophase(void)
 
 #ifdef __SUPPORT_DISTRIBUTED_TRANSACTION__
 
-static void RecoverEndGlobalPrepare(GlobalTransaction gxact)
+static void
+RecoverEndGlobalPrepare(GlobalTransaction gxact)
 {
     volatile PGXACT    *pgxact = &ProcGlobal->allPgXact[gxact->pgprocno];
     
@@ -416,17 +417,17 @@ static void RecoverEndGlobalPrepare(GlobalTransaction gxact)
 
 }
 
-
-void EndGlobalPrepare(GlobalTransaction gxact, bool isImplicit)
-{    
-    volatile PGXACT    *pgxact = &ProcGlobal->allPgXact[gxact->pgprocno];
-    
-    pg_atomic_write_u64(&pgxact->prepare_timestamp, GetGlobalPrepareTimestamp());
-    if(enable_distri_print)
-    {
-        elog(LOG, "proc no %d prepare timestamp " INT64_FORMAT " xid %d.", gxact->pgprocno, 
-                            GetGlobalPrepareTimestamp(), pgxact->xid);
-    }
+void
+EndGlobalPrepare(GlobalTransaction gxact, bool isImplicit)
+{	
+	volatile PGXACT	*pgxact = &ProcGlobal->allPgXact[gxact->pgprocno];
+	
+	pg_atomic_write_u64(&pgxact->prepare_timestamp, GetGlobalPrepareTimestamp());
+	if(enable_distri_print)
+	{
+		elog(LOG, "proc no %d prepare timestamp " INT64_FORMAT " xid %d.", gxact->pgprocno, 
+							GetGlobalPrepareTimestamp(), pgxact->xid);
+	}
 
     if(isImplicit && !GlobalTimestampIsValid(pg_atomic_read_u64(&pgxact->prepare_timestamp)))
     {
@@ -435,27 +436,31 @@ void EndGlobalPrepare(GlobalTransaction gxact, bool isImplicit)
     }
 
 #ifdef __TBASE_DEBUG__
-    if(enable_distri_print)
-    {
-        InsertPreparedXid(pgxact->xid, GetGlobalPrepareTimestamp());
-    }
-#endif    
+	if(enable_distri_print)
+	{
+		InsertPreparedXid(pgxact->xid, GetGlobalPrepareTimestamp());
+	}
+#endif	
 
-    // SetGlobalPrepareTimestamp(InvalidGlobalTimestamp);
-    /* 
-     * Transfer the tmin to the prepared proc without locking. 
-     * As the prepare xact procs lie behind the normal procs in proc array,
-     * Get Snapshot would not miss the tmin even when it is being transferred.
-     */
-    pg_atomic_write_u64(&pgxact->tmin, pg_atomic_read_u64(&MyPgXact->tmin));
-    if(!GlobalTimestampIsValid(pg_atomic_read_u64(&MyPgXact->tmin)))
-    {
-        elog(LOG,
-             "prepare transaction %d does not have valid tmin. autovacuum %d", 
-             MyPgXact->xid, IsAutoVacuumWorkerProcess());
-    }
-    
-
+	// SetGlobalPrepareTimestamp(InvalidGlobalTimestamp);
+	/* 
+	 * Transfer the tmin to the prepared proc without locking. 
+	 * As the prepare xact procs lie behind the normal procs in proc array,
+	 * Get Snapshot would not miss the tmin even when it is being transferred.
+	 * 
+	 * According to PortalRunUtility, we do not set snapshot if transaction
+	 * only contains utilities that do not need one. In that case,
+	 * xmin and tmin are both invalid, for they are both set by snapshot.
+	 * So if xmin is valid, tmin should also be.
+	 */
+	pg_atomic_write_u64(&pgxact->tmin, pg_atomic_read_u64(&MyPgXact->tmin));
+	if(!GlobalTimestampIsValid(pg_atomic_read_u64(&MyPgXact->tmin)) &&
+		TransactionIdIsValid(MyPgXact->xmin))
+	{
+		elog(LOG,
+			 "prepare transaction %d does not have valid tmin. autovacuum %d", 
+			 MyPgXact->xid, IsAutoVacuumWorkerProcess());
+	}
 }
 
 

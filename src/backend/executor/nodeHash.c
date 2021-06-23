@@ -184,6 +184,9 @@ ExecInitHash(Hash *node, EState *estate, int eflags)
     hashstate->ps.ExecProcNode = ExecHash;
     hashstate->hashtable = NULL;
     hashstate->hashkeys = NIL;    /* will be set by parent HashJoin */
+#ifdef __TBASE__
+	hashstate->shared_info = NULL;
+#endif
 
     /*
      * Miscellaneous initialization
@@ -1820,6 +1823,130 @@ ExecHashRemoveNextSkewBucket(HashJoinTable hashtable)
         hashtable->spaceUsed -= hashtable->spaceUsedSkew;
         hashtable->spaceUsedSkew = 0;
     }
+}
+
+/*
+ * Reserve space in the DSM segment for instrumentation data.
+ */
+void
+ExecHashEstimate(HashState *node, ParallelContext *pcxt)
+{
+	size_t		size;
+
+	/* don't need this if not instrumenting or no workers */
+	if (!node->ps.instrument || pcxt->nworkers == 0)
+		return;
+	
+	size = mul_size(pcxt->nworkers, sizeof(HashInstrumentation));
+	size = add_size(size, offsetof(SharedHashInfo, hinstrument));
+	shm_toc_estimate_chunk(&pcxt->estimator, size);
+	shm_toc_estimate_keys(&pcxt->estimator, 1);
+}
+
+/*
+ * Set up a space in the DSM for all workers to record instrumentation data
+ * about their hash table.
+ */
+void
+ExecHashInitializeDSM(HashState *node, ParallelContext *pcxt)
+{
+	size_t		size;
+
+	/* don't need this if not instrumenting or no workers */
+	if (!node->ps.instrument || pcxt->nworkers == 0)
+		return;
+	
+	size = offsetof(SharedHashInfo, hinstrument) +
+		pcxt->nworkers * sizeof(HashInstrumentation);
+	node->shared_info = (SharedHashInfo *) shm_toc_allocate(pcxt->toc, size);
+	memset(node->shared_info, 0, size);
+	node->shared_info->num_workers = pcxt->nworkers;
+	shm_toc_insert(pcxt->toc, node->ps.plan->plan_node_id,
+				   node->shared_info);
+}
+
+/*
+ * Reset shared state before beginning a fresh scan.
+ */
+void
+ExecHashReInitializeDSM(HashState *node, ParallelContext *pcxt)
+{
+	if (node->shared_info != NULL)
+	{
+		memset(node->shared_info->hinstrument, 0,
+			   node->shared_info->num_workers * sizeof(HashInstrumentation));
+	}
+}
+
+/*
+ * Locate the DSM space for hash table instrumentation data that we'll write
+ * to at shutdown time.
+ */
+void
+ExecHashInitializeWorker(HashState *node, ParallelWorkerContext *pwcxt)
+{
+	SharedHashInfo *shared_info;
+
+	/* don't need this if not instrumenting */
+	if (!node->ps.instrument)
+		return;
+	
+	shared_info = (SharedHashInfo *)
+		shm_toc_lookup(pwcxt->toc, node->ps.plan->plan_node_id, true);
+	node->hinstrument = &shared_info->hinstrument[ParallelWorkerNumber];
+#ifdef __TBASE__
+	/* set node->shared_info for distributed instrument */
+	node->shared_info = shared_info;
+#endif
+}
+
+/*
+ * Copy instrumentation data from this worker's hash table (if it built one)
+ * to DSM memory so the leader can retrieve it.  This must be done in an
+ * ExecShutdownHash() rather than ExecEndHash() because the latter runs after
+ * we've detached from the DSM segment.
+ */
+void
+ExecShutdownHash(HashState *node)
+{
+	/* Now accumulate data for the current (final) hash table */
+	if (node->hinstrument && node->hashtable)
+		ExecHashGetInstrumentation(node->hinstrument, node->hashtable);
+}
+
+/*
+ * Retrieve instrumentation data from workers before the DSM segment is
+ * detached, so that EXPLAIN can access it.
+ */
+void
+ExecHashRetrieveInstrumentation(HashState *node)
+{
+	SharedHashInfo *shared_info = node->shared_info;
+	size_t		size;
+
+	if (shared_info == NULL)
+		return;
+	
+	/* Replace node->shared_info with a copy in backend-local memory. */
+	size = offsetof(SharedHashInfo, hinstrument) +
+		shared_info->num_workers * sizeof(HashInstrumentation);
+	node->shared_info = palloc(size);
+	memcpy(node->shared_info, shared_info, size);
+}
+
+/*
+ * Copy the instrumentation data from 'hashtable' into a HashInstrumentation
+ * struct.
+ */
+void
+ExecHashGetInstrumentation(HashInstrumentation *instrument,
+						   HashJoinTable hashtable)
+{
+	instrument->nbuckets = hashtable->nbuckets;
+	instrument->nbuckets_original = hashtable->nbuckets_original;
+	instrument->nbatch = hashtable->nbatch;
+	instrument->nbatch_original = hashtable->nbatch_original;
+	instrument->space_peak = hashtable->spacePeak;
 }
 
 /*

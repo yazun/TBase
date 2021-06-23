@@ -24,6 +24,9 @@
  */
 #include "postgres.h"
 
+#include <unistd.h>
+#include <sys/mman.h>
+
 #include "access/commit_ts.h"
 #include "access/htup_details.h"
 #include "access/lru.h"
@@ -208,63 +211,64 @@ TransactionTreeSetCommitTsData(TransactionId xid, int nsubxids,
     else
         newestXact = xid;
 #endif
-    /*
-     * We split the xids to set the timestamp to in groups belonging to the
-     * same SLRU page; the first element in each such set is its head.  The
-     * first group has the main XID as the head; subsequent sets use the first
-     * subxid not on the previous page as head.  This way, we only have to
-     * lock/modify each SLRU page once.
-     */
-    for (i = 0, headxid = xid;;)
-    {
-        int            pageno = TransactionIdToCTsPage(headxid);
-        int            j;
+	/*
+	 * We split the xids to set the timestamp to in groups belonging to the
+	 * same SLRU page; the first element in each such set is its head.  The
+	 * first group has the main XID as the head; subsequent sets use the first
+	 * subxid not on the previous page as head.  This way, we only have to
+	 * lock/modify each SLRU page once.
+	 */
+	for (i = 0, headxid = xid;;)
+	{
+		int			pageno = TransactionIdToCTsPage(headxid);
+		int			j;
 
-        for (j = i; j < nsubxids; j++)
-        {
-            if(enable_committs_print)
-            {
-                elog(LOG, "TransactionTreeSetCommitTsData, subxid xid %d i %d j %d nsubxids %d", subxids[j], i, j, nsubxids);
-            }
-            
-            if (TransactionIdToCTsPage(subxids[j]) != pageno)
-            {
-                if(enable_committs_print)
-                {
-                    elog(LOG, "break pageno %d subxid xid %d j %d", pageno, subxids[j], j);
-                }
-                break;
-            }
-        }
-        /* subxids[i..j] are on the same page as the head */
-        if(j - i > 0)
-        {
-            SetXidCommitTsInPage(headxid, j - i, subxids + i, global_timestamp, timestamp, nodeid,
-                                 pageno, lsn);
-        }
-        else
-        {
-            SetXidCommitTsInPage(headxid, 0, NULL, global_timestamp, timestamp, nodeid,
-                                 pageno, lsn);
-        }
+		for (j = i; j < nsubxids; j++)
+		{
+			if(enable_committs_print)
+			{
+				elog(LOG, "TransactionTreeSetCommitTsData, subxid xid %d i %d j %d nsubxids %d", subxids[j], i, j, nsubxids);
+			}
+			
+			if (TransactionIdToCTsPage(subxids[j]) != pageno)
+			{
+				if(enable_committs_print)
+				{
+					elog(LOG, "break pageno %d subxid xid %d j %d", pageno, subxids[j], j);
+				}
+				break;
+			}
+		}
+		/* subxids[i..j] are on the same page as the head */
+		if(j - i > 0)
+		{
+			SetXidCommitTsInPage(headxid, j - i, subxids + i, global_timestamp, timestamp, nodeid,
+								 pageno, lsn);
+		}
+		else
+		{
+			SetXidCommitTsInPage(headxid, 0, NULL, global_timestamp, timestamp, nodeid,
+								 pageno, lsn);
+		}
 
-        if(enable_committs_print)
-        {
-            elog(LOG, "set committs data pageno %d xid %d head xid %d j-i %d i %d nsubxids %d committs "INT64_FORMAT, pageno, xid, headxid, j-i, 
-                i, nsubxids, global_timestamp);
-        }
+		if(enable_committs_print)
+		{
+			elog(LOG,
+				"TransactionTreeSetCommitTsData: set committs data pageno %d xid %d head xid %d j-i %d i %d nsubxids %d committs "INT64_FORMAT,
+				pageno, xid, headxid, j - i, i, nsubxids, global_timestamp);
+		}
 
-        /* if we wrote out all subxids, we're done. */
-        if (j + 1 > nsubxids)
-            break;
+		/* if we wrote out all subxids, we're done. */
+		if (j + 1 > nsubxids)
+			break;
 
-        /*
-         * Set the new head and skip over it, as well as over the subxids we
-         * just wrote.
-         */
-        headxid = subxids[j];
-        i = j + 1;
-    }
+		/*
+		 * Set the new head and skip over it, as well as over the subxids we
+		 * just wrote.
+		 */
+		headxid = subxids[j];
+		i = j + 1;
+	}
 #if 0
     /* update the cached value in shared memory */
     LWLockAcquire(CommitTsLock, LW_EXCLUSIVE);
@@ -317,21 +321,23 @@ static void
 TransactionIdSetCommitTs(TransactionId xid, TimestampTz gts, TimestampTz ts,
                          RepOriginId nodeid, int partitionno, int slotno, XLogRecPtr lsn)
 {
-    int            entryno = TransactionIdToCTsEntry(xid);
-    CommitTimestampEntry entry;
+	int			entryno = TransactionIdToCTsEntry(xid);
+	CommitTimestampEntry entry;
 
-//    Assert(TransactionIdIsNormal(xid));
-    if(enable_committs_print)
-    {
-        elog(LOG, "TransactionIdSetCommitTs xid %d", xid);
-    }
-    entry.global_timestamp = gts;
-    entry.time = ts;
-    entry.nodeid = nodeid;
+//	Assert(TransactionIdIsNormal(xid));
+	if (enable_committs_print)
+	{
+		elog(LOG, "TransactionIdSetCommitTs: xid %d gts "INT64_FORMAT, xid, gts);
+	}
+	entry.global_timestamp = gts;
+	entry.time = ts;
+	entry.nodeid = nodeid;
 
-    memcpy(CommitTsCtl->shared[partitionno]->page_buffer[slotno] +
-           SizeOfCommitTimestampEntry * entryno,
-           &entry, SizeOfCommitTimestampEntry);
+	LruTlogDisableMemoryProtection(CommitTsCtl->shared[partitionno]->page_buffer[slotno]);
+	memcpy(CommitTsCtl->shared[partitionno]->page_buffer[slotno] +
+		   SizeOfCommitTimestampEntry * entryno,
+		   &entry, SizeOfCommitTimestampEntry);
+	LruTlogEnableMemoryProtection(CommitTsCtl->shared[partitionno]->page_buffer[slotno]);
 
 #ifdef __TBASE__
     /*
@@ -867,7 +873,7 @@ TrimCommitTs(void)
     CommitTsCtl->global_shared->latest_page_number = pageno;
     LWLockRelease(CommitTsControlLock);
     
-    elog(LOG, "Trim committs next xid %d latest page number %d entryno %d", xid, pageno, entryno);
+	elog(DEBUG10, "Trim committs next xid %d latest page number %d entryno %d", xid, pageno, entryno);
     
     
     /*
@@ -901,9 +907,12 @@ TrimCommitTs(void)
         
         byteptr = CommitTsCtl->shared[partitionno]->page_buffer[slotno] + byteno;
         
+		LruTlogDisableMemoryProtection(CommitTsCtl->shared[partitionno]->page_buffer[slotno]);
         /* Zero the rest of the page */
         MemSet(byteptr, 0, BLCKSZ - byteno);
-        elog(LOG, "zero out the remaining page starting from byteno %d len BLCKSZ -byteno %d entryno %d sizeofentry %lu", 
+		LruTlogEnableMemoryProtection(CommitTsCtl->shared[partitionno]->page_buffer[slotno]);
+
+        elog(DEBUG10, "zero out the remaining page starting from byteno %d len BLCKSZ -byteno %d entryno %d sizeofentry %lu",
             byteno, BLCKSZ - byteno, entryno, SizeOfCommitTimestampEntry);
         CommitTsCtl->shared[partitionno]->page_dirty[slotno] = true;
         
@@ -1191,19 +1200,26 @@ WriteSetTimestampXlogRec(TransactionId mainxid, int nsubxids,
                          TransactionId *subxids, TimestampTz global_timestamp, TimestampTz timestamp,
                          RepOriginId nodeid)
 {
-    xl_commit_ts_set record;
+	xl_commit_ts_set record;
 
-    record.global_timestamp = global_timestamp;
-    record.timestamp = timestamp;
-    record.nodeid = nodeid;
-    record.mainxid = mainxid;
+	record.global_timestamp = global_timestamp;
+	record.timestamp = timestamp;
+	record.nodeid = nodeid;
+	record.mainxid = mainxid;
 
-    XLogBeginInsert();
-    XLogRegisterData((char *) &record,
-                     offsetof(xl_commit_ts_set, mainxid) +
-                     sizeof(TransactionId));
-    XLogRegisterData((char *) subxids, nsubxids * sizeof(TransactionId));
-    XLogInsert(RM_COMMIT_TS_ID, COMMIT_TS_SETTS);
+	XLogBeginInsert();
+	XLogRegisterData((char *) &record,
+					 offsetof(xl_commit_ts_set, mainxid) +
+					 sizeof(TransactionId));
+	XLogRegisterData((char *) subxids, nsubxids * sizeof(TransactionId));
+	XLogInsert(RM_COMMIT_TS_ID, COMMIT_TS_SETTS);
+
+	if (enable_committs_print)
+	{
+		elog(LOG,
+			"WriteSetTimestampXlogRec: mainxid %d timestamp "INT64_FORMAT" global_timestamp "INT64_FORMAT,
+			mainxid, timestamp, global_timestamp);
+	}
 }
 
 /*

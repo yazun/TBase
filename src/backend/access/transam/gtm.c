@@ -40,6 +40,7 @@
 #include "utils/tqual.h"
 #include "pgxc/nodemgr.h"
 #include "access/xlog.h"
+#include "storage/lmgr.h"
 #endif
 
 /* To access sequences */
@@ -200,7 +201,9 @@ void RegisterRenameSequence(char *new, char *old)
         rename_info = (RenameInfo *) lfirst(cell);            
         if (0 == strncmp(rename_info->new, old, GTM_NAME_LEN))
         {            
-            elog(LOG, "Combine requence seq:%s ->:%s, %s->%s to old:%s latest new:%s", rename_info->new, rename_info->old, new, old, rename_info->old, new);
+             elog(LOG, "Combine requence seq:%s ->:%s, %s->%s to old:%s latest "
+                                       "new:%s", rename_info->new, rename_info->old, new, old,
+                                       rename_info->old, new);
             snprintf(rename_info->new, GTM_NAME_LEN, "%s", new);
             return;
         }        
@@ -1079,100 +1082,105 @@ IsGTMConnected()
 }
 
 #ifdef __TBASE__
+/*
+ * Set gtm info with GtmHost and GtmPort.
+ *
+ * There are three cases:
+ * 1.New gtm info from create/alter gtm node command
+ * 2.Gtm info from pgxc_node
+ * 3.Gtm info from recovery gtm host
+ */
 static void 
 GetMasterGtmInfo(void)
-{// #lizard forgives
-    /* Check gtm host and port info */
-    Relation    rel;
-    HeapScanDesc scan;
-    HeapTuple    gtmtup;
-    Form_pgxc_node    nodeForm;
-    bool        found = false;
+{
+	/* Check gtm host and port info */
+	Relation	rel;
+	HeapScanDesc scan;
+	HeapTuple	gtmtup;
+	Form_pgxc_node	nodeForm;
+	bool		found = false;
 
-    /* reset gtm info */
-    ResetGtmInfo();
+	/* reset gtm info */
+	ResetGtmInfo();
 
-    /* we have no recovery gtm host info, just read from heap. */
-    if (!g_recovery_gtm_host->need_read)
-    {
-        rel = heap_open(PgxcNodeRelationId, AccessShareLock);
-        scan = heap_beginscan_catalog(rel, 0, NULL);
+	/* If NewGtmHost and NewGtmPort, just use it. */
+	if (NewGtmHost && NewGtmPort != 0)
+	{
+		GtmHost = strdup(NewGtmHost);
+		GtmPort = NewGtmPort;
 
-        /* Only one record will match */
-        while (HeapTupleIsValid(gtmtup = heap_getnext(scan, ForwardScanDirection)))
-        {
-            nodeForm = (Form_pgxc_node) GETSTRUCT(gtmtup);
-            if (PGXC_NODE_GTM == nodeForm->node_type && nodeForm->nodeis_primary)
-            {
-                GtmHost = strdup(NameStr(nodeForm->node_host));
-                GtmPort = nodeForm->node_port;
-                found = true;
-                break;
-            }
-        }
+		free(NewGtmHost);
+		NewGtmHost = NULL;
+		NewGtmPort = 0;
 
-        heap_endscan(scan);
-        heap_close(rel, AccessShareLock);
-    }
-    else
-    {
-        /* get the gtm host info  */
-        GtmHost = strdup(NameStr(g_recovery_gtm_host->hostdata));
-        GtmPort = g_recovery_gtm_host->port;    
-        found = true;
-    }    
+		elog(LOG,
+			"GetMasterGtmInfo: set master gtm info with NewGtmHost:%s NewGtmPort:%d",
+			NewGtmHost, NewGtmPort);
+		return;
+	}
 
-    if (!found)
-    {
-        if (NewGtmHost && NewGtmPort != 0)
-        {
-            elog(LOG, "GetMasterGtmInfo: can not get master gtm info from pgxc_node, try use NewGtmHost:%s NewGtmPort:%d",
-                        NewGtmHost, NewGtmPort);
-        }
-        else
-        {
-            elog(LOG, "GetMasterGtmInfo: can not get master gtm info from pgxc_node");
-        }
-    }
+	/* we have no recovery gtm host info, just read from heap. */
+	if (!g_recovery_gtm_host->need_read)
+	{
+		/*
+		 * We must be sure there is no error report, because we may be
+		 * in AbortTransaction now.
+		 * 1.If we are not in a transaction, we should not open relation.
+		 * 2.If we do not get lock, it is ok to try it next time.
+		 */
+		if (IsTransactionState() &&
+			ConditionalLockRelationOid(PgxcNodeRelationId, AccessShareLock))
+		{
+			rel = relation_open(PgxcNodeRelationId, NoLock);
+			scan = heap_beginscan_catalog(rel, 0, NULL);
+			/* Only one record will match */
+			while (HeapTupleIsValid(gtmtup = heap_getnext(scan, ForwardScanDirection)))
+			{
+				nodeForm = (Form_pgxc_node) GETSTRUCT(gtmtup);
+				if (PGXC_NODE_GTM == nodeForm->node_type && nodeForm->nodeis_primary)
+				{
+					GtmHost = strdup(NameStr(nodeForm->node_host));
+					GtmPort = nodeForm->node_port;
+					found = true;
+					break;
+				}
+			}
+			heap_endscan(scan);
+			relation_close(rel, AccessShareLock);
+		}
+	}
+	else
+	{
+		/* get the gtm host info  */
+		GtmHost = strdup(NameStr(g_recovery_gtm_host->hostdata));
+		GtmPort = g_recovery_gtm_host->port;	
+		found = true;
+	}	
+
+	if (!found)
+	{
+		elog(LOG,
+			"GetMasterGtmInfo: can not get master gtm info from pgxc_node");
+	}
 }
 #endif
 
 static void
 CheckConnection(void)
-{// #lizard forgives
-#ifdef __TBASE__
-    /* First time try connect to gtm, get gtm info from syscache first */
-    if (NULL == GtmHost && 0 == GtmPort)
-    {
-        GetMasterGtmInfo();
-    }
+{
+	/* Be sure that a backend does not use a postmaster connection */
+	if (IsUnderPostmaster && GTMPQispostmaster(conn) == 1)
+	{
+		CloseGTM();
+		InitGTM();
+		return;
+	}
 
-    /* If NewGtmHost and NewGtmPort were set, we are in create/alter gtm node command */
-    if (NewGtmHost && NewGtmPort != 0)
-    {
-        ResetGtmInfo();
-        
-        GtmHost = strdup(NewGtmHost);
-        GtmPort = NewGtmPort;
-
-        free(NewGtmHost);
-        NewGtmHost = NULL;
-        NewGtmPort = 0;
-
-        /* Close old gtm connection */
-        CloseGTM();
-    }
-#endif
-
-    /* Be sure that a backend does not use a postmaster connection */
-    if (IsUnderPostmaster && GTMPQispostmaster(conn) == 1)
-    {
-        InitGTM();
-        return;
-    }
-
-    if (GTMPQstatus(conn) != CONNECTION_OK)
-        InitGTM();
+	if (GTMPQstatus(conn) != CONNECTION_OK)
+	{
+		CloseGTM();
+		InitGTM();
+	}
 }
 
 void
@@ -1181,95 +1189,126 @@ InitGTM(void)
 #define  CONNECT_STR_LEN   256 /* 256 bytes should be enough */
     char conn_str[CONNECT_STR_LEN];
 #ifdef __TBASE__
-    int  try_cnt = 0;
-    const int max_try_cnt = 1;
+	int  try_cnt = 0;
+	const int max_try_cnt = 1;
+
+	/*
+	 * Only re-set gtm info in two cases:
+	 * 1.No gtm info
+	 * 2.New gtm info by create/alter gtm node command
+	 */
+	if ((GtmHost == NULL && GtmPort == 0) ||
+		(NewGtmHost != NULL && NewGtmPort != 0))
+	{
+		GetMasterGtmInfo();
+	}
+	if (GtmHost == NULL && GtmPort == 0)
+	{
+		ereport(LOG,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("GtmHost and GtmPort are not set")));
+		return;
+	}
 #endif
 
 try_connect_gtm:
-    /* If this thread is postmaster itself, it contacts gtm identifying itself */
-    if (!IsUnderPostmaster)
-    {
-        GTM_PGXCNodeType remote_type = GTM_NODE_DEFAULT;
+	/* If this thread is postmaster itself, it contacts gtm identifying itself */
+	if (!IsUnderPostmaster)
+	{
+		GTM_PGXCNodeType remote_type = GTM_NODE_DEFAULT;
 
-        if (IS_PGXC_COORDINATOR)
-            remote_type = GTM_NODE_COORDINATOR;
-        else if (IS_PGXC_DATANODE)
-            remote_type = GTM_NODE_DATANODE;
+		if (IS_PGXC_COORDINATOR)
+			remote_type = GTM_NODE_COORDINATOR;
+		else if (IS_PGXC_DATANODE)
+			remote_type = GTM_NODE_DATANODE;
 
-        /* Use 60s as connection timeout */
-        snprintf(conn_str, CONNECT_STR_LEN, "host=%s port=%d node_name=%s remote_type=%d postmaster=1 connect_timeout=%d",
-                                GtmHost, GtmPort, PGXCNodeName, remote_type,
-                                GtmConnectTimeout);
+		/* Use 60s as connection timeout */
+		snprintf(conn_str, CONNECT_STR_LEN, "host=%s port=%d node_name=%s remote_type=%d postmaster=1 connect_timeout=%d",
+								GtmHost, GtmPort, PGXCNodeName, remote_type,
+								tcp_keepalives_idle > 0 ?
+								tcp_keepalives_idle : GtmConnectTimeout);
 
-        /* Log activity of GTM connections */
-        if(GTMDebugPrint)
-            elog(LOG, "Postmaster: connection established to GTM with string %s", conn_str);
-    }
-    else
-    {
-        /* Use 60s as connection timeout */
-        snprintf(conn_str, CONNECT_STR_LEN, "host=%s port=%d node_name=%s connect_timeout=%d",
-                GtmHost, GtmPort, PGXCNodeName, GtmConnectTimeout);
+		/* Log activity of GTM connections */
+		if(GTMDebugPrint)
+			elog(LOG, "Postmaster: connection established to GTM with string %s", conn_str);
+	}
+	else
+	{
+		/* Use 60s as connection timeout */
+		snprintf(conn_str, CONNECT_STR_LEN, "host=%s port=%d node_name=%s connect_timeout=%d",
+				GtmHost, GtmPort, PGXCNodeName,
+				tcp_keepalives_idle > 0 ?
+				tcp_keepalives_idle : GtmConnectTimeout);
 
-        /* Log activity of GTM connections */
-        if (IsAutoVacuumWorkerProcess() && GTMDebugPrint)
-            elog(LOG, "Autovacuum worker: connection established to GTM with string %s", conn_str);
-        else if (IsAutoVacuumLauncherProcess() && GTMDebugPrint)
-            elog(LOG, "Autovacuum launcher: connection established to GTM with string %s", conn_str);
-        else if (IsClusterMonitorProcess() && GTMDebugPrint)
-            elog(LOG, "Cluster monitor: connection established to GTM with string %s", conn_str);
-        else if(GTMDebugPrint)
-            elog(LOG, "Postmaster child: connection established to GTM with string %s", conn_str);
-    }
+		/* Log activity of GTM connections */
+		if (IsAutoVacuumWorkerProcess() && GTMDebugPrint)
+			elog(LOG, "Autovacuum worker: connection established to GTM with string %s", conn_str);
+		else if (IsAutoVacuumLauncherProcess() && GTMDebugPrint)
+			elog(LOG, "Autovacuum launcher: connection established to GTM with string %s", conn_str);
+		else if (IsClusterMonitorProcess() && GTMDebugPrint)
+			elog(LOG, "Cluster monitor: connection established to GTM with string %s", conn_str);
+		else if(GTMDebugPrint)
+			elog(LOG, "Postmaster child: connection established to GTM with string %s", conn_str);
+	}
 
-    conn = PQconnectGTM(conn_str);
-    if (GTMPQstatus(conn) != CONNECTION_OK)
-    {
-        int save_errno = errno;
-        
-#ifdef __TBASE__    
-        if (try_cnt < max_try_cnt)
-        {
-            /* If connect gtm failed, get gtm info from syscache, and try again */
-            GetMasterGtmInfo();
-            if (GtmHost != NULL && GtmPort)
-            {
-                elog(DEBUG1, "[InitGTM] Get GtmHost:%s  GtmPort:%d try_cnt:%d max_try_cnt:%d", 
-                             GtmHost, GtmPort, try_cnt, max_try_cnt);
-            }
-            CloseGTM();
-            try_cnt++;
-            goto try_connect_gtm;
-        }
-        else
-#endif        
-        {
-            ResetGtmInfo();
+	conn = PQconnectGTM(conn_str);
+	if (GTMPQstatus(conn) != CONNECTION_OK)
+	{
+		int save_errno = errno;
+		
+#ifdef __TBASE__	
+		if (try_cnt < max_try_cnt)
+		{
+			/* If connect gtm failed, get gtm info from syscache, and try again */
+			GetMasterGtmInfo();
+			if (GtmHost != NULL && GtmPort)
+			{
+				elog(DEBUG1, "[InitGTM] Get GtmHost:%s  GtmPort:%d try_cnt:%d max_try_cnt:%d", 
+							 GtmHost, GtmPort, try_cnt, max_try_cnt);
+			}
+			CloseGTM();
+			try_cnt++;
+			goto try_connect_gtm;
+		}
+		else
+#endif		
+		{
+			ResetGtmInfo();
 
-            /* Use LOG instead of ERROR to avoid error stack overflow. */
-            if(conn)
-            {
-                ereport(LOG,
-                    (errcode(ERRCODE_INTERNAL_ERROR),
-                     errmsg("can not connect to GTM: %s %m", GTMPQerrorMessage(conn))));
-            }
-            else
-            {
-                ereport(LOG,
-                    (errcode(ERRCODE_INTERNAL_ERROR),
-                     errmsg("connection is null: %m")));
-            }
+			/* Use LOG instead of ERROR to avoid error stack overflow. */
+			if(conn)
+			{
+				ereport(LOG,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("can not connect to GTM: %s %m", GTMPQerrorMessage(conn))));
+			}
+			else
+			{
+				ereport(LOG,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("connection is null: %m")));
+			}
 
-            errno = save_errno;
+			errno = save_errno;
 
-            CloseGTM();
-        }
-        
-    }
-    else if (IS_PGXC_COORDINATOR)
-    {
-        register_session(conn, PGXCNodeName, MyProcPid, MyBackendId);
-    }
+			CloseGTM();
+		}
+		
+	}
+	else
+	{
+		if (!GTMSetSockKeepAlive(conn, tcp_keepalives_idle,
+							tcp_keepalives_interval, tcp_keepalives_count))
+		{
+			ereport(LOG,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("GTMSetSockKeepAlive failed: %m")));
+		}
+		if (IS_PGXC_COORDINATOR)
+		{
+			register_session(conn, PGXCNodeName, MyProcPid, MyBackendId);
+		}
+	}
 }
 
 void
@@ -1302,7 +1341,6 @@ GetGlobalTimestampGTM(void)
     GTM_Timestamp  latest_gts = InvalidGlobalTimestamp;
     struct rusage start_r;
     struct timeval start_t;
-    int retries = 0;
 
     if (log_gtm_stats)
         ResetUsageCommon(&start_r, &start_t);
@@ -1343,36 +1381,28 @@ GetGlobalTimestampGTM(void)
     if (log_gtm_stats)
         ShowUsageCommon("BeginTranGTM", &start_r, &start_t);
 
-retry:
-    
-    latest_gts = GetLatestCommitTS();
-    if (gts_result.gts != InvalidGlobalTimestamp && latest_gts > (gts_result.gts + GTM_CHECK_DELTA))
-    {
-        if(retries < 3)
-        {
-            retries++;
-            goto retry;
-        }
-        
-        elog(ERROR, "global gts:%lu is earlier than local gts:%lu, please check GTM status!", gts_result.gts + GTM_CHECK_DELTA, latest_gts);
-    }
+	latest_gts = GetLatestCommitTS();
+	if (gts_result.gts != InvalidGlobalTimestamp && latest_gts > (gts_result.gts + GTM_CHECK_DELTA))
+	{
+		elog(ERROR, "global gts:%lu is earlier than local gts:%lu, please check GTM status!", gts_result.gts + GTM_CHECK_DELTA, latest_gts);
+	}
 
-    /* if we are standby, use timestamp subtracting given interval */
-    if (IsStandbyPostgres() && query_delay)
-    {
-        GTM_Timestamp  interval = query_delay * USECS_PER_SEC;
+	/* if we are standby, use timestamp subtracting given interval */
+	if (IsStandbyPostgres() && query_delay)
+	{
+		GTM_Timestamp  interval = query_delay * USECS_PER_SEC;
 
-        gts_result.gts = gts_result.gts - interval;
+		gts_result.gts = gts_result.gts - interval;
 
-        if (gts_result.gts < FirstGlobalTimestamp)
-        {
-            gts_result.gts = FirstGlobalTimestamp;
-        }
-    }
+		if (gts_result.gts < FirstGlobalTimestamp)
+		{
+			gts_result.gts = FirstGlobalTimestamp;
+		}
+	}
 
-    GTM_ReadOnly = gts_result.gtm_readonly;
-    
-    return gts_result.gts;
+	GTM_ReadOnly = gts_result.gtm_readonly;
+	
+	return gts_result.gts;
 }
 #endif
 

@@ -716,23 +716,6 @@ ExecReScanBitmapHeapScan(BitmapHeapScanState *node)
     node->shared_tbmiterator = NULL;
     node->shared_prefetch_iterator = NULL;
 
-    /* Reset parallel bitmap state, if present */
-    if (node->pstate)
-    {
-        dsa_area   *dsa = node->ss.ps.state->es_query_dsa;
-
-        node->pstate->state = BM_INITIAL;
-
-        if (DsaPointerIsValid(node->pstate->tbmiterator))
-            tbm_free_shared_area(dsa, node->pstate->tbmiterator);
-
-        if (DsaPointerIsValid(node->pstate->prefetch_iterator))
-            tbm_free_shared_area(dsa, node->pstate->prefetch_iterator);
-
-        node->pstate->tbmiterator = InvalidDsaPointer;
-        node->pstate->prefetch_iterator = InvalidDsaPointer;
-    }
-
     ExecScanReScan(&node->ss);
 
     /*
@@ -1055,18 +1038,44 @@ ExecBitmapHeapInitializeDSM(BitmapHeapScanState *node,
 }
 
 /* ----------------------------------------------------------------
+ *		ExecBitmapHeapReInitializeDSM
+ *
+ *		Reset shared state before beginning a fresh scan.
+ * ----------------------------------------------------------------
+ */
+void
+ExecBitmapHeapReInitializeDSM(BitmapHeapScanState *node,
+							  ParallelContext *pcxt)
+{
+	ParallelBitmapHeapState *pstate = node->pstate;
+	dsa_area   *dsa = node->ss.ps.state->es_query_dsa;
+
+	pstate->state = BM_INITIAL;
+
+	if (DsaPointerIsValid(pstate->tbmiterator))
+		tbm_free_shared_area(dsa, pstate->tbmiterator);
+
+	if (DsaPointerIsValid(pstate->prefetch_iterator))
+		tbm_free_shared_area(dsa, pstate->prefetch_iterator);
+
+	pstate->tbmiterator = InvalidDsaPointer;
+	pstate->prefetch_iterator = InvalidDsaPointer;
+}
+
+/* ----------------------------------------------------------------
  *        ExecBitmapHeapInitializeWorker
  *
  *        Copy relevant information from TOC into planstate.
  * ----------------------------------------------------------------
  */
 void
-ExecBitmapHeapInitializeWorker(BitmapHeapScanState *node, shm_toc *toc)
+ExecBitmapHeapInitializeWorker(BitmapHeapScanState *node,
+							   ParallelWorkerContext *pwcxt)
 {
     ParallelBitmapHeapState *pstate;
     Snapshot    snapshot;
 
-    pstate = shm_toc_lookup(toc, node->ss.ps.plan->plan_node_id, false);
+	pstate = shm_toc_lookup(pwcxt->toc, node->ss.ps.plan->plan_node_id, false);
     node->pstate = pstate;
 
     snapshot = RestoreSnapshot(pstate->phs_snapshot_data);

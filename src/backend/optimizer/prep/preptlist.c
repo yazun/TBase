@@ -229,13 +229,19 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 
                                     secDataType = exprType((Node *)keyTle->expr);
 
-                                    secConstExpr = (Const *) eval_const_expressions(root,
+									/* evaluate sql value function on coordinator */
+									keyTle->expr = (Expr *) replace_eval_sql_value_function(
+											(Node *)keyTle->expr);
+
+									secConstExpr = (Const *) estimate_expression_value(root,
                                                              (Node *)keyTle->expr);
+
+									/* cold hot insert router must be on coordinator */
                                     if (!IsA(secConstExpr, Const) ||
                                                 secConstExpr->consttype != secDataType)
                                     {
-                                        list_free(nodeList);
-                                        goto END_restrict;
+										list_free(nodeList);
+										goto END_restrict;
                                     }
 
                                     secisnull = secConstExpr->constisnull;
@@ -362,6 +368,20 @@ END_restrict:
                                   pstrdup(resname),
                                   true);
             tlist = lappend(tlist, tle);
+			
+			/* Need to fetch another xc_node_id */
+			var = makeVar(rc->rti,
+			              XC_NodeIdAttributeNumber,
+			              INT4OID,
+			              -1,
+			              InvalidOid,
+			              0);
+			snprintf(resname, sizeof(resname), "xc_node_id%u", rc->rowmarkId);
+			tle = makeTargetEntry((Expr *) var,
+			                      list_length(tlist) + 1,
+			                      pstrdup(resname),
+			                      true);
+			tlist = lappend(tlist, tle);
         }
         if (rc->allMarkTypes & (1 << ROW_MARK_COPY))
         {

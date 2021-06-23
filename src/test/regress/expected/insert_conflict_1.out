@@ -51,8 +51,8 @@ explain (costs off) insert into insertconflicttest values(0, 'Crowberry') on con
 
 explain (costs off) insert into insertconflicttest values(0, 'Crowberry') on conflict (key, fruit) do update set fruit = excluded.fruit
   where exists (select 1 from insertconflicttest ii where ii.key = excluded.key);
-                                       QUERY PLAN                                       
-----------------------------------------------------------------------------------------
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
  Remote Subquery Scan on all (datanode_2)
    ->  Insert on insertconflicttest
          Conflict Resolution: UPDATE
@@ -61,8 +61,8 @@ explain (costs off) insert into insertconflicttest values(0, 'Crowberry') on con
          ->  Result
          SubPlan 1
            ->  Remote Subquery Scan on all (datanode_1,datanode_2)
-                 ->  Index Only Scan using both_index_expr_key on insertconflicttest ii
-                       Index Cond: (key = excluded.key)
+                 ->  Seq Scan on insertconflicttest ii
+                       Filter: (key = excluded.key)
 (10 rows)
 
 -- Neither collation nor operator class specifications are required --
@@ -219,37 +219,37 @@ explain (costs off) insert into insertconflicttest values(0, 'Crowberry') on con
 
 -- Does the same, but JSON format shows "Conflict Arbiter Index" as JSON array:
 explain (costs off, format json) insert into insertconflicttest values (0, 'Bilberry') on conflict (key) do update set fruit = excluded.fruit where insertconflicttest.fruit != 'Lime' returning *;
-                                 QUERY PLAN                                 
-----------------------------------------------------------------------------
- [                                                                         +
-   {                                                                       +
-     "Plan": {                                                             +
-       "Node Type": "Remote Subquery Scan",                                +
-       "Parallel Aware": false,                                            +
-       "Replicated": "no",                                                 +
-       "Node List": ["datanode_2"],                                        +
-       "Plans": [                                                          +
-         {                                                                 +
-           "Node Type": "ModifyTable",                                     +
-           "Operation": "Insert",                                          +
-           "Parent Relationship": "Outer",                                 +
-           "Parallel Aware": false,                                        +
-           "Relation Name": "insertconflicttest",                          +
-           "Alias": "insertconflicttest",                                  +
-           "Conflict Resolution": "UPDATE",                                +
-           "Conflict Arbiter Indexes": ["key_index"],                      +
-           "Conflict Filter": "(insertconflicttest.fruit <> 'Lime'::text)",+
-           "Plans": [                                                      +
-             {                                                             +
-               "Node Type": "Result",                                      +
-               "Parent Relationship": "Member",                            +
-               "Parallel Aware": false                                     +
-             }                                                             +
-           ]                                                               +
-         }                                                                 +
-       ]                                                                   +
-     }                                                                     +
-   }                                                                       +
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ [                                                                           +
+   {                                                                         +
+     "Plan": {                                                               +
+       "Node Type": "Remote Fast Query Execution",                           +
+       "Parallel Aware": false,                                              +
+       "Node expr": "0"                                                      +
+       "Remote plan": [                                                      +
+         {                                                                   +
+           "Plan": {                                                         +
+             "Node Type": "ModifyTable",                                     +
+             "Operation": "Insert",                                          +
+             "Parallel Aware": false,                                        +
+             "Relation Name": "insertconflicttest",                          +
+             "Alias": "insertconflicttest",                                  +
+             "Conflict Resolution": "UPDATE",                                +
+             "Conflict Arbiter Indexes": ["key_index"],                      +
+             "Conflict Filter": "(insertconflicttest.fruit <> 'Lime'::text)",+
+             "Plans": [                                                      +
+               {                                                             +
+                 "Node Type": "Result",                                      +
+                 "Parent Relationship": "Member",                            +
+                 "Parallel Aware": false                                     +
+               }                                                             +
+             ]                                                               +
+           }                                                                 +
+         }                                                                   +
+       ]                                                                     +
+     }                                                                       +
+   }                                                                         +
  ]
 (1 row)
 

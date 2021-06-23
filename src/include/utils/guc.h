@@ -269,7 +269,15 @@ extern int32   g_TransferSpeed;
 /* slicent copy from */
 extern bool g_enable_copy_silence;
 extern bool g_enable_user_authority_force_check;
+extern bool enable_buffer_mprotect;
+extern bool enable_clog_mprotect;
+extern bool enable_tlog_mprotect;
+extern bool enable_xlog_mprotect;
 extern int query_delay;
+
+extern bool enable_memory_optimization;
+extern int max_relcache_relations;
+extern int number_replaced_relations;
 #endif
 extern int    log_min_error_statement;
 extern int    log_min_messages;

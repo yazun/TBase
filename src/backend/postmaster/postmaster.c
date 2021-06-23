@@ -466,6 +466,9 @@ char            *PGXCClusterName = NULL;
 char            *PGXCMainClusterName = NULL;
 bool        IsPGXCMainCluster = false;
 int            PGXCNodeId = 0;
+#ifdef __TBASE__
+char             PGXCSessionId[NAMEDATALEN];
+#endif
 /*
  * When a particular node starts up, store the node identifier in this variable
  * so that we dont have to calculate it OR do a search in cache any where else
@@ -7241,6 +7244,26 @@ void PostmasterDisableTimeout(void)
     {
         disable_timeout(g_postmaster_timeout_id, true);
     }
+}
+
+/*
+ * Whether the database is primary instance and it is normal.
+ */
+bool PostmasterIsPrimaryAndNormal(void)
+{
+	/*
+	 * Do not consider: pmState == PM_HOT_STANDBY. Because the original data may
+	 * be retained in the slave instance, which is inconsistent with the reset
+	 * data in the primary instance.
+	 */
+	if (pmState == PM_RUN)
+	{
+		return true;
+	}
+	else
+	{
+		return false;
+	}
 }
 
 void InitPostmasterLatch(void)

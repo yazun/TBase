@@ -1697,6 +1697,7 @@ _outRemoteSubplan(StringInfo str, const RemoteSubplan *node)
     WRITE_STRING_FIELD(cursor);
     WRITE_INT_FIELD(unique);
     WRITE_BOOL_FIELD(parallelWorkerSendTuple);
+	WRITE_BITMAPSET_FIELD(initPlanParams);
 
 #ifdef __TBASE__
     if (IS_PGXC_COORDINATOR && !g_set_global_snapshot)
@@ -3604,10 +3605,11 @@ _outRelOptInfo(StringInfo str, const RelOptInfo *node)
     WRITE_BOOL_FIELD(has_eclass_joins);
     WRITE_BITMAPSET_FIELD(top_parent_relids);
 #ifdef __TBASE__
-    WRITE_BOOL_FIELD(intervalparent);
-    WRITE_BOOL_FIELD(isdefault);
-    WRITE_BITMAPSET_FIELD(childs);
-    WRITE_INT_FIELD(estimate_partidx);
+	WRITE_BOOL_FIELD(intervalparent);
+	WRITE_BOOL_FIELD(isdefault);
+	WRITE_BITMAPSET_FIELD(childs);
+	WRITE_INT_FIELD(estimate_partidx);
+    WRITE_ENUM_FIELD(resultRelLoc, ResultRelLocation);
 #endif
 }
 
@@ -4376,16 +4378,17 @@ _outCommonTableExpr(StringInfo str, const CommonTableExpr *node)
 {
     WRITE_NODE_TYPE("COMMONTABLEEXPR");
 
-    WRITE_STRING_FIELD(ctename);
-    WRITE_NODE_FIELD(aliascolnames);
-    WRITE_NODE_FIELD(ctequery);
-    WRITE_LOCATION_FIELD(location);
-    WRITE_BOOL_FIELD(cterecursive);
-    WRITE_INT_FIELD(cterefcount);
-    WRITE_NODE_FIELD(ctecolnames);
-    WRITE_NODE_FIELD(ctecoltypes);
-    WRITE_NODE_FIELD(ctecoltypmods);
-    WRITE_NODE_FIELD(ctecolcollations);
+	WRITE_STRING_FIELD(ctename);
+	WRITE_NODE_FIELD(aliascolnames);
+    WRITE_ENUM_FIELD(ctematerialized, CTEMaterialize);
+	WRITE_NODE_FIELD(ctequery);
+	WRITE_LOCATION_FIELD(location);
+	WRITE_BOOL_FIELD(cterecursive);
+	WRITE_INT_FIELD(cterefcount);
+	WRITE_NODE_FIELD(ctecolnames);
+	WRITE_NODE_FIELD(ctecoltypes);
+	WRITE_NODE_FIELD(ctecoltypmods);
+	WRITE_NODE_FIELD(ctecolcollations);
 }
 
 static void

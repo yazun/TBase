@@ -2258,7 +2258,7 @@ expression_tree_walker(Node *node,
  * Some callers want to suppress visitation of certain items in the sub-Query,
  * typically because they need to process them specially, or don't actually
  * want to recurse into subqueries.  This is supported by the flags argument,
- * which is the bitwise OR of flag values to suppress visitation of
+ * which is the bitwise OR of flag values to add or suppress visitation of
  * indicated items.  (More flag bits may be added as needed.)
  */
 bool
@@ -2320,53 +2320,57 @@ query_tree_walker(Query *query,
  */
 bool
 range_table_walker(List *rtable,
-                   bool (*walker) (),
-                   void *context,
-                   int flags)
-{// #lizard forgives
-    ListCell   *rt;
+				   bool (*walker) (),
+				   void *context,
+				   int flags)
+{
+	ListCell   *rt;
 
-    foreach(rt, rtable)
-    {
-        RangeTblEntry *rte = (RangeTblEntry *) lfirst(rt);
+	foreach(rt, rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(rt);
 
-        /* For historical reasons, visiting RTEs is not the default */
-        if (flags & QTW_EXAMINE_RTES)
-            if (walker(rte, context))
-                return true;
+		/*
+		 * Walkers might need to examine the RTE node itself either before or
+		 * after visiting its contents (or, conceivably, both).  Note that if
+		 * you specify neither flag, the walker won't visit the RTE at all.
+		 */
+		if (flags & QTW_EXAMINE_RTES_BEFORE)
+			if (walker(rte, context))
+				return true;
 
-        switch (rte->rtekind)
-        {
-            case RTE_RELATION:
-                if (walker(rte->tablesample, context))
-                    return true;
-                break;
-            case RTE_CTE:
-            case RTE_NAMEDTUPLESTORE:
-                /* nothing to do */
-                break;
-            case RTE_SUBQUERY:
-                if (!(flags & QTW_IGNORE_RT_SUBQUERIES))
-                    if (walker(rte->subquery, context))
-                        return true;
-                break;
-            case RTE_JOIN:
-                if (!(flags & QTW_IGNORE_JOINALIASES))
-                    if (walker(rte->joinaliasvars, context))
-                        return true;
-                break;
-            case RTE_FUNCTION:
-                if (walker(rte->functions, context))
-                    return true;
-                break;
-            case RTE_TABLEFUNC:
-                if (walker(rte->tablefunc, context))
-                    return true;
-                break;
-            case RTE_VALUES:
-                if (walker(rte->values_lists, context))
-                    return true;
-                break;
+		switch (rte->rtekind)
+		{
+			case RTE_RELATION:
+				if (walker(rte->tablesample, context))
+					return true;
+				break;
+			case RTE_CTE:
+			case RTE_NAMEDTUPLESTORE:
+				/* nothing to do */
+				break;
+			case RTE_SUBQUERY:
+				if (!(flags & QTW_IGNORE_RT_SUBQUERIES))
+					if (walker(rte->subquery, context))
+						return true;
+				break;
+			case RTE_JOIN:
+				if (!(flags & QTW_IGNORE_JOINALIASES))
+					if (walker(rte->joinaliasvars, context))
+						return true;
+				break;
+			case RTE_FUNCTION:
+				if (walker(rte->functions, context))
+					return true;
+				break;
+			case RTE_TABLEFUNC:
+				if (walker(rte->tablefunc, context))
+					return true;
+				break;
+			case RTE_VALUES:
+				if (walker(rte->values_lists, context))
+					return true;
+				break;
 #ifdef PGXC
             case RTE_REMOTE_DUMMY:
                 elog(ERROR, "Invalid RTE found.");
@@ -2374,10 +2378,14 @@ range_table_walker(List *rtable,
 #endif /* PGXC */
         }
 
-        if (walker(rte->securityQuals, context))
-            return true;
-    }
-    return false;
+		if (walker(rte->securityQuals, context))
+			return true;
+
+		if (flags & QTW_EXAMINE_RTES_AFTER)
+			if (walker(rte, context))
+				return true;
+	}
+	return false;
 }
 
 
@@ -3863,4 +3871,114 @@ planstate_walk_members(List *plans, PlanState **planstates,
     }
 
     return false;
+}
+
+/*
+ * Walk a list of SubPlans (or initPlans, which also use SubPlan nodes).
+ */
+static bool
+plantree_walk_initplans(List *plans,
+                        List *subplans,
+                        bool (*walker) (),
+                        void *context)
+{
+	ListCell   *lc;
+	
+	foreach(lc, plans)
+	{
+		Plan    *splan = list_nth_node(Plan, subplans,
+								 (lfirst_node(SubPlan, lc))->plan_id);
+		
+		if (walker(splan, context))
+			return true;
+	}
+	
+	return false;
+}
+
+/*
+ * plantree_walker --- walk plan trees
+ *
+ * The walker has already visited the current node, and so we need only
+ * recurse into any sub-nodes it has.
+ */
+bool
+plantree_walker(Plan *plan,
+                List *top_subplans,
+                bool (*walker) (),
+                void *context)
+{
+	ListCell   *lc;
+	
+	if (plan == NULL)
+		return false;
+	
+	/* initPlan-s */
+	if (plantree_walk_initplans(plan->initPlan, top_subplans, walker, context))
+		return true;
+	
+	/* lefttree */
+	if (walker(plan->lefttree, top_subplans, context))
+		return true;
+	
+	/* righttree */
+	if (walker(plan->righttree, top_subplans, context))
+		return true;
+	
+	/* special child plans */
+	switch (nodeTag(plan))
+	{
+		case T_ModifyTable:
+			foreach(lc, ((ModifyTable *) plan)->plans)
+			{
+				if (walker((Plan *) lfirst(lc), top_subplans, context))
+					return true;
+			}
+			break;
+		case T_Append:
+			foreach(lc, ((Append *) plan)->appendplans)
+			{
+				if (walker((Plan *) lfirst(lc), top_subplans, context))
+					return true;
+			}
+			break;
+		case T_MergeAppend:
+			foreach(lc, ((MergeAppend *) plan)->mergeplans)
+			{
+				if (walker((Plan *) lfirst(lc), top_subplans, context))
+					return true;
+			}
+			break;
+		case T_BitmapAnd:
+			foreach(lc, ((BitmapAnd *) plan)->bitmapplans)
+			{
+				if (walker((Plan *) lfirst(lc), top_subplans, context))
+					return true;
+			}
+			break;
+		case T_BitmapOr:
+			foreach(lc, ((BitmapOr *) plan)->bitmapplans)
+			{
+				if (walker((Plan *) lfirst(lc), top_subplans, context))
+					return true;
+			}
+			break;
+		case T_SubqueryScan:
+			{
+				if (walker(castNode(SubqueryScan, plan)->subplan, top_subplans, context))
+					return true;
+			}
+			break;
+		case T_CustomScan:
+			foreach(lc, ((CustomScan *) plan)->custom_plans)
+			{
+				if (walker((Plan *) lfirst(lc), top_subplans, context))
+					return true;
+			}
+			break;
+		default:
+			break;
+	}
+	
+	return false;
 }

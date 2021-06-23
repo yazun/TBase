@@ -96,6 +96,9 @@ do { \
         elog(WARNING, "trying to delete portal name that does not exist"); \
 } while(0)
 
+/* Hooks for plugins to get control in PortalDrop */
+PortalDrop_hook_type PortalDrop_hook = NULL;
+
 static MemoryContext PortalMemory = NULL;
 
 
@@ -564,6 +567,9 @@ PortalDrop(Portal portal, bool isTopCommit)
                 (errcode(ERRCODE_INVALID_CURSOR_STATE),
                  errmsg("cannot drop active portal \"%s\"", portal->name)));
 
+	if (PortalDrop_hook)
+		PortalDrop_hook(portal);
+	
     /*
      * Allow portalcmds.c to clean up the state it knows about, in particular
      * shutting down the executor if still active.  This step potentially runs
@@ -606,15 +612,6 @@ PortalDrop(Portal portal, bool isTopCommit)
      */
     if (portalIsProducing(portal))
         return;
-
-    if (portal->queryDesc)
-    {
-        ResourceOwner saveResourceOwner = CurrentResourceOwner;
-        CurrentResourceOwner = portal->resowner;
-        FreeQueryDesc(portal->queryDesc);
-        CurrentResourceOwner = saveResourceOwner;
-        portal->queryDesc = NULL;
-    }
 #endif
 
     /*
@@ -660,15 +657,18 @@ PortalDrop(Portal portal, bool isTopCommit)
     {
 
 #ifdef __TBASE__
-        /* 
-         * when dn recv rollback_subtxn, the resource already release by AbortSubTransaction,
-         * and the memory delete by CleanupSubTransaction (delete parent memory context op will delete child)
-         */
-		if (strcmp(portal->commandTag, "ROLLBACK SUBTXN") == 0)
-        {
-            elog(LOG, "skip delete portal resowner");
-        }
-        else
+		/* 
+		 * When CN/DN received rollback_subtxn, the resource already been
+		 * released by AbortSubTransaction, and the memory delete by
+		 * CleanupSubTransaction (delete parent memory context operation
+		 * will delete child)
+		 */
+		if (portal->commandTag &&
+			strcmp(portal->commandTag, "ROLLBACK SUBTXN") == 0)
+		{
+			elog(LOG, "skip delete portal resowner");
+		}
+		else
 #endif
         {
             bool        isCommit = (portal->status != PORTAL_FAILED);

@@ -38,6 +38,7 @@
 #include "utils/relcache.h"
 #include "utils/tqual.h"
 #include "utils/syscache.h"
+#include "utils/varbit.h"
 #include "nodes/nodes.h"
 #include "optimizer/clauses.h"
 #include "parser/parse_coerce.h"
@@ -914,6 +915,14 @@ FreeRelationLocInfo(RelationLocInfo *relationLocInfo)
     {
         if (relationLocInfo->partAttrName)
             pfree(relationLocInfo->partAttrName);
+
+#ifdef __COLD_HOT__
+		if (relationLocInfo->secAttrName)
+			pfree(relationLocInfo->secAttrName);
+#endif
+
+		list_free(relationLocInfo->rl_nodeList);
+
         pfree(relationLocInfo);
     }
 }
@@ -1020,6 +1029,9 @@ hash_func_ptr(Oid dataType)
             return hash_numeric;
         case UUIDOID:
             return uuid_hash;
+		case BITOID:
+		case VARBITOID:
+			return bithash;
         default:
             return NULL;
     }
@@ -2156,6 +2168,25 @@ IsDistributedColumn(AttrNumber attr, RelationLocInfo *relation_loc_info)
 
     return result;
 }
+
+/*
+ * Calculate the tuple replication times based on replication type and number
+ * of target nodes.
+ */
+int
+calcDistReplications(char distributionType, Bitmapset *nodes)
+{
+	if (!nodes)
+		return 1;
+
+	if (IsLocatorReplicated(distributionType) ||
+		IsLocatorNone(distributionType))
+	{
+		return  bms_num_members(nodes);
+	}
+
+	return 1;
+}
 #endif
 
 void *
@@ -2275,6 +2306,23 @@ GetRelationNodes(RelationLocInfo *rel_loc_info, Datum valueForDistCol,
 
     freeLocator(locator);
     return exec_nodes;
+}
+
+/*
+ * GetRelationNodesForExplain
+ * This is just for explain statement, just pick one datanode.
+ * The returned List is a copy, so it should be freed when finished.
+ */
+ExecNodes *
+GetRelationNodesForExplain(RelationLocInfo *rel_loc_info,
+				RelationAccessType accessType)
+{
+	ExecNodes	*exec_nodes;
+	exec_nodes = makeNode(ExecNodes);
+	exec_nodes->baselocatortype = rel_loc_info->locatorType;
+	exec_nodes->accesstype = accessType;
+	exec_nodes->nodeList = lappend_int(exec_nodes->nodeList, 1);
+	return exec_nodes;
 }
 
 /*

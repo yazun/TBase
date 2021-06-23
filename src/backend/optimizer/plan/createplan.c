@@ -104,11 +104,11 @@
 int remote_subplan_depth = 0;
 List *groupOids = NULL;
 bool mergejoin = false;
+bool child_of_gather = false;
 bool enable_group_across_query = false;
 bool enable_distributed_unique_plan = false;
 #endif
 #ifdef __COLD_HOT__
-bool has_distribute_remote_plan = false;
 bool has_cold_hot_table = false;
 #endif
 static Plan *create_plan_recurse(PlannerInfo *root, Path *best_path,
@@ -690,7 +690,6 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
     /* find is there any tables located in more than one group */
     if ((rel->reloptkind == RELOPT_BASEREL || rel->reloptkind == RELOPT_OTHER_MEMBER_REL) && rel->rtekind == RTE_RELATION)
     {
-        bool error = false;
         
         rte = root->simple_rte_array[rel->relid];
         relation = heap_open(rte->relid, NoLock);
@@ -701,26 +700,11 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
 
             if (AttributeNumberIsValid(loc->secAttrNum) || OidIsValid(loc->coldGroupId))
             {
-                if (has_distribute_remote_plan && list_length(groupOids) != 1)
-                {
-                    error = true;
-                }
-                else
-                {
                     has_cold_hot_table = true;
                 }
             }
-        }
 
         heap_close(relation, NoLock);
-
-        if (error)
-        {
-            has_distribute_remote_plan = false;
-            has_cold_hot_table = false;
-
-            elog(ERROR, "Tables which located in more than one group could not involved in query with join or redistribution");
-        }
     }
 #endif
 
@@ -936,6 +920,7 @@ create_scan_plan(PlannerInfo *root, Path *best_path, int flags)
                 switch(nodeTag(child))
                 {
                     case T_SeqScan:
+					case T_SampleScan:
                         break;
                     case T_IndexScan:
                         {
@@ -1971,6 +1956,14 @@ create_gather_plan(PlannerInfo *root, GatherPath *best_path)
     Gather       *gather_plan;
     Plan       *subplan;
     List       *tlist;
+    bool reset = false;
+
+    /* if child_of_gather is false, set child_of_gather true, and reset the value before return */
+    if (!child_of_gather)
+    {
+        child_of_gather = true;
+        reset = true;
+    }
 
     /*
      * Although the Gather node can project, we prefer to push down such work
@@ -1990,6 +1983,11 @@ create_gather_plan(PlannerInfo *root, GatherPath *best_path)
 
     /* use parallel mode for parallel plans. */
     root->glob->parallelModeNeeded = true;
+
+	if (reset)
+    {
+        child_of_gather = false;
+    }
 
     return gather_plan;
 }
@@ -3026,14 +3024,14 @@ create_modifytable_plan(PlannerInfo *root, ModifyTablePath *best_path)
     copy_generic_path_info(&plan->plan, &best_path->path);
 
 #ifdef __TBASE__
-    /*
-      * If we have unshippable triggers, we have to do DML on coordinators,
-      * generate remote_dml plan now.
-         */
-    if (root->parse->hasUnshippableTriggers)
-    {
-        create_remotedml_plan(root, (Plan *)plan, plan->operation);
-    }
+	/*
+	 * If we have unshippable triggers, we have to do DML on coordinators,
+	 * generate remote_dml plan now.
+     */
+	if (root->parse->hasUnshippableTriggers)
+	{
+		create_remotedml_plan(root, (Plan *)plan, plan->operation);
+	}
 #endif
     return plan;
 }
@@ -3827,6 +3825,11 @@ create_bitmap_subplan(PlannerInfo *root, Path *bitmapqual,
         List       *subindexquals = NIL;
         List       *subindexECs = NIL;
         ListCell   *l;
+		double      nodes = 1;
+
+#ifdef __TBASE__
+		nodes = path_count_datanodes(&apath->path);
+#endif
 
         /*
          * There may well be redundant quals among the subplans, since a
@@ -3855,7 +3858,7 @@ create_bitmap_subplan(PlannerInfo *root, Path *bitmapqual,
         plan->startup_cost = apath->path.startup_cost;
         plan->total_cost = apath->path.total_cost;
         plan->plan_rows =
-            clamp_row_est(apath->bitmapselectivity * apath->path.parent->tuples);
+			clamp_row_est(apath->bitmapselectivity * apath->path.parent->tuples / nodes);
         plan->plan_width = 0;    /* meaningless */
         plan->parallel_aware = false;
         plan->parallel_safe = apath->path.parallel_safe;
@@ -3915,11 +3918,15 @@ create_bitmap_subplan(PlannerInfo *root, Path *bitmapqual,
         }
         else
         {
+			double  nodes = 1;
+#ifdef __TBASE__
+			nodes = path_count_datanodes(&opath->path);
+#endif
             plan = (Plan *) make_bitmap_or(subplans);
             plan->startup_cost = opath->path.startup_cost;
             plan->total_cost = opath->path.total_cost;
             plan->plan_rows =
-                clamp_row_est(opath->bitmapselectivity * opath->path.parent->tuples);
+				clamp_row_est(opath->bitmapselectivity * opath->path.parent->tuples / nodes);
             plan->plan_width = 0;    /* meaningless */
             plan->parallel_aware = false;
             plan->parallel_safe = opath->path.parallel_safe;
@@ -3950,7 +3957,10 @@ create_bitmap_subplan(PlannerInfo *root, Path *bitmapqual,
         IndexScan  *iscan;
         List       *subindexECs;
         ListCell   *l;
-
+		double      nodes = 1;
+#ifdef __TBASE__
+		nodes = path_count_datanodes(&ipath->path);
+#endif
         /* Use the regular indexscan plan build machinery... */
         iscan = castNode(IndexScan,
                          create_indexscan_plan(root, ipath,
@@ -3964,7 +3974,7 @@ create_bitmap_subplan(PlannerInfo *root, Path *bitmapqual,
         plan->startup_cost = 0.0;
         plan->total_cost = ipath->indextotalcost;
         plan->plan_rows =
-            clamp_row_est(ipath->indexselectivity * ipath->path.parent->tuples);
+			clamp_row_est(ipath->indexselectivity * ipath->path.parent->tuples / nodes);
         plan->plan_width = 0;    /* meaningless */
         plan->parallel_aware = false;
         plan->parallel_safe = ipath->path.parallel_safe;
@@ -6402,30 +6412,26 @@ make_remotesubplan(PlannerInfo *root,
     Plan *gather_left = lefttree;
     Plan *gather_parent = NULL;
     bool need_sort = true;
+	double nodes = 1;
 #endif
 
     /* Sanity checks */
     Assert(!equal(resultDistribution, execDistribution));
     Assert(!IsA(lefttree, RemoteSubplan));
 
-#ifdef __COLD_HOT__
-    if (distributionType != LOCATOR_TYPE_NONE)
-    {
-        if (has_cold_hot_table && list_length(groupOids) != 1 && root->parse->commandType != CMD_INSERT)
-        {
-            has_cold_hot_table = false;
-            has_distribute_remote_plan = false;
-            elog(ERROR, "Tables which located in more than one group could not involved in query with join or redistribution");
-        }
-        else
-        {
-            has_distribute_remote_plan = true;
-        }
-    }
-#endif
-
 #ifdef __TBASE__
-    if((IsA(lefttree, HashJoin) || IsA(lefttree, SeqScan) 
+	/* do things like path_count_datanodes, but we have only distribution here */
+	if (execDistribution &&
+	    (execDistribution->distributionType == LOCATOR_TYPE_HASH ||
+	     execDistribution->distributionType == LOCATOR_TYPE_SHARD))
+	{
+		nodes = bms_num_members(execDistribution->nodes);
+		if (nodes <= 0)
+			/* should not happen, but for safety */
+			nodes = 1;
+	}
+	
+	if((IsA(lefttree, HashJoin) || IsA(lefttree, NestLoop) || IsA(lefttree, SeqScan) 
         || IsA(lefttree, Agg) || IsA(lefttree, Group) ||
         IsA(lefttree, Sort) || IsA(lefttree, Limit) || IsA(lefttree, Gather)) && 
         max_parallel_workers_per_gather && root->glob->parallelModeOK &&
@@ -6434,18 +6440,17 @@ make_remotesubplan(PlannerInfo *root,
          distributionType == LOCATOR_TYPE_NONE ||
          distributionType == LOCATOR_TYPE_SHARD))
     {
-        int    parallel_threshold_rows = 50000;
-        
         if (IsA(lefttree, Gather))
         {
             Gather *gather = (Gather *)lefttree;
             int nWorkers = gather->num_workers;
             Plan *leftplan = lefttree->lefttree;
-            double rows = GetPlanRows(leftplan);
+			/* rows estimate is cut down to per data nodes, set it to all nodes for parallel estimate. */
+			double rows = GetPlanRows(leftplan) * nodes;
             int    heap_parallel_threshold = 0;
             int    heap_parallel_workers = 1;
 
-            heap_parallel_threshold = Max(parallel_threshold_rows, 1);
+			heap_parallel_threshold = Max(min_parallel_rows_size, 1);
             while (rows >= (heap_parallel_threshold * 3))
             {
                 heap_parallel_workers++;
@@ -6483,7 +6488,7 @@ make_remotesubplan(PlannerInfo *root,
                 switch(nodeTag(lefttree))
                 {
                     case T_SeqScan:
-                        if (rows >= parallel_threshold_rows * 3)
+						if (rows >= min_parallel_rows_size * 3)
                         {
                             lefttree->parallel_aware = true;
                         }
@@ -6669,7 +6674,9 @@ make_remotesubplan(PlannerInfo *root,
                 }
             }
 
-            if (rows < parallel_threshold_rows * 3)
+			/* rows estimate is cut down to per data nodes, set it to all nodes for parallel estimate. */
+			rows *= nodes;
+			if (rows < min_parallel_rows_size * 3)
                 need_parallel = false;
 
             if (need_parallel)
@@ -6679,7 +6686,7 @@ make_remotesubplan(PlannerInfo *root,
                 Gather       *gather_plan           = NULL;
                 Plan       *subplan               = NULL;
 
-                heap_parallel_threshold = Max(parallel_threshold_rows, 1);
+				heap_parallel_threshold = Max(min_parallel_rows_size, 1);
                 while (rows >= (heap_parallel_threshold * 3))
                 {
                     heap_parallel_workers++;
@@ -7093,7 +7100,7 @@ make_remotesubplan(PlannerInfo *root,
         gather_plan->parallelWorker_sendTuple = true;
     }
 
-    if ((IsA(lefttree, Gather) || lefttree->parallel_aware) &&
+	if ((IsA(lefttree, Gather) || lefttree->parallel_aware || child_of_gather) &&
         olap_optimizer)
     {
         plan->parallel_aware = true;

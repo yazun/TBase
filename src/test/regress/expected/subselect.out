@@ -530,12 +530,10 @@ update shipped_view set value = 11
     from int4_tbl a join int4_tbl b
       on (a.f1 = (select f1 from int4_tbl c where c.f1=b.f1))
     where ordnum = a.f1;
-ERROR:  could not plan this distributed update
-DETAIL:  correlated UPDATE or updating distribution column currently not supported in Postgres-XL.
 select * from shipped_view;
- ttype | ordnum | partnum |  value  
--------+--------+---------+---------
- wt    |      0 | 1       | 1234.56
+ ttype | ordnum | partnum | value 
+-------+--------+---------+-------
+ wt    |      0 | 1       |    11
 (1 row)
 
 select f1, ss1 as relabel from
@@ -778,63 +776,71 @@ where a.thousand = b.thousand
 explain (verbose, costs off)
   select x, x from
     (select (select now()) as x from (values(1),(2)) v(y)) ss;
-        QUERY PLAN         
----------------------------
- Values Scan on "*VALUES*"
+                QUERY PLAN                
+------------------------------------------
+ Remote Subquery Scan on all (datanode_1)
    Output: $0, $1
-   InitPlan 1 (returns $0)
-     ->  Result
-           Output: now()
-   InitPlan 2 (returns $1)
-     ->  Result
-           Output: now()
-(8 rows)
-
-explain (verbose, costs off)
-  select x, x from
-    (select (select random()) as x from (values(1),(2)) v(y)) ss;
-            QUERY PLAN            
-----------------------------------
- Subquery Scan on ss
-   Output: ss.x, ss.x
    ->  Values Scan on "*VALUES*"
-         Output: $0
+         Output: $0, $1
          InitPlan 1 (returns $0)
            ->  Result
-                 Output: random()
-(7 rows)
-
-explain (verbose, costs off)
-  select x, x from
-    (select (select now() where y=y) as x from (values(1),(2)) v(y)) ss;
-                              QUERY PLAN                              
-----------------------------------------------------------------------
- Values Scan on "*VALUES*"
-   Output: (SubPlan 1), (SubPlan 2)
-   SubPlan 1
-     ->  Result
-           Output: now()
-           One-Time Filter: ("*VALUES*".column1 = "*VALUES*".column1)
-   SubPlan 2
-     ->  Result
-           Output: now()
-           One-Time Filter: ("*VALUES*".column1 = "*VALUES*".column1)
+                 Output: now()
+         InitPlan 2 (returns $1)
+           ->  Result
+                 Output: now()
 (10 rows)
 
 explain (verbose, costs off)
   select x, x from
-    (select (select random() where y=y) as x from (values(1),(2)) v(y)) ss;
+    (select (select random()) as x from (values(1),(2)) v(y)) ss;
+                QUERY PLAN                
+------------------------------------------
+ Remote Subquery Scan on all (datanode_1)
+   Output: ss.x, ss.x
+   ->  Subquery Scan on ss
+         Output: ss.x, ss.x
+         ->  Values Scan on "*VALUES*"
+               Output: $0
+               InitPlan 1 (returns $0)
+                 ->  Result
+                       Output: random()
+(9 rows)
+
+explain (verbose, costs off)
+  select x, x from
+    (select (select now() where y=y) as x from (values(1),(2)) v(y)) ss;
                                  QUERY PLAN                                 
 ----------------------------------------------------------------------------
- Subquery Scan on ss
-   Output: ss.x, ss.x
+ Remote Subquery Scan on all (datanode_1)
+   Output: (SubPlan 1), (SubPlan 2)
    ->  Values Scan on "*VALUES*"
-         Output: (SubPlan 1)
+         Output: (SubPlan 1), (SubPlan 2)
          SubPlan 1
            ->  Result
-                 Output: random()
+                 Output: now()
                  One-Time Filter: ("*VALUES*".column1 = "*VALUES*".column1)
-(8 rows)
+         SubPlan 2
+           ->  Result
+                 Output: now()
+                 One-Time Filter: ("*VALUES*".column1 = "*VALUES*".column1)
+(12 rows)
+
+explain (verbose, costs off)
+  select x, x from
+    (select (select random() where y=y) as x from (values(1),(2)) v(y)) ss;
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Remote Subquery Scan on all (datanode_1)
+   Output: ss.x, ss.x
+   ->  Subquery Scan on ss
+         Output: ss.x, ss.x
+         ->  Values Scan on "*VALUES*"
+               Output: (SubPlan 1)
+               SubPlan 1
+                 ->  Result
+                       Output: random()
+                       One-Time Filter: ("*VALUES*".column1 = "*VALUES*".column1)
+(10 rows)
 
 --
 -- Check we behave sanely in corner case of empty SELECT list (bug #8648)
@@ -853,31 +859,35 @@ explain (verbose, costs off)
 select * from int4_tbl where
   (case when f1 in (select unique1 from tenk1 a) then f1 else null end) in
   (select ten from tenk1 b);
-                                                  QUERY PLAN                                                   
----------------------------------------------------------------------------------------------------------------
+                                            QUERY PLAN                                             
+---------------------------------------------------------------------------------------------------
  Remote Subquery Scan on all (datanode_1,datanode_2)
    Output: int4_tbl.f1
-   ->  Nested Loop Semi Join
+   ->  Hash Join
          Output: int4_tbl.f1
-         Join Filter: ((CASE WHEN (hashed SubPlan 1) THEN int4_tbl.f1 ELSE NULL::integer END) = b.ten)
-         ->  Remote Subquery Scan on all (datanode_1)
-               Output: int4_tbl.f1, CASE WHEN (hashed SubPlan 1) THEN int4_tbl.f1 ELSE NULL::integer END
-               Distribute results by H: CASE WHEN (hashed SubPlan 1) THEN f1 ELSE NULL::integer END
-               ->  Seq Scan on public.int4_tbl
-                     Output: int4_tbl.f1, CASE WHEN (hashed SubPlan 1) THEN int4_tbl.f1 ELSE NULL::integer END
-                     SubPlan 1
-                       ->  Remote Subquery Scan on all (datanode_1,datanode_2)
-                             Output: a.unique1
-                             ->  Seq Scan on public.tenk1 a
-                                   Output: a.unique1
-         ->  Materialize
+         Inner Unique: true
+         Hash Cond: (CASE WHEN (hashed SubPlan 1) THEN int4_tbl.f1 ELSE NULL::integer END = b.ten)
+         ->  Seq Scan on public.int4_tbl
+               Output: int4_tbl.f1
+         ->  Hash
                Output: b.ten
-               ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+               ->  HashAggregate
                      Output: b.ten
-                     Distribute results by H: ten
-                     ->  Seq Scan on public.tenk1 b
+                     Group Key: b.ten
+                     ->  Remote Subquery Scan on all (datanode_1,datanode_2)
                            Output: b.ten
-(22 rows)
+                           Distribute results by H: ten
+                           ->  HashAggregate
+                                 Output: b.ten
+                                 Group Key: b.ten
+                                 ->  Seq Scan on public.tenk1 b
+                                       Output: b.ten
+         SubPlan 1
+           ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                 Output: a.unique1
+                 ->  Index Only Scan using tenk1_unique1 on public.tenk1 a
+                       Output: a.unique1
+(26 rows)
 
 select * from int4_tbl where
   (case when f1 in (select unique1 from tenk1 a) then f1 else null end) in
@@ -1158,3 +1168,1059 @@ NOTICE:  x = 9, y = 13
 (3 rows)
 
 drop function tattle(x int, y int);
+--
+-- Tests for pulling up more sublinks
+--
+set enable_pullup_subquery to true;
+create table tbl_a(a int,b int);
+create table tbl_b(a int,b int);
+insert into tbl_a select generate_series(1,10),1;
+insert into tbl_b select generate_series(2,11),1;
+-- check targetlist subquery scenario.
+set enable_nestloop to true;
+set enable_hashjoin to false;
+set enable_mergejoin to false;
+explain select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
+ Remote Subquery Scan on all (datanode_1,datanode_2)  (cost=3923.54..3924.39 rows=338 width=8)
+   ->  Sort  (cost=3923.54..3924.39 rows=338 width=8)
+         Sort Key: a.a, b.a
+         ->  Nested Loop Left Scalar Join  (cost=0.00..3909.35 rows=338 width=8)
+               Join Filter: (b.a = a.a)
+               ->  Seq Scan on tbl_a a  (cost=0.00..11.75 rows=675 width=4)
+               ->  Materialize  (cost=0.00..15.12 rows=675 width=4)
+                     ->  Seq Scan on tbl_b b  (cost=0.00..11.75 rows=675 width=4)
+(8 rows)
+
+select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+ a  | q  
+----+----
+  1 |   
+  2 |  2
+  3 |  3
+  4 |  4
+  5 |  5
+  6 |  6
+  7 |  7
+  8 |  8
+  9 |  9
+ 10 | 10
+(10 rows)
+
+set enable_nestloop to false;
+set enable_hashjoin to true;
+set enable_mergejoin to false;
+explain (costs off) select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Remote Subquery Scan on all (datanode_1,datanode_2)
+   ->  Sort
+         Sort Key: a.a, b.a
+         ->  Hash Left Scalar Join
+               Hash Cond: (a.a = b.a)
+               ->  Seq Scan on tbl_a a
+               ->  Hash
+                     ->  Seq Scan on tbl_b b
+(8 rows)
+
+select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+ a  | q  
+----+----
+  1 |   
+  2 |  2
+  3 |  3
+  4 |  4
+  5 |  5
+  6 |  6
+  7 |  7
+  8 |  8
+  9 |  9
+ 10 | 10
+(10 rows)
+
+set enable_nestloop to false;
+set enable_hashjoin to false;
+set enable_mergejoin to true;
+explain (costs off) select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Remote Subquery Scan on all (datanode_1,datanode_2)
+   ->  Sort
+         Sort Key: a.a, b.a
+         ->  Merge Left Scalar Join
+               Merge Cond: (a.a = b.a)
+               ->  Sort
+                     Sort Key: a.a
+                     ->  Seq Scan on tbl_a a
+               ->  Sort
+                     Sort Key: b.a
+                     ->  Seq Scan on tbl_b b
+(11 rows)
+
+select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+ a  | q  
+----+----
+  1 |   
+  2 |  2
+  3 |  3
+  4 |  4
+  5 |  5
+  6 |  6
+  7 |  7
+  8 |  8
+  9 |  9
+ 10 | 10
+(10 rows)
+
+-- check non-scalar scenario.
+insert into tbl_b values(2,2);
+set enable_nestloop to true;
+set enable_hashjoin to false;
+set enable_mergejoin to false;
+explain (costs off) select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Remote Subquery Scan on all (datanode_1,datanode_2)
+   ->  Sort
+         Sort Key: a.a, b.a
+         ->  Nested Loop Left Scalar Join
+               Join Filter: (b.a = a.a)
+               ->  Seq Scan on tbl_a a
+               ->  Materialize
+                     ->  Seq Scan on tbl_b b
+(8 rows)
+
+select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+ERROR:  more than one row returned by a subquery used as an expression
+set enable_nestloop to false;
+set enable_hashjoin to true;
+set enable_mergejoin to false;
+explain (costs off) select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Remote Subquery Scan on all (datanode_1,datanode_2)
+   ->  Sort
+         Sort Key: a.a, b.a
+         ->  Hash Left Scalar Join
+               Hash Cond: (a.a = b.a)
+               ->  Seq Scan on tbl_a a
+               ->  Hash
+                     ->  Seq Scan on tbl_b b
+(8 rows)
+
+select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+ERROR:  more than one row returned by a subquery used as an expression
+set enable_nestloop to false;
+set enable_hashjoin to false;
+set enable_mergejoin to true;
+explain (costs off) select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Remote Subquery Scan on all (datanode_1,datanode_2)
+   ->  Sort
+         Sort Key: a.a, b.a
+         ->  Merge Left Scalar Join
+               Merge Cond: (a.a = b.a)
+               ->  Sort
+                     Sort Key: a.a
+                     ->  Seq Scan on tbl_a a
+               ->  Sort
+                     Sort Key: b.a
+                     ->  Seq Scan on tbl_b b
+(11 rows)
+
+select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+ERROR:  more than one row returned by a subquery used as an expression
+explain (costs off) select a.a,(select b.a from tbl_b b where b.a = a.a and b.a = 5) q from tbl_a a order by 1,2;
+                 QUERY PLAN                  
+---------------------------------------------
+ Remote Subquery Scan on all (datanode_1)
+   ->  Sort
+         Sort Key: a.a, b.a
+         ->  Merge Left Scalar Join
+               Merge Cond: (a.a = b.a)
+               ->  Sort
+                     Sort Key: a.a
+                     ->  Seq Scan on tbl_a a
+               ->  Sort
+                     Sort Key: b.a
+                     ->  Seq Scan on tbl_b b
+                           Filter: (a = 5)
+(12 rows)
+
+select a.a,(select b.a from tbl_b b where b.a = a.a and b.a = 5) q from tbl_a a order by 1,2;
+ a | q 
+---+---
+ 1 |  
+ 2 |  
+ 5 | 5
+ 6 |  
+ 8 |  
+ 9 |  
+(6 rows)
+
+-- check distinct scenario.
+set enable_nestloop to true;
+set enable_hashjoin to false;
+set enable_mergejoin to false;
+explain (costs  off) select a.a,(select distinct b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Sort
+   Sort Key: a.a, a
+   ->  Nested Loop Left Scalar Join
+         ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+               ->  Seq Scan on tbl_a a
+         ->  Materialize
+               ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                     ->  Unique
+                           ->  Seq Scan on tbl_b b
+                                 Filter: (a = a.a)
+(10 rows)
+
+select a.a,(select distinct b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+ a  | q  
+----+----
+  1 |   
+  2 |  2
+  3 |  3
+  4 |  4
+  5 |  5
+  6 |  6
+  7 |  7
+  8 |  8
+  9 |  9
+ 10 | 10
+(10 rows)
+
+set enable_nestloop to false;
+set enable_hashjoin to true;
+set enable_mergejoin to false;
+explain (costs off) select a.a,(select distinct b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Sort
+   Sort Key: a.a, a
+   ->  Nested Loop Left Scalar Join
+         ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+               ->  Seq Scan on tbl_a a
+         ->  Materialize
+               ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                     ->  Unique
+                           ->  Seq Scan on tbl_b b
+                                 Filter: (a = a.a)
+(10 rows)
+
+select a.a,(select distinct b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+ a  | q  
+----+----
+  1 |   
+  2 |  2
+  3 |  3
+  4 |  4
+  5 |  5
+  6 |  6
+  7 |  7
+  8 |  8
+  9 |  9
+ 10 | 10
+(10 rows)
+
+set enable_nestloop to false;
+set enable_hashjoin to false;
+set enable_mergejoin to true;
+explain (costs  off) select a.a,(select distinct b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Sort
+   Sort Key: a.a, a
+   ->  Nested Loop Left Scalar Join
+         ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+               ->  Seq Scan on tbl_a a
+         ->  Materialize
+               ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                     ->  Unique
+                           ->  Seq Scan on tbl_b b
+                                 Filter: (a = a.a)
+(10 rows)
+
+select a.a,(select distinct b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+ a  | q  
+----+----
+  1 |   
+  2 |  2
+  3 |  3
+  4 |  4
+  5 |  5
+  6 |  6
+  7 |  7
+  8 |  8
+  9 |  9
+ 10 | 10
+(10 rows)
+
+set enable_nestloop to true;
+set enable_hashjoin to true;
+set enable_mergejoin to true;
+-- targetlist sublink with agg
+explain (costs off)  select (select sum(b.a) from tbl_b b where b.a = a.a and b.b = a.b) from tbl_a a order by 1;
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Sort
+   Sort Key: "TARGETLIST_subquery".sum
+   ->  Nested Loop Left Semi Join
+         ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+               ->  Seq Scan on tbl_a a
+         ->  Materialize
+               ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                     ->  Subquery Scan on "TARGETLIST_subquery"
+                           ->  GroupAggregate
+                                 Group Key: b.a, b.b
+                                 ->  Seq Scan on tbl_b b
+                                       Filter: ((a = a.a) AND (b = a.b))
+(12 rows)
+
+select (select sum(b.a) from tbl_b b where b.a = a.a and b.b = a.b) from tbl_a a order by 1;
+ sum 
+-----
+   2
+   3
+   4
+   5
+   6
+   7
+   8
+   9
+  10
+    
+(10 rows)
+
+explain (costs off)  select (select count(b.a) from tbl_b b where b.a = a.a) from tbl_a a order by 1;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Sort
+   Sort Key: (COALESCE("TARGETLIST_subquery".count, '0'::bigint))
+   ->  Nested Loop Left Semi Join
+         ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+               ->  Seq Scan on tbl_a a
+         ->  Materialize
+               ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                     ->  Subquery Scan on "TARGETLIST_subquery"
+                           ->  GroupAggregate
+                                 Group Key: b.a
+                                 ->  Seq Scan on tbl_b b
+                                       Filter: (a = a.a)
+(12 rows)
+
+select (select count(b.a) from tbl_b b where b.a = a.a ) from tbl_a a order by 1;
+ count 
+-------
+     0
+     1
+     1
+     1
+     1
+     1
+     1
+     1
+     1
+     2
+(10 rows)
+
+explain (costs off) select (select sum(b.a) from tbl_b b where b.a = a.a and b.b = a.b or b.a = 1) from tbl_a a order by 1;
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Remote Subquery Scan on all (datanode_1,datanode_2)
+   ->  Sort
+         Sort Key: ((SubPlan 1))
+         ->  Seq Scan on tbl_a a
+               SubPlan 1
+                 ->  Finalize Aggregate
+                       ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                             ->  Partial Aggregate
+                                   ->  Seq Scan on tbl_b b
+                                         Filter: (((a = a.a) AND (b = a.b)) OR (a = 1))
+(10 rows)
+
+select (select sum(b.a) from tbl_b b where b.a = a.a and b.b = a.b or b.a = 1) from tbl_a a order by 1;
+ sum 
+-----
+   2
+   3
+   4
+   5
+   6
+   7
+   8
+   9
+  10
+    
+(10 rows)
+
+-- targetlist sublink wrapped in expr
+explain (costs off)  select (case when a.b =1 then (select sum(b.a) from tbl_b b where b.a = a.a and b.b = a.b) else 0 end) from tbl_a a order by 1;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Sort
+   Sort Key: (CASE WHEN (a.b = 1) THEN "TARGETLIST_subquery".sum ELSE '0'::bigint END)
+   ->  Nested Loop Left Semi Join
+         ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+               ->  Seq Scan on tbl_a a
+         ->  Materialize
+               ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                     ->  Subquery Scan on "TARGETLIST_subquery"
+                           ->  GroupAggregate
+                                 Group Key: b.a, b.b
+                                 ->  Seq Scan on tbl_b b
+                                       Filter: ((a = a.a) AND (b = a.b))
+(12 rows)
+
+select (case when a.b =1 then (select sum(b.a) from tbl_b b where b.a = a.a and b.b = a.b) else 0 end) from tbl_a a order by 1;
+ case 
+------
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+   10
+     
+(10 rows)
+
+explain (costs off)  select (case when a.b =1 then (select b.a from tbl_b b where b.a = a.a and b.b = a.b) else 0 end) from tbl_a a order by 1;
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Remote Subquery Scan on all (datanode_1,datanode_2)
+   ->  Sort
+         Sort Key: (CASE WHEN (a.b = 1) THEN b.a ELSE 0 END)
+         ->  Hash Left Scalar Join
+               Hash Cond: ((a.a = b.a) AND (a.b = b.b))
+               ->  Seq Scan on tbl_a a
+               ->  Hash
+                     ->  Seq Scan on tbl_b b
+(8 rows)
+
+select (case when a.b =1 then (select b.a from tbl_b b where b.a = a.a and b.b = a.b) else 0 end) from tbl_a a order by 1;
+ case 
+------
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+   10
+     
+(10 rows)
+
+explain (costs off)  select (case when a.b =1 then (select count(*) from tbl_b b where b.a = a.a and b.b = a.b and a.b in (1,2)) else 0 end) from tbl_a a order by 1;
+                                                   QUERY PLAN                                                   
+----------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: (CASE WHEN (a.b = 1) THEN COALESCE("TARGETLIST_subquery".count, '0'::bigint) ELSE '0'::bigint END)
+   ->  Nested Loop Left Semi Join
+         ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+               ->  Seq Scan on tbl_a a
+         ->  Materialize
+               ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                     ->  Subquery Scan on "TARGETLIST_subquery"
+                           ->  GroupAggregate
+                                 Group Key: b.a, b.b
+                                 ->  Result
+                                       One-Time Filter: (a.b = ANY ('{1,2}'::integer[]))
+                                       ->  Seq Scan on tbl_b b
+                                             Filter: ((a = a.a) AND (b = a.b))
+(14 rows)
+
+select (case when a.b =1 then (select count(*) from tbl_b b where b.a = a.a and b.b = a.b and a.b in (1,2)) else 0 end) from tbl_a a order by 1;
+ case 
+------
+    0
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+(10 rows)
+
+explain (costs off)  select (case when a.b =1 then (select count(*) from tbl_b b where b.a = a.a and b.b = a.b and a.b is not null) else 0 end) from tbl_a a order by 1;
+                                                   QUERY PLAN                                                   
+----------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: (CASE WHEN (a.b = 1) THEN COALESCE("TARGETLIST_subquery".count, '0'::bigint) ELSE '0'::bigint END)
+   ->  Nested Loop Left Semi Join
+         ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+               ->  Seq Scan on tbl_a a
+         ->  Materialize
+               ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                     ->  Subquery Scan on "TARGETLIST_subquery"
+                           ->  GroupAggregate
+                                 Group Key: b.a, b.b
+                                 ->  Result
+                                       One-Time Filter: (a.b IS NOT NULL)
+                                       ->  Seq Scan on tbl_b b
+                                             Filter: ((a = a.a) AND (b = a.b))
+(14 rows)
+
+select (case when a.b =1 then (select count(*) from tbl_b b where b.a = a.a and b.b = a.b and a.b is not null) else 0 end) from tbl_a a order by 1;
+ case 
+------
+    0
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+(10 rows)
+
+-- targetlist sublink with limit 1
+explain (costs off) select a.a,(select b.a from tbl_b b where b.a = a.a limit 1) q from tbl_a a order by 1,2;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Remote Subquery Scan on all (datanode_1,datanode_2)
+   ->  Sort
+         Sort Key: a.a, b.a
+         ->  Hash Left Semi Join
+               Hash Cond: (a.a = b.a)
+               ->  Seq Scan on tbl_a a
+               ->  Hash
+                     ->  Seq Scan on tbl_b b
+(8 rows)
+
+select a.a,(select b.a from tbl_b b where b.a = a.a limit 1) q from tbl_a a order by 1,2;
+ a  | q  
+----+----
+  1 |   
+  2 |  2
+  3 |  3
+  4 |  4
+  5 |  5
+  6 |  6
+  7 |  7
+  8 |  8
+  9 |  9
+ 10 | 10
+(10 rows)
+
+-- support pullup lateral ANY_SUBLINK
+explain select * from tbl_a a where a.b IN (select b.a from tbl_b b where b.b > a.b);
+                                               QUERY PLAN                                                
+---------------------------------------------------------------------------------------------------------
+ Remote Subquery Scan on all (datanode_1,datanode_2)  (cost=120.19..145.13 rows=112 width=8)
+   ->  Hash Semi Join  (cost=120.19..145.13 rows=112 width=8)
+         Hash Cond: (a.b = b.a)
+         Join Filter: (b.b > a.b)
+         ->  Remote Subquery Scan on all (datanode_1,datanode_2)  (cost=100.00..120.53 rows=675 width=8)
+               Distribute results by H: b
+               ->  Seq Scan on tbl_a a  (cost=0.00..11.75 rows=675 width=8)
+         ->  Hash  (cost=11.75..11.75 rows=675 width=8)
+               ->  Seq Scan on tbl_b b  (cost=0.00..11.75 rows=675 width=8)
+(9 rows)
+
+select * from tbl_a a where a.b IN (select b.a from tbl_b b where b.b > a.b);
+ a | b 
+---+---
+(0 rows)
+
+explain select * from tbl_a a where a.b NOT IN (select b.a from tbl_b b where b.b > a.b);
+                                               QUERY PLAN                                                
+---------------------------------------------------------------------------------------------------------
+ Nested Loop Anti Join  (cost=200.00..6935.40 rows=1123 width=8)
+   Join Filter: ((b.b > a.b) AND ((a.b = b.a) OR (a.b IS NULL) OR (b.a IS NULL)))
+   ->  Remote Subquery Scan on all (datanode_1,datanode_2)  (cost=100.00..120.53 rows=675 width=8)
+         ->  Seq Scan on tbl_a a  (cost=0.00..11.75 rows=675 width=8)
+   ->  Materialize  (cost=100.00..123.90 rows=675 width=8)
+         ->  Remote Subquery Scan on all (datanode_1,datanode_2)  (cost=100.00..120.53 rows=675 width=8)
+               ->  Seq Scan on tbl_b b  (cost=0.00..11.75 rows=675 width=8)
+(7 rows)
+
+select * from tbl_a a where a.b NOT IN (select b.a from tbl_b b where b.b > a.b);
+ a  | b 
+----+---
+  1 | 1
+  2 | 1
+  5 | 1
+  6 | 1
+  8 | 1
+  9 | 1
+  3 | 1
+  4 | 1
+  7 | 1
+ 10 | 1
+(10 rows)
+
+drop table tbl_a;
+drop table tbl_b;
+-- test NOT IN/ANY with NOT NULL restriction
+create table tbl_a(a int NOT NULL, b int NOT NULL);
+create table tbl_b(a int NOT NULL, b int NOT NULL);
+insert into tbl_a select generate_series(1,10),1;
+insert into tbl_b select generate_series(2,11),1;
+explain select * from tbl_a a where a.b NOT IN (select b.a from tbl_b b where b.b > a.b);
+                                               QUERY PLAN                                                
+---------------------------------------------------------------------------------------------------------
+ Remote Subquery Scan on all (datanode_1,datanode_2)  (cost=120.19..150.77 rows=562 width=8)
+   ->  Hash Anti Join  (cost=120.19..150.77 rows=562 width=8)
+         Hash Cond: (a.b = b.a)
+         Join Filter: (b.b > a.b)
+         ->  Remote Subquery Scan on all (datanode_1,datanode_2)  (cost=100.00..120.53 rows=675 width=8)
+               Distribute results by H: b
+               ->  Seq Scan on tbl_a a  (cost=0.00..11.75 rows=675 width=8)
+         ->  Hash  (cost=11.75..11.75 rows=675 width=8)
+               ->  Seq Scan on tbl_b b  (cost=0.00..11.75 rows=675 width=8)
+(9 rows)
+
+select * from tbl_a a where a.b NOT IN (select b.a from tbl_b b where b.b > a.b);
+ a  | b 
+----+---
+  1 | 1
+  2 | 1
+  5 | 1
+  6 | 1
+  8 | 1
+  9 | 1
+  3 | 1
+  4 | 1
+  7 | 1
+ 10 | 1
+(10 rows)
+
+drop table tbl_a;
+drop table tbl_b;
+-- more RTEs in subquery
+CREATE TABLE sub_t1 (a int4, b int4);
+CREATE TABLE sub_t2 (a int4, b int4);
+CREATE TABLE sub_interfere1 (a int4, b int4);
+CREATE TABLE sub_interfere2 (a int4, b int4);
+explain (costs off)
+select 1 from 
+	sub_t1 t1,
+	sub_t2 t2
+where t2.a = (
+	select 
+		min(t2.a)
+	from
+		sub_t2 t2,
+		sub_interfere1,
+		sub_interfere2
+	where
+		t1.a = t2.a
+);
+                                                QUERY PLAN                                                 
+-----------------------------------------------------------------------------------------------------------
+ Hash Join
+   Hash Cond: (t2.a = "EXPR_subquery".min)
+   ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+         ->  Seq Scan on sub_t2 t2
+   ->  Hash
+         ->  Hash Left Join
+               Hash Cond: (t1.a = "EXPR_subquery".a)
+               ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                     ->  Seq Scan on sub_t1 t1
+               ->  Hash
+                     ->  Subquery Scan on "EXPR_subquery"
+                           ->  HashAggregate
+                                 Group Key: t2_1.a
+                                 ->  Nested Loop
+                                       ->  Nested Loop
+                                             ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                                                   ->  Seq Scan on sub_t2 t2_1
+                                             ->  Materialize
+                                                   ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                                                         ->  Seq Scan on sub_interfere1
+                                       ->  Materialize
+                                             ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                                                   ->  Seq Scan on sub_interfere2
+(23 rows)
+
+DROP TABLE sub_t1;
+DROP TABLE sub_t2;
+DROP TABLE sub_interfere1;
+DROP TABLE sub_interfere2;
+set enable_pullup_subquery to false;
+-- Test that LIMIT can be pushed to SORT through a subquery that just projects
+-- columns.  We check for that having happened by looking to see if EXPLAIN
+-- ANALYZE shows that a top-N sort was used.  We must suppress or filter away
+-- all the non-invariant parts of the EXPLAIN ANALYZE output.
+--
+create table sq_limit (pk int primary key, c1 int, c2 int);
+insert into sq_limit values
+    (1, 1, 1),
+    (2, 2, 2),
+    (3, 3, 3),
+    (4, 4, 4),
+    (5, 1, 1),
+    (6, 2, 2),
+    (7, 3, 3),
+    (8, 4, 4);
+create function explain_sq_limit() returns setof text language plpgsql as
+$$
+declare ln text;
+begin
+    for ln in
+        explain (analyze, summary off, timing off, costs off)
+        select * from (select pk,c2 from sq_limit order by c1,pk) as x limit 3
+    loop
+        ln := regexp_replace(ln, 'Memory: \S*',  'Memory: xxx');
+        -- this case might occur if force_parallel_mode is on:
+        ln := regexp_replace(ln, 'Worker 0:  Sort Method',  'Sort Method');
+        return next ln;
+    end loop;
+end;
+$$;
+--
+-- Tests for CTE inlining behavior
+--
+-- Basic subquery that can be inlined
+explain (verbose, costs off)
+with x as (select * from (select f1 from subselect_tbl) ss)
+select * from x where f1 = 1;
+                QUERY PLAN                
+------------------------------------------
+ Remote Subquery Scan on all (datanode_1)
+   Output: subselect_tbl.f1
+   ->  Seq Scan on public.subselect_tbl
+         Output: subselect_tbl.f1
+         Filter: (subselect_tbl.f1 = 1)
+(5 rows)
+
+-- Explicitly request materialization
+explain (verbose, costs off)
+with x as materialized (select * from (select f1 from subselect_tbl) ss)
+select * from x where f1 = 1;
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ CTE Scan on x
+   Output: x.f1
+   Filter: (x.f1 = 1)
+   CTE x
+     ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+           Output: subselect_tbl.f1
+           ->  Seq Scan on public.subselect_tbl
+                 Output: subselect_tbl.f1
+(8 rows)
+
+-- Stable functions are safe to inline
+explain (verbose, costs off)
+with x as (select * from (select f1, now() from subselect_tbl) ss)
+select * from x where f1 = 1;
+                QUERY PLAN                
+------------------------------------------
+ Remote Subquery Scan on all (datanode_1)
+   Output: subselect_tbl.f1, now()
+   ->  Seq Scan on public.subselect_tbl
+         Output: subselect_tbl.f1, now()
+         Filter: (subselect_tbl.f1 = 1)
+(5 rows)
+
+-- Volatile functions prevent inlining
+explain (verbose, costs off)
+with x as (select * from (select f1, random() from subselect_tbl) ss)
+select * from x where f1 = 1;
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ CTE Scan on x
+   Output: x.f1, x.random
+   Filter: (x.f1 = 1)
+   CTE x
+     ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+           Output: f1, random
+           ->  Seq Scan on public.subselect_tbl
+                 Output: subselect_tbl.f1, random()
+(8 rows)
+
+-- SELECT FOR UPDATE cannot be inlined
+explain (verbose, costs off)
+with x as (select * from (select f1 from subselect_tbl for update) ss)
+select * from x where f1 = 1;
+                                             QUERY PLAN                                             
+----------------------------------------------------------------------------------------------------
+ CTE Scan on x
+   Output: x.f1
+   Filter: (x.f1 = 1)
+   CTE x
+     ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+           Output: ss.f1
+           ->  Subquery Scan on ss
+                 Output: ss.f1
+                 ->  LockRows
+                       Output: subselect_tbl.f1, subselect_tbl.ctid, subselect_tbl.xc_node_id
+                       ->  Seq Scan on public.subselect_tbl
+                             Output: subselect_tbl.f1, subselect_tbl.ctid, subselect_tbl.xc_node_id
+(12 rows)
+
+-- Multiply-referenced CTEs are inlined only when requested
+explain (verbose, costs off)
+with x as (select * from (select f1, now() as n from subselect_tbl) ss)
+select * from x, x x2 where x.n = x2.n;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Remote Subquery Scan on all (datanode_1,datanode_2)
+   Output: subselect_tbl.f1, now(), subselect_tbl_1.f1, now()
+   ->  Result
+         Output: subselect_tbl.f1, (now()), subselect_tbl_1.f1, (now())
+         One-Time Filter: (now() = now())
+         ->  Nested Loop
+               Output: subselect_tbl.f1, (now()), subselect_tbl_1.f1, (now())
+               ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                     Output: subselect_tbl.f1, now()
+                     Distribute results by H: now()
+                     ->  Seq Scan on public.subselect_tbl
+                           Output: subselect_tbl.f1, now()
+               ->  Materialize
+                     Output: subselect_tbl_1.f1, (now())
+                     ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                           Output: subselect_tbl_1.f1, now()
+                           Distribute results by H: now()
+                           ->  Seq Scan on public.subselect_tbl subselect_tbl_1
+                                 Output: subselect_tbl_1.f1, now()
+(19 rows)
+
+explain (verbose, costs off)
+with x as not materialized (select * from (select f1, now() as n from subselect_tbl) ss)
+select * from x, x x2 where x.n = x2.n;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Remote Subquery Scan on all (datanode_1,datanode_2)
+   Output: subselect_tbl.f1, now(), subselect_tbl_1.f1, now()
+   ->  Result
+         Output: subselect_tbl.f1, (now()), subselect_tbl_1.f1, (now())
+         One-Time Filter: (now() = now())
+         ->  Nested Loop
+               Output: subselect_tbl.f1, (now()), subselect_tbl_1.f1, (now())
+               ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                     Output: subselect_tbl.f1, now()
+                     Distribute results by H: now()
+                     ->  Seq Scan on public.subselect_tbl
+                           Output: subselect_tbl.f1, now()
+               ->  Materialize
+                     Output: subselect_tbl_1.f1, (now())
+                     ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                           Output: subselect_tbl_1.f1, now()
+                           Distribute results by H: now()
+                           ->  Seq Scan on public.subselect_tbl subselect_tbl_1
+                                 Output: subselect_tbl_1.f1, now()
+(19 rows)
+
+-- Multiply-referenced CTEs can't be inlined if they contain outer self-refs
+explain (verbose, costs off)
+with recursive x(a) as
+  ((values ('a'), ('b'))
+   union all
+   (with z as not materialized (select * from x)
+    select z.a || z1.a as a from z cross join z as z1
+    where length(z.a || z1.a) < 5))
+select * from x;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ CTE Scan on x
+   Output: x.a
+   CTE x
+     ->  Remote Subquery Scan on all (datanode_1)
+           Output: x_1.a
+           ->  Recursive Union
+                 ->  Values Scan on "*VALUES*"
+                       Output: "*VALUES*".column1
+                 ->  Nested Loop
+                       Output: (z.a || z1.a)
+                       Join Filter: (length((z.a || z1.a)) < 5)
+                       CTE z
+                         ->  WorkTable Scan on x x_1
+                               Output: x_1.a
+                       ->  CTE Scan on z
+                             Output: z.a
+                       ->  Materialize
+                             Output: z1.a
+                             ->  CTE Scan on z z1
+                                   Output: z1.a
+(20 rows)
+
+with recursive x(a) as
+  ((values ('a'), ('b'))
+   union all
+   (with z as not materialized (select * from x)
+    select z.a || z1.a as a from z cross join z as z1
+    where length(z.a || z1.a) < 5))
+select * from x;
+  a   
+------
+ a
+ b
+ aa
+ ab
+ ba
+ bb
+ aaaa
+ aaab
+ aaba
+ aabb
+ abaa
+ abab
+ abba
+ abbb
+ baaa
+ baab
+ baba
+ babb
+ bbaa
+ bbab
+ bbba
+ bbbb
+(22 rows)
+
+explain (verbose, costs off)
+with recursive x(a) as
+  ((values ('a'), ('b'))
+   union all
+   (with z as not materialized (select * from x)
+    select z.a || z.a as a from z
+    where length(z.a || z.a) < 5))
+select * from x;
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ CTE Scan on x
+   Output: x.a
+   CTE x
+     ->  Remote Subquery Scan on all (datanode_1)
+           Output: x.a
+           ->  Recursive Union
+                 ->  Values Scan on "*VALUES*"
+                       Output: "*VALUES*".column1
+                 ->  WorkTable Scan on x x_1
+                       Output: (x_1.a || x_1.a)
+                       Filter: (length((x_1.a || x_1.a)) < 5)
+(11 rows)
+
+with recursive x(a) as
+  ((values ('a'), ('b'))
+   union all
+   (with z as not materialized (select * from x)
+    select z.a || z.a as a from z
+    where length(z.a || z.a) < 5))
+select * from x;
+  a   
+------
+ a
+ b
+ aa
+ bb
+ aaaa
+ bbbb
+(6 rows)
+
+-- Check handling of outer references
+explain (verbose, costs off)
+with x as (select * from int4_tbl)
+select * from (with y as (select * from x) select * from y) ss;
+                QUERY PLAN                
+------------------------------------------
+ Remote Subquery Scan on all (datanode_1)
+   Output: f1
+   ->  Seq Scan on public.int4_tbl
+         Output: int4_tbl.f1
+(4 rows)
+
+explain (verbose, costs off)
+with x as materialized (select * from int4_tbl)
+select * from (with y as (select * from x) select * from y) ss;
+                    QUERY PLAN                    
+--------------------------------------------------
+ CTE Scan on x
+   Output: x.f1
+   CTE x
+     ->  Remote Subquery Scan on all (datanode_1)
+           Output: int4_tbl.f1
+           ->  Seq Scan on public.int4_tbl
+                 Output: int4_tbl.f1
+(7 rows)
+
+-- Ensure that we inline the currect CTE when there are
+-- multiple CTEs with the same name
+explain (verbose, costs off)
+with x as (select 1 as y)
+select * from (with x as (select 2 as y) select * from x) ss;
+ QUERY PLAN  
+-------------
+ Result
+   Output: 2
+(2 rows)
+
+-- Row marks are not pushed into CTEs
+explain (verbose, costs off)
+with x as (select * from subselect_tbl)
+select * from x for update;
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Remote Subquery Scan on all (datanode_1,datanode_2)
+   Output: subselect_tbl.f1, subselect_tbl.f2, subselect_tbl.f3
+   ->  Seq Scan on public.subselect_tbl
+         Output: subselect_tbl.f1, subselect_tbl.f2, subselect_tbl.f3
+(4 rows)
+
+-- test subquery pathkey
+CREATE TABLE catalog_sales (
+    cs_sold_date_sk integer,
+    cs_item_sk integer NOT NULL,
+    cs_order_number integer NOT NULL
+);
+CREATE TABLE catalog_returns (
+    cr_returned_date_sk integer,
+    cr_item_sk integer NOT NULL,
+    cr_order_number integer NOT NULL
+);
+CREATE TABLE date_dim (
+    d_date_sk integer NOT NULL,
+    d_year integer
+);
+with cs as
+(
+    select d_year AS cs_sold_year, cs_item_sk
+    from catalog_sales
+        left join catalog_returns on cr_order_number=cs_order_number and cs_item_sk=cr_item_sk
+        join date_dim on cs_sold_date_sk = d_date_sk
+    order by d_year, cs_item_sk
+)
+select 1
+from date_dim
+    join cs on (cs_sold_year=d_year and cs_item_sk=cs_item_sk);
+ ?column? 
+----------
+(0 rows)
+
+drop table catalog_sales, catalog_returns, date_dim;
+-- not in optimization
+create table notin_t1 (id1 int, num1 int not null);
+create table notin_t2 (id2 int, num2 int not null);
+explain(costs off) select num1 from notin_t1 where num1 not in (select num2 from notin_t2);
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Remote Subquery Scan on all (datanode_1,datanode_2)
+   ->  Hash Anti Join
+         Hash Cond: (notin_t1.num1 = notin_t2.num2)
+         ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+               Distribute results by H: num1
+               ->  Seq Scan on notin_t1
+         ->  Hash
+               ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                     Distribute results by H: num2
+                     ->  Seq Scan on notin_t2
+(10 rows)
+
+drop table notin_t1;
+drop table notin_t2;
+drop function explain_sq_limit();
+drop table sq_limit;

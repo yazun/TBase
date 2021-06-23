@@ -478,6 +478,8 @@ select * from alter_order_range order by f1 asc;
 select * from alter_order_range_201701 order by f1 asc;
 select * from alter_order_range_201702 order by f1 asc;
 
+sample alter_order_range(3000);
+
 alter table alter_order_range detach partition alter_order_range_201701;
 
 \c - mls_admin
@@ -847,6 +849,9 @@ checkpoint;
 
 --explain select * from tbl_mls_test where f1 = 1024 and f2 >= '2018-05-01' and f2 < '2018-06-01' order by f1 limit 10 ;      
 select * from tbl_mls_test where f1 = 1024 and f2 >= '2018-05-01' and f2 < '2018-06-01' order by f1 limit 10 ;      
+
+-- test vacuum analyze
+vacuum analyze tbl_mls_test;
 
 --case: orignal partition, interval partition with index
 \c - godlike
@@ -1416,6 +1421,15 @@ select MLS_TRANSPARENT_CRYPT_ALGORITHM_UNBIND_TABLE('no_crypted_schema_alt', 'tb
 select MLS_TRANSPARENT_CRYPT_ALGORITHM_UNBIND_TABLE('no_crypted_schema_alt_2', 'tbl_crypt_alt_2');
 select MLS_TRANSPARENT_CRYPT_ALGORITHM_UNBIND_SCHEMA('crypted_schema_alt');
 select MLS_TRANSPARENT_CRYPT_ALGORITHM_UNBIND_SCHEMA('crypted_schema_alt_2');
+
+-- child table has bind
+select algorithm_id, nspname, tblname from pg_transparent_crypt_policy_map where nspname ilike '%alt%' order by 1,2,3;
+
+--clean child
+select MLS_TRANSPARENT_CRYPT_ALGORITHM_UNBIND_TABLE('no_crypted_schema_alt_2', 'tbl_crypt_alt_2_part_0');
+select MLS_TRANSPARENT_CRYPT_ALGORITHM_UNBIND_TABLE('no_crypted_schema_alt_2', 'tbl_crypt_alt_2_part_1');
+select MLS_TRANSPARENT_CRYPT_ALGORITHM_UNBIND_TABLE('no_crypted_schema_alt_2', 'tbl_crypt_alt_2_part_2');
+
 \c - godlike
 drop table no_crypted_schema_alt.tbl_crypted_alt;
 drop table no_crypted_schema_alt.tbl_nocrypt_alt;
@@ -1732,7 +1746,7 @@ select * from xixi where i = 11;
 --case: insert into select from join 
 \c - godlike 
 insert into lala2 select a.i,a.j,b._cls from lala a, lala3 b where a.i = b.i;
-select * from lala2;
+select * from lala2 order by i;
 
 --ROUND1. end
 truncate table xixi;
@@ -1923,7 +1937,7 @@ select * from xixi where i = 3;
 insert into xixi as x(i,j) values(3,3) on conflict(i) do update set j = 2048 where x.j = 1024 and x.i = 3;
 select * from xixi where i = 3;
 \c - badboy
---fails to update 
+--fails to update
 insert into xixi as x(i,j) values(6,6) on conflict(i) do update set j = 3096 where x.j = 2048 and x.i = 6;
 select * from xixi where i = 6;
 \c - godlike
@@ -2153,7 +2167,13 @@ drop table lala;
 drop table lala2;
 drop table lala3;
 
+\c - mls_admin
+select polid, attnum, enable, nspname, tblname, reloptions from pg_cls_table;
+select MLS_CLS_DROP_TABLE_LABEL('cls_compare', 'public', 'xixi');
+select polid, attnum, enable, nspname, tblname, reloptions from pg_cls_table;
+
 --everything is done
+\c - godlike
 drop table xixi;
 drop table momo;
 

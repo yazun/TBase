@@ -1315,6 +1315,7 @@ _copyRemoteQuery(const RemoteQuery *from)
     COPY_NODE_FIELD(query_var_tlist);
     COPY_SCALAR_FIELD(is_temp);
 #ifdef __TBASE__
+	COPY_NODE_FIELD(forDeparse);
     COPY_STRING_FIELD(sql_select);
     COPY_STRING_FIELD(sql_select_base);
     COPY_SCALAR_FIELD(forUpadte);
@@ -1339,6 +1340,8 @@ _copyRemoteQuery(const RemoteQuery *from)
     COPY_SCALAR_FIELD(jf_xc_node_id);
     COPY_SCALAR_FIELD(jf_xc_wholerow);
     COPY_BITMAPSET_FIELD(conflict_cols);
+	COPY_SCALAR_FIELD(is_set);
+	COPY_SCALAR_FIELD(ignore_tuple_desc);
 #endif
     return newnode;
 }
@@ -1360,6 +1363,10 @@ _copyExecNodes(const ExecNodes *from)
 #endif
     COPY_SCALAR_FIELD(en_relid);
     COPY_SCALAR_FIELD(accesstype);
+	COPY_SCALAR_FIELD(need_rewrite);
+	COPY_SCALAR_FIELD(rewrite_value);
+	COPY_SCALAR_FIELD(isnull);
+	COPY_SCALAR_FIELD(rewrite_done);
 
     return newnode;
 }
@@ -1414,6 +1421,7 @@ _copyRemoteSubplan(const RemoteSubplan *from)
     COPY_SCALAR_FIELD(unique);
 #ifdef __TBASE__
     COPY_SCALAR_FIELD(parallelWorkerSendTuple);
+	COPY_BITMAPSET_FIELD(initPlanParams);
 #endif
     return newnode;
 }
@@ -2747,16 +2755,17 @@ _copyCommonTableExpr(const CommonTableExpr *from)
 {
     CommonTableExpr *newnode = makeNode(CommonTableExpr);
 
-    COPY_STRING_FIELD(ctename);
-    COPY_NODE_FIELD(aliascolnames);
-    COPY_NODE_FIELD(ctequery);
-    COPY_LOCATION_FIELD(location);
-    COPY_SCALAR_FIELD(cterecursive);
-    COPY_SCALAR_FIELD(cterefcount);
-    COPY_NODE_FIELD(ctecolnames);
-    COPY_NODE_FIELD(ctecoltypes);
-    COPY_NODE_FIELD(ctecoltypmods);
-    COPY_NODE_FIELD(ctecolcollations);
+	COPY_STRING_FIELD(ctename);
+	COPY_NODE_FIELD(aliascolnames);
+	COPY_SCALAR_FIELD(ctematerialized);
+	COPY_NODE_FIELD(ctequery);
+	COPY_LOCATION_FIELD(location);
+	COPY_SCALAR_FIELD(cterecursive);
+	COPY_SCALAR_FIELD(cterefcount);
+	COPY_NODE_FIELD(ctecolnames);
+	COPY_NODE_FIELD(ctecoltypes);
+	COPY_NODE_FIELD(ctecoltypmods);
+	COPY_NODE_FIELD(ctecolcollations);
 
     return newnode;
 }

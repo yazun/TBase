@@ -81,19 +81,43 @@ select length(stringu1) from tenk1 group by length(stringu1);
 
 explain (costs off)
 	select stringu1, count(*) from tenk1 group by stringu1 order by stringu1;
-                           QUERY PLAN                            
------------------------------------------------------------------
- Sort
-   Sort Key: stringu1
-   ->  Finalize HashAggregate
-         Group Key: stringu1
-         ->  Remote Subquery Scan on all (datanode_1,datanode_2)
-               ->  Gather
-                     Workers Planned: 4
-                     ->  Partial HashAggregate
-                           Group Key: stringu1
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Finalize GroupAggregate
+   Group Key: stringu1
+   ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+         ->  Sort
+               Sort Key: stringu1
+               ->  Partial HashAggregate
+                     Group Key: stringu1
+                     ->  Gather
+                           Workers Planned: 4
                            ->  Parallel Seq Scan on tenk1
 (10 rows)
+
+explain (costs off)
+	select count(stringu1) as num, (CASE WHEN length(stringu1) > 5 THEN 'LONG' ELSE 'SHORT' END) as islong
+		from tenk1 group by islong order by num;
+                                                     QUERY PLAN                                                     
+--------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: (count(stringu1))
+   ->  Finalize HashAggregate
+         Group Key: CASE WHEN (length((stringu1)::text) > 5) THEN 'LONG'::text ELSE 'SHORT'::text END
+         ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+               ->  Partial HashAggregate
+                     Group Key: (CASE WHEN (length((stringu1)::text) > 5) THEN 'LONG'::text ELSE 'SHORT'::text END)
+                     ->  Gather
+                           Workers Planned: 4
+                           ->  Parallel Seq Scan on tenk1
+(10 rows)
+
+select count(stringu1) as num, (CASE WHEN length(stringu1) > 5 THEN 'LONG' ELSE 'SHORT' END) as islong
+	from tenk1 group by islong order by num;
+  num  | islong 
+-------+--------
+ 10000 | LONG
+(1 row)
 
 -- test that parallel plan for aggregates is not selected when
 -- target list contains parallel restricted clause.
@@ -115,20 +139,18 @@ alter table tenk2 set (parallel_workers = 0);
 explain (costs off)
 	select count(*) from tenk1 where (two, four) not in
 	(select hundred, thousand from tenk2 where thousand > 100);
-                                           QUERY PLAN                                           
-------------------------------------------------------------------------------------------------
+                                                                                           QUERY PLAN                                                                                           
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Aggregate
-   ->  Remote Subquery Scan on all (datanode_1,datanode_2)
-         ->  Gather
-               Workers Planned: 4
-               ->  Hash Anti Join
-                     Hash Cond: ((tenk1.two = tenk2.hundred) AND (tenk1.four = tenk2.thousand))
-                     ->  Parallel Seq Scan on tenk1
-                     ->  Hash
-                           ->  Remote Subquery Scan on all (datanode_1,datanode_2)
-                                 ->  Seq Scan on tenk2
-                                       Filter: (thousand > 100)
-(11 rows)
+   ->  Nested Loop Anti Join
+         Join Filter: (((tenk1.two = tenk2.hundred) OR (tenk1.two IS NULL) OR (tenk2.hundred IS NULL)) AND ((tenk1.four = tenk2.thousand) OR (tenk1.four IS NULL) OR (tenk2.thousand IS NULL)))
+         ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+               ->  Seq Scan on tenk1
+         ->  Materialize
+               ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+                     ->  Seq Scan on tenk2
+                           Filter: (thousand > 100)
+(9 rows)
 
 select count(*) from tenk1 where (two, four) not in
 	(select hundred, thousand from tenk2 where thousand > 100);
@@ -335,6 +357,25 @@ EXPLAIN (analyze, timing off, summary off, costs off) SELECT * FROM tenk1;
  Remote Fast Query Execution (actual rows=10000 loops=1)
    Node/s: datanode_1, datanode_2
 (2 rows)
+
+-- make sure identifier was set in workers
+CREATE TABLE t_worker_identifier (a int);
+INSERT INTO t_worker_identifier values(1);
+EXPLAIN (costs off) SELECT xc_node_id != 0 FROM t_worker_identifier;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Remote Fast Query Execution
+   Node/s: datanode_1, datanode_2
+   ->  Gather
+         Workers Planned: 3
+         ->  Parallel Seq Scan on t_worker_identifier
+(5 rows)
+
+SELECT xc_node_id != 0 FROM t_worker_identifier;
+ ?column? 
+----------
+ t
+(1 row)
 
 -- provoke error in worker
 select stringu1::int2 from tenk1 where unique1 = 1;

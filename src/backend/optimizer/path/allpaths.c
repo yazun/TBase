@@ -44,6 +44,7 @@
 #include "optimizer/var.h"
 #include "parser/parse_clause.h"
 #include "parser/parsetree.h"
+#include "pgxc/nodemgr.h"
 #ifdef PGXC
 #include "nodes/makefuncs.h"
 #include "miscadmin.h"
@@ -65,6 +66,7 @@ bool        enable_geqo = false;    /* just in case GUC doesn't set it */
 int            geqo_threshold;
 int            min_parallel_table_scan_size;
 int            min_parallel_index_scan_size;
+int			min_parallel_rows_size;
 
 /* Hook for plugins to get control in set_rel_pathlist() */
 set_rel_pathlist_hook_type set_rel_pathlist_hook = NULL;
@@ -140,6 +142,7 @@ static void recurse_push_qual(Node *setOp, Query *topquery,
 static void remove_unused_subquery_outputs(Query *subquery, RelOptInfo *rel);
 static void add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
                         List *live_childrels);
+static bool check_list_contain_all_const(List *list);
 
 
 /*
@@ -210,34 +213,41 @@ make_one_rel(PlannerInfo *root, List *joinlist)
 static void
 set_base_rel_consider_startup(PlannerInfo *root)
 {
-    /*
-     * Since parameterized paths can only be used on the inside of a nestloop
-     * join plan, there is usually little value in considering fast-start
-     * plans for them.  However, for relations that are on the RHS of a SEMI
-     * or ANTI join, a fast-start plan can be useful because we're only going
-     * to care about fetching one tuple anyway.
-     *
-     * To minimize growth of planning time, we currently restrict this to
-     * cases where the RHS is a single base relation, not a join; there is no
-     * provision for consider_param_startup to get set at all on joinrels.
-     * Also we don't worry about appendrels.  costsize.c's costing rules for
-     * nestloop semi/antijoins don't consider such cases either.
-     */
-    ListCell   *lc;
+	/*
+	 * Since parameterized paths can only be used on the inside of a nestloop
+	 * join plan, there is usually little value in considering fast-start
+	 * plans for them.  However, for relations that are on the RHS of a SEMI
+	 * or ANTI join, a fast-start plan can be useful because we're only going
+	 * to care about fetching one tuple anyway.
+	 *
+	 * To minimize growth of planning time, we currently restrict this to
+	 * cases where the RHS is a single base relation, not a join; there is no
+	 * provision for consider_param_startup to get set at all on joinrels.
+	 * Also we don't worry about appendrels.  costsize.c's costing rules for
+	 * nestloop semi/antijoins don't consider such cases either.
+	 */
+	ListCell   *lc;
 
-    foreach(lc, root->join_info_list)
-    {
-        SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
-        int            varno;
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+		int			varno;
 
-        if ((sjinfo->jointype == JOIN_SEMI || sjinfo->jointype == JOIN_ANTI) &&
-            bms_get_singleton_member(sjinfo->syn_righthand, &varno))
-        {
-            RelOptInfo *rel = find_base_rel(root, varno);
+#ifdef __TBASE__
+        if ((sjinfo->jointype == JOIN_SEMI || sjinfo->jointype == JOIN_ANTI ||
+             sjinfo->jointype == JOIN_LEFT_SCALAR ||
+			 sjinfo->jointype == JOIN_LEFT_SEMI) &&
+			bms_get_singleton_member(sjinfo->syn_righthand, &varno))
+#else
+		if ((sjinfo->jointype == JOIN_SEMI || sjinfo->jointype == JOIN_ANTI) &&
+			bms_get_singleton_member(sjinfo->syn_righthand, &varno))
+#endif
+		{
+			RelOptInfo *rel = find_base_rel(root, varno);
 
-            rel->consider_param_startup = true;
-        }
-    }
+			rel->consider_param_startup = true;
+		}
+	}
 }
 
 /*
@@ -2071,6 +2081,35 @@ set_function_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 }
 
 /*
+ * check_list_contain_all_const
+ *      Check the list is contain all consts.
+ */
+static bool
+check_list_contain_all_const(List *list)
+{
+	ListCell *lc = NULL;
+	Node   *node = NULL;
+
+	foreach(lc, list)
+	{
+		node = lfirst(lc);
+		if (IsA(node, List))
+		{
+			if (!check_list_contain_all_const((List *)node))
+			{
+				return false;
+			}
+		}
+		else if (!IsA(node, Const))
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+/*
  * set_values_pathlist
  *        Build the (single) access path for a VALUES RTE
  */
@@ -2078,6 +2117,7 @@ static void
 set_values_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
     Relids        required_outer;
+	Path        *new_path = NULL;
 
     /*
      * We don't support pushing join clauses into the quals of a values scan,
@@ -2087,7 +2127,29 @@ set_values_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
     required_outer = rel->lateral_relids;
 
     /* Generate appropriate path */
-    add_path(rel, create_valuesscan_path(root, rel, required_outer));
+	new_path = create_valuesscan_path(root, rel, required_outer);
+
+	/* Mark scan as replicated if selected value list is all const */
+	if (root->parse->commandType == CMD_SELECT &&
+	    check_list_contain_all_const((List *)rte->values_lists))
+	{
+		Distribution *targetd = NULL;
+		int node_index = 0;
+
+		targetd = makeNode(Distribution);
+		targetd->distributionType = LOCATOR_TYPE_REPLICATED;
+		targetd->nodes = NULL;
+
+		for (node_index = 0; node_index < NumDataNodes; node_index++)
+		{
+			targetd->nodes = bms_add_member(targetd->nodes, node_index);
+		}
+
+		targetd->restrictNodes = NULL;
+		new_path->distribution = targetd;
+	}
+
+	add_path(rel, new_path);
 }
 
 /*

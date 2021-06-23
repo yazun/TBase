@@ -596,6 +596,9 @@ typedef struct ExecAuxRowMark
     AttrNumber    ctidAttNo;        /* resno of ctid junk attribute, if any */
     AttrNumber    toidAttNo;        /* resno of tableoid junk attribute, if any */
     AttrNumber    wholeAttNo;        /* resno of whole-row junk attribute, if any */
+#ifdef __TBASE__
+	AttrNumber	nodeidAttNo;    /* resno of xc_node_id junk attribute, if any */
+#endif
 } ExecAuxRowMark;
 
 
@@ -925,6 +928,9 @@ typedef struct PlanState
                                          * wrapper */
 
     Instrumentation *instrument;    /* Optional runtime stats for this node */
+#ifdef __TBASE__
+	DatanodeInstrumentation *dn_instrument;     /* per-datanode instrumentation */
+#endif
     WorkerInstrumentation *worker_instrument;    /* per-worker instrumentation */
 
     /*
@@ -995,6 +1001,9 @@ typedef struct EPQState
     Plan       *plan;            /* plan tree to be executed */
     List       *arowMarks;        /* ExecAuxRowMarks (non-locking only) */
     int            epqParam;        /* ID of Param to force scan node re-eval */
+#ifdef __TBASE__
+	EState	   *parentestate;   /* parant EState, more information to modify plantree if needed */
+#endif
 } EPQState;
 
 
@@ -1960,6 +1969,16 @@ typedef struct ReDistributeState
 #endif
 
 /* ----------------
+ *	 Shared memory container for per-worker sort information
+ * ----------------
+ */
+typedef struct SharedSortInfo
+{
+	int			num_workers;
+	TuplesortInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
+} SharedSortInfo;
+
+/* ----------------
  *     SortState information
  * ----------------
  */
@@ -1973,7 +1992,10 @@ typedef struct SortState
     bool        bounded_Done;    /* value of bounded we did the sort with */
     int64        bound_Done;        /* value of bound we did the sort with */
     void       *tuplesortstate; /* private state of tuplesort.c */
+	bool		am_worker;		/* are we a worker? */
+	SharedSortInfo *shared_info;	/* one entry per worker */
 #ifdef __TBASE__
+	TuplesortInstrumentation instrument; /* cached instrument from distributed nodes */
     Size            stateLen;
     ReDistributeState *state;
     BufFile        **file;
@@ -2205,6 +2227,29 @@ typedef struct GatherMergeState
 } GatherMergeState;
 
 /* ----------------
+ *	 Values displayed by EXPLAIN ANALYZE
+ * ----------------
+ */
+typedef struct HashInstrumentation
+{
+	int			nbuckets;		/* number of buckets at end of execution */
+	int			nbuckets_original;	/* planned number of buckets */
+	int			nbatch;			/* number of batches at end of execution */
+	int			nbatch_original;	/* planned number of batches */
+	size_t		space_peak;		/* speak memory usage in bytes */
+} HashInstrumentation;
+
+/* ----------------
+ *	 Shared memory container for per-worker hash information
+ * ----------------
+ */
+typedef struct SharedHashInfo
+{
+	int			num_workers;
+	HashInstrumentation hinstrument[FLEXIBLE_ARRAY_MEMBER];
+} SharedHashInfo;
+
+/* ----------------
  *     HashState information
  * ----------------
  */
@@ -2214,6 +2259,9 @@ typedef struct HashState
     HashJoinTable hashtable;    /* hash table for the hashjoin */
     List       *hashkeys;        /* list of ExprState nodes */
     /* hashkeys is same as parent's hj_InnerHashKeys */
+
+	SharedHashInfo *shared_info;	/* one entry per worker */
+	HashInstrumentation *hinstrument;	/* this worker's entry */
 } HashState;
 
 /* ----------------
@@ -2296,5 +2344,13 @@ typedef struct LimitState
     int64        position;        /* 1-based index of last tuple returned */
     TupleTableSlot *subSlot;    /* tuple last obtained from subplan */
 } LimitState;
+
+typedef struct RemoteEPQContext
+{
+	int              ntuples;
+	int             *rtidx;
+	ItemPointerData *tid;
+	uint32          *nodeid;
+} RemoteEPQContext;
 
 #endif                            /* EXECNODES_H */

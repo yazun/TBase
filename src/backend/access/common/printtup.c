@@ -29,9 +29,12 @@
 
 #include "miscadmin.h"
 #ifdef __TBASE__
+#include "access/htup_details.h"
+#include "catalog/pg_type.h"
 #include "postmaster/postmaster.h"
 #include "pgxc/squeue.h"
 #include "executor/executor.h"
+#include "utils/typcache.h"
 extern bool IsAbortedTransactionBlockState(void);
 #endif
 static void printtup_startup(DestReceiver *self, int operation,
@@ -335,6 +338,7 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
     int            natts = typeinfo->natts;
     int            i;
     bool        binary = false;
+    bool        needEncodingConvert = false;
 
 #ifdef __TBASE__
     if (end_query_requested)
@@ -399,6 +403,12 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 
     pq_sendint(&buf, natts, 2);
 
+	/* encoding convert only on datanode when connect from coordinator node or connect from app */
+	if (isPGXCDataNode && (IsConnFromCoord() || IsConnFromApp()))
+    {
+        needEncodingConvert = true;
+    }
+
     /*
      * send the attributes of this tuple
      */
@@ -430,10 +440,55 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
             char       *outputstr;
 
             outputstr = OutputFunctionCall(&thisState->finfo, attr);
+
+            if (needEncodingConvert)
+            {
             pq_sendcountedtext(&buf, outputstr, strlen(outputstr), false);
         }
         else
         {
+	            int len = strlen(outputstr);
+#ifdef __TBASE__
+	            if (slot->tts_tupleDescriptor->attrs[i]->atttypid == RECORDOID && self->mydest == DestRemoteExecute)
+	            {
+		            Oid			    tupType;
+		            int32           tupTypmod;
+		            TupleDesc       tupdesc;
+		            uint32          n32;
+		            StringInfoData  tupdesc_data;
+		            HeapTupleHeader rec;
+		            /* RECORD must be varlena */
+		            Datum   attr_detoast = PointerGetDatum(PG_DETOAST_DATUM(slot->tts_values[i]));
+		
+		            rec = DatumGetHeapTupleHeader(attr_detoast);
+		            
+		            initStringInfo(&tupdesc_data);
+		            
+		            /* Extract type info from the tuple itself */
+		            tupType = HeapTupleHeaderGetTypeId(rec);
+		            tupTypmod = HeapTupleHeaderGetTypMod(rec);
+		            tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+		
+		            /* -2 to indicate this is composite type */
+		            n32 = htonl(-2);
+		            appendBinaryStringInfo(&buf, (char *) &n32, 4);
+		
+		            FormRowDescriptionMessage(tupdesc, NULL, NULL, &tupdesc_data);
+		            ReleaseTupleDesc(tupdesc);
+		            n32 = htonl(tupdesc_data.len);
+		            /* write rowDesctiption */
+		            appendBinaryStringInfo(&buf, (char *) &n32, 4);
+		            appendBinaryStringInfo(&buf, tupdesc_data.data, tupdesc_data.len);
+		
+		            pfree(tupdesc_data.data);
+	            }
+#endif
+                pq_sendint(&buf, len, 4);
+                appendBinaryStringInfo(&buf, outputstr, len);
+            }
+		}
+		else
+		{
             /* Binary output */
             bytea       *outputbytes;
 

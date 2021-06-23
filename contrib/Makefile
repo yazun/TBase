@@ -46,13 +46,17 @@ SUBDIRS = \
                 seg             \
                 spi             \
                 tablefunc       \
+				tbase_gts_tools \
+		tbase_memory_tools	\
                 tcn             \
                 test_decoding   \
                 tsm_system_rows \
                 tsm_system_time \
                 unaccent        \
                 vacuumlo        \
-                stormstats
+                stormstats		\
+				tbase_pooler_stat \
+                pg_stat_cluster_activity
 
 ifeq ($(with_openssl),yes)
 SUBDIRS += sslinfo

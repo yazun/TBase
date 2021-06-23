@@ -97,12 +97,12 @@ explain (costs off, num_nodes off, nodes off, verbose on)  select * from t1 for 
                             QUERY PLAN                            
 ------------------------------------------------------------------
  Remote Fast Query Execution
-   Output: t1.val, t1.val2, t1.ctid
+   Output: t1.val, t1.val2, t1.ctid, t1.xc_node_id
    Remote query: SELECT val, val2 FROM t1 FOR UPDATE OF t1 NOWAIT
    ->  LockRows
-         Output: val, val2, ctid
+         Output: val, val2, ctid, xc_node_id
          ->  Seq Scan on public.t1
-               Output: val, val2, ctid
+               Output: val, val2, ctid, xc_node_id
 (7 rows)
 
 -- two table case
@@ -209,47 +209,47 @@ ERROR:  FOR UPDATE is not allowed with joins
 explain (costs off, num_nodes off, nodes off, verbose on)  select * from t1, t2, t3 for share of t1,t2 nowait;
 ERROR:  FOR SHARE is not allowed with joins
 explain (costs off, num_nodes off, nodes off, verbose on)  select * from t1 join t2 on (t1.val2 = t2.val2) join t3 on (t1.val2 = t3.val2);
-                             QUERY PLAN                              
----------------------------------------------------------------------
+                            QUERY PLAN                             
+-------------------------------------------------------------------
  Remote Subquery Scan on all
    Output: t1.val, t1.val2, t2.val, t2.val2, t3.val, t3.val2
    ->  Merge Join
          Output: t1.val, t1.val2, t2.val, t2.val2, t3.val, t3.val2
-         Merge Cond: (t3.val2 = t1.val2)
-         ->  Remote Subquery Scan on all
-               Output: t3.val, t3.val2
-               Distribute results by H: val2
-               Sort Key: t3.val2
-               ->  Sort
-                     Output: t3.val, t3.val2
-                     Sort Key: t3.val2
-                     ->  Seq Scan on public.t3
-                           Output: t3.val, t3.val2
-         ->  Materialize
+         Merge Cond: (t1.val2 = t3.val2)
+         ->  Merge Join
                Output: t1.val, t1.val2, t2.val, t2.val2
-               ->  Merge Join
-                     Output: t1.val, t1.val2, t2.val, t2.val2
-                     Merge Cond: (t1.val2 = t2.val2)
-                     ->  Remote Subquery Scan on all
+               Merge Cond: (t1.val2 = t2.val2)
+               ->  Remote Subquery Scan on all
+                     Output: t1.val, t1.val2
+                     Distribute results by H: val2
+                     Sort Key: t1.val2
+                     ->  Sort
                            Output: t1.val, t1.val2
-                           Distribute results by H: val2
                            Sort Key: t1.val2
-                           ->  Sort
+                           ->  Seq Scan on public.t1
                                  Output: t1.val, t1.val2
-                                 Sort Key: t1.val2
-                                 ->  Seq Scan on public.t1
-                                       Output: t1.val, t1.val2
-                     ->  Materialize
+               ->  Materialize
+                     Output: t2.val, t2.val2
+                     ->  Remote Subquery Scan on all
                            Output: t2.val, t2.val2
-                           ->  Remote Subquery Scan on all
+                           Distribute results by H: val2
+                           Sort Key: t2.val2
+                           ->  Sort
                                  Output: t2.val, t2.val2
-                                 Distribute results by H: val2
                                  Sort Key: t2.val2
-                                 ->  Sort
+                                 ->  Seq Scan on public.t2
                                        Output: t2.val, t2.val2
-                                       Sort Key: t2.val2
-                                       ->  Seq Scan on public.t2
-                                             Output: t2.val, t2.val2
+         ->  Materialize
+               Output: t3.val, t3.val2
+               ->  Remote Subquery Scan on all
+                     Output: t3.val, t3.val2
+                     Distribute results by H: val2
+                     Sort Key: t3.val2
+                     ->  Sort
+                           Output: t3.val, t3.val2
+                           Sort Key: t3.val2
+                           ->  Seq Scan on public.t3
+                                 Output: t3.val, t3.val2
 (39 rows)
 
 explain (costs off, num_nodes off, nodes off, verbose on)  select * from t1 join t2 on (t1.val2 = t2.val2) join t3 on (t1.val2 = t3.val2) for update;
@@ -262,12 +262,12 @@ select * from t1 join t2 on (t1.val2 = t2.val2) join t3 on (t1.val2 = t3.val2);
  val | val2 | val | val2 | val | val2 
 -----+------+-----+------+-----+------
    1 |   11 |   3 |   11 |   5 |   11
-   1 |   11 |   4 |   11 |   5 |   11
-   2 |   11 |   3 |   11 |   5 |   11
-   2 |   11 |   4 |   11 |   5 |   11
    1 |   11 |   3 |   11 |   6 |   11
+   1 |   11 |   4 |   11 |   5 |   11
    1 |   11 |   4 |   11 |   6 |   11
+   2 |   11 |   3 |   11 |   5 |   11
    2 |   11 |   3 |   11 |   6 |   11
+   2 |   11 |   4 |   11 |   5 |   11
    2 |   11 |   4 |   11 |   6 |   11
 (8 rows)
 
@@ -279,23 +279,23 @@ select * from t1 join t2 on (t1.val2 = t2.val2) join t3 on (t1.val2 = t3.val2) f
 ERROR:  FOR UPDATE is not allowed with joins
 -- check a few subquery cases
 explain (costs off, num_nodes off, nodes off, verbose on)  select * from (select * from t1 for update of t1 nowait) as foo;
-                      QUERY PLAN                      
-------------------------------------------------------
+                             QUERY PLAN                              
+---------------------------------------------------------------------
  Remote Subquery Scan on all
    Output: foo.val, foo.val2
    ->  Subquery Scan on foo
          Output: foo.val, foo.val2
          ->  LockRows
-               Output: t1.val, t1.val2, t1.ctid
+               Output: t1.val, t1.val2, t1.ctid, t1.xc_node_id
                ->  Seq Scan on public.t1
-                     Output: t1.val, t1.val2, t1.ctid
+                     Output: t1.val, t1.val2, t1.ctid, t1.xc_node_id
 (8 rows)
 
 explain (costs off, num_nodes off, nodes off, verbose on)  select * from t1 where val in (select val from t2 for update of t2 nowait) for update;
 ERROR:  FOR UPDATE is not allowed with joins
 explain (costs off, num_nodes off, nodes off, verbose on)  select * from t1 where val in (select val from t2 for update of t2 nowait);
-                          QUERY PLAN                           
----------------------------------------------------------------
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
  Remote Subquery Scan on all
    Output: t1.val, t1.val2
    ->  Hash Join
@@ -312,9 +312,9 @@ explain (costs off, num_nodes off, nodes off, verbose on)  select * from t1 wher
                      ->  Subquery Scan on "ANY_subquery"
                            Output: "ANY_subquery".val
                            ->  LockRows
-                                 Output: t2.val, t2.ctid
+                                 Output: t2.val, t2.ctid, t2.xc_node_id
                                  ->  Seq Scan on public.t2
-                                       Output: t2.val, t2.ctid
+                                       Output: t2.val, t2.ctid, t2.xc_node_id
 (19 rows)
 
 -- test multiple row marks
@@ -325,48 +325,48 @@ explain (costs off, num_nodes off, nodes off, verbose on)  select * from t1 for 
                         QUERY PLAN                         
 -----------------------------------------------------------
  Remote Fast Query Execution
-   Output: t1.val, t1.val2, t1.ctid
+   Output: t1.val, t1.val2, t1.ctid, t1.xc_node_id
    Remote query: SELECT val, val2 FROM t1 FOR UPDATE OF t1
    ->  LockRows
-         Output: val, val2, ctid
+         Output: val, val2, ctid, xc_node_id
          ->  Seq Scan on public.t1
-               Output: val, val2, ctid
+               Output: val, val2, ctid, xc_node_id
 (7 rows)
 
 explain (costs off, num_nodes off, nodes off, verbose on)  select * from t1 for update of t1 for share of t1;
                         QUERY PLAN                         
 -----------------------------------------------------------
  Remote Fast Query Execution
-   Output: t1.val, t1.val2, t1.ctid
+   Output: t1.val, t1.val2, t1.ctid, t1.xc_node_id
    Remote query: SELECT val, val2 FROM t1 FOR UPDATE OF t1
    ->  LockRows
-         Output: val, val2, ctid
+         Output: val, val2, ctid, xc_node_id
          ->  Seq Scan on public.t1
-               Output: val, val2, ctid
+               Output: val, val2, ctid, xc_node_id
 (7 rows)
 
 explain (costs off, num_nodes off, nodes off, verbose on)  select * from t1 for share of t1 for share of t1 for update of t1;
                         QUERY PLAN                         
 -----------------------------------------------------------
  Remote Fast Query Execution
-   Output: t1.val, t1.val2, t1.ctid
+   Output: t1.val, t1.val2, t1.ctid, t1.xc_node_id
    Remote query: SELECT val, val2 FROM t1 FOR UPDATE OF t1
    ->  LockRows
-         Output: val, val2, ctid
+         Output: val, val2, ctid, xc_node_id
          ->  Seq Scan on public.t1
-               Output: val, val2, ctid
+               Output: val, val2, ctid, xc_node_id
 (7 rows)
 
 explain (costs off, num_nodes off, nodes off, verbose on)  select * from t1 for share of t1 for share of t1 for share of t1;
                         QUERY PLAN                        
 ----------------------------------------------------------
  Remote Fast Query Execution
-   Output: t1.val, t1.val2, t1.ctid
+   Output: t1.val, t1.val2, t1.ctid, t1.xc_node_id
    Remote query: SELECT val, val2 FROM t1 FOR SHARE OF t1
    ->  LockRows
-         Output: val, val2, ctid
+         Output: val, val2, ctid, xc_node_id
          ->  Seq Scan on public.t1
-               Output: val, val2, ctid
+               Output: val, val2, ctid, xc_node_id
 (7 rows)
 
 -- make sure NOWAIT is used in remote query even if it is not mentioned with FOR UPDATE clause
@@ -374,12 +374,12 @@ explain (costs off, num_nodes off, nodes off, verbose on)  select * from t1 for 
                             QUERY PLAN                            
 ------------------------------------------------------------------
  Remote Fast Query Execution
-   Output: t1.val, t1.val2, t1.ctid
+   Output: t1.val, t1.val2, t1.ctid, t1.xc_node_id
    Remote query: SELECT val, val2 FROM t1 FOR UPDATE OF t1 NOWAIT
    ->  LockRows
-         Output: val, val2, ctid
+         Output: val, val2, ctid, xc_node_id
          ->  Seq Scan on public.t1
-               Output: val, val2, ctid
+               Output: val, val2, ctid, xc_node_id
 (7 rows)
 
 -- same table , different aliases and different row marks for different aliases
@@ -390,42 +390,36 @@ ERROR:  FOR SHARE is not allowed with joins
 explain (costs off, num_nodes off, nodes off, verbose on)  WITH q1 AS (SELECT * from t1 FOR UPDATE) SELECT * FROM q1,t2 FOR UPDATE;
 ERROR:  FOR UPDATE is not allowed with joins
 explain (costs off, num_nodes off, nodes off, verbose on)  WITH q1 AS (SELECT * from t1) SELECT * FROM q1;
-               QUERY PLAN                
------------------------------------------
- CTE Scan on q1
-   Output: q1.val, q1.val2
-   CTE q1
-     ->  Remote Subquery Scan on all
-           Output: t1.val, t1.val2
-           ->  Seq Scan on public.t1
-                 Output: t1.val, t1.val2
-(7 rows)
+           QUERY PLAN            
+---------------------------------
+ Remote Subquery Scan on all
+   Output: t1.val, t1.val2
+   ->  Seq Scan on public.t1
+         Output: t1.val, t1.val2
+(4 rows)
 
 -- make sure row marks are no ops for queries on WITH tables
 explain (costs off, num_nodes off, nodes off, verbose on)  WITH q1 AS (SELECT * from t1) SELECT * FROM q1 FOR UPDATE;
-               QUERY PLAN                
------------------------------------------
- CTE Scan on q1
-   Output: q1.val, q1.val2
-   CTE q1
-     ->  Remote Subquery Scan on all
-           Output: t1.val, t1.val2
-           ->  Seq Scan on public.t1
-                 Output: t1.val, t1.val2
-(7 rows)
+           QUERY PLAN            
+---------------------------------
+ Remote Subquery Scan on all
+   Output: t1.val, t1.val2
+   ->  Seq Scan on public.t1
+         Output: t1.val, t1.val2
+(4 rows)
 
 explain (costs off, num_nodes off, nodes off, verbose on)  WITH q1 AS (SELECT * from t1 FOR UPDATE) SELECT * FROM q1 FOR UPDATE;
-                       QUERY PLAN                       
---------------------------------------------------------
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
  CTE Scan on q1
    Output: q1.val, q1.val2
    CTE q1
      ->  Remote Subquery Scan on all
-           Output: t1.val, t1.val2, t1.ctid
+           Output: t1.val, t1.val2, t1.ctid, t1.xc_node_id
            ->  LockRows
-                 Output: t1.val, t1.val2, t1.ctid
+                 Output: t1.val, t1.val2, t1.ctid, t1.xc_node_id
                  ->  Seq Scan on public.t1
-                       Output: t1.val, t1.val2, t1.ctid
+                       Output: t1.val, t1.val2, t1.ctid, t1.xc_node_id
 (9 rows)
 
 -- test case of inheried tables
@@ -439,17 +433,17 @@ select * from p1 order by 1 for update;
 (4 rows)
 
 explain (costs off, num_nodes off, nodes off, verbose on)  select * from p1 for update;
-                          QUERY PLAN                          
---------------------------------------------------------------
+                                 QUERY PLAN                                  
+-----------------------------------------------------------------------------
  Remote Subquery Scan on all
-   Output: a, b, ctid, tableoid
+   Output: a, b, ctid, xc_node_id, tableoid
    ->  LockRows
-         Output: p1.a, p1.b, p1.ctid, p1.tableoid
+         Output: p1.a, p1.b, p1.ctid, p1.xc_node_id, p1.tableoid
          ->  Append
                ->  Seq Scan on public.p1
-                     Output: p1.a, p1.b, p1.ctid, p1.tableoid
+                     Output: p1.a, p1.b, p1.ctid, p1.xc_node_id, p1.tableoid
                ->  Seq Scan on public.c1
-                     Output: c1.a, c1.b, c1.ctid, c1.tableoid
+                     Output: c1.a, c1.b, c1.ctid, c1.xc_node_id, c1.tableoid
 (9 rows)
 
 select * from c1 order by 1 for update;
@@ -463,12 +457,12 @@ explain (costs off, num_nodes off, nodes off, verbose on)  select * from c1 for 
                          QUERY PLAN                         
 ------------------------------------------------------------
  Remote Fast Query Execution
-   Output: c1.a, c1.b, c1.d, c1.e, c1.ctid
+   Output: c1.a, c1.b, c1.d, c1.e, c1.ctid, c1.xc_node_id
    Remote query: SELECT a, b, d, e FROM c1 FOR UPDATE OF c1
    ->  LockRows
-         Output: a, b, d, e, ctid
+         Output: a, b, d, e, ctid, xc_node_id
          ->  Seq Scan on public.c1
-               Output: a, b, d, e, ctid
+               Output: a, b, d, e, ctid, xc_node_id
 (7 rows)
 
 -- confirm that in various join scenarios for update gets to the remote query

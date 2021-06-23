@@ -132,6 +132,11 @@
 #include "pgxc/shardmap.h"
 #include "pgxc/groupmgr.h"
 #endif
+
+#ifdef __TBASE__
+#include "parser/scansup.h"
+#endif
+
 /*
  * ON COMMIT action list
  */
@@ -632,118 +637,123 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
      * namespace is selected.
      */
 #ifdef __TBASE__
-    if (stmt->interval_child)
+	if (stmt->interval_child)
+	{
+		/* interval partition child's namespace is same as parent. */
+		namespaceId = get_rel_namespace(stmt->interval_parentId);
+	}
+	else
     {
-        /* interval partition child's namespace is same as parent. */
-        namespaceId = get_rel_namespace(stmt->interval_parentId);
+        namespaceId =
+                RangeVarGetAndCheckCreationNamespace(stmt->relation, ExclusiveLock, NULL);
     }
-    else
+#else
+	namespaceId =
+		RangeVarGetAndCheckCreationNamespace(stmt->relation, NoLock, NULL);
 #endif
-    namespaceId =
-        RangeVarGetAndCheckCreationNamespace(stmt->relation, NoLock, NULL);
 
-    /*
-     * Security check: disallow creating temp tables from security-restricted
-     * code.  This is needed because calling code might not expect untrusted
-     * tables to appear in pg_temp at the front of its search path.
-     */
-    if (stmt->relation->relpersistence == RELPERSISTENCE_TEMP
-        && InSecurityRestrictedOperation())
-        ereport(ERROR,
-                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-                 errmsg("cannot create temporary table within security-restricted operation")));
+	/*
+	 * Security check: disallow creating temp tables from security-restricted
+	 * code.  This is needed because calling code might not expect untrusted
+	 * tables to appear in pg_temp at the front of its search path.
+	 */
+	if (stmt->relation->relpersistence == RELPERSISTENCE_TEMP
+		&& InSecurityRestrictedOperation())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("cannot create temporary table within security-restricted operation")));
 
-    /*
-     * Select tablespace to use.  If not specified, use default tablespace
-     * (which may in turn default to database's default).
-     */
-    if (stmt->tablespacename)
-    {
-        tablespaceId = get_tablespace_oid(stmt->tablespacename, false);
-    }
-    else
-    {
-        tablespaceId = GetDefaultTablespace(stmt->relation->relpersistence);
-        /* note InvalidOid is OK in this case */
-    }
+	/*
+	 * Select tablespace to use.  If not specified, use default tablespace
+	 * (which may in turn default to database's default).
+	 */
+	if (stmt->tablespacename)
+	{
+		tablespaceId = get_tablespace_oid(stmt->tablespacename, false);
+	}
+	else
+	{
+		tablespaceId = GetDefaultTablespace(stmt->relation->relpersistence);
+		/* note InvalidOid is OK in this case */
+	}
 
-    /* Check permissions except when using database's default */
-    if (OidIsValid(tablespaceId) && tablespaceId != MyDatabaseTableSpace)
-    {
-        AclResult    aclresult;
+	/* Check permissions except when using database's default */
+	if (OidIsValid(tablespaceId) && tablespaceId != MyDatabaseTableSpace)
+	{
+		AclResult	aclresult;
 
-        aclresult = pg_tablespace_aclcheck(tablespaceId, GetUserId(),
-                                           ACL_CREATE);
-        if (aclresult != ACLCHECK_OK)
-            aclcheck_error(aclresult, ACL_KIND_TABLESPACE,
-                           get_tablespace_name(tablespaceId));
-    }
+		aclresult = pg_tablespace_aclcheck(tablespaceId, GetUserId(),
+										   ACL_CREATE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, ACL_KIND_TABLESPACE,
+						   get_tablespace_name(tablespaceId));
+	}
 
-    /* In all cases disallow placing user relations in pg_global */
-    if (tablespaceId == GLOBALTABLESPACE_OID)
-        ereport(ERROR,
-                (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                 errmsg("only shared relations can be placed in pg_global tablespace")));
+	/* In all cases disallow placing user relations in pg_global */
+	if (tablespaceId == GLOBALTABLESPACE_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("only shared relations can be placed in pg_global tablespace")));
 
-    /* Identify user ID that will own the table */
-    if (!OidIsValid(ownerId))
-        ownerId = GetUserId();
+	/* Identify user ID that will own the table */
+	if (!OidIsValid(ownerId))
+		ownerId = GetUserId();
 
-    /*
-     * Parse and validate reloptions, if any.
-     */
-    reloptions = transformRelOptions((Datum) 0, stmt->options, NULL, validnsps,
-                                     true, false);
+	/*
+	 * Parse and validate reloptions, if any.
+	 */
+	reloptions = transformRelOptions((Datum) 0, stmt->options, NULL, validnsps,
+									 true, false);
 
-    if (relkind == RELKIND_VIEW)
-        (void) view_reloptions(reloptions, true);
-    else
-        (void) heap_reloptions(relkind, reloptions, true);
+	if (relkind == RELKIND_VIEW)
+		(void) view_reloptions(reloptions, true);
+	else
+		(void) heap_reloptions(relkind, reloptions, true);
 
-    if (stmt->ofTypename)
-    {
-        AclResult    aclresult;
+	if (stmt->ofTypename)
+	{
+		AclResult	aclresult;
 
-        ofTypeId = typenameTypeId(NULL, stmt->ofTypename);
+		ofTypeId = typenameTypeId(NULL, stmt->ofTypename);
 
-        aclresult = pg_type_aclcheck(ofTypeId, GetUserId(), ACL_USAGE);
-        if (aclresult != ACLCHECK_OK)
-            aclcheck_error_type(aclresult, ofTypeId);
-    }
-    else
-        ofTypeId = InvalidOid;
+		aclresult = pg_type_aclcheck(ofTypeId, GetUserId(), ACL_USAGE);
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error_type(aclresult, ofTypeId);
+	}
+	else
+		ofTypeId = InvalidOid;
 
-    /*
-     * Look up inheritance ancestors and generate relation schema, including
-     * inherited attributes.  (Note that stmt->tableElts is destructively
-     * modified by MergeAttributes.)
-     */
-    stmt->tableElts =
-        MergeAttributes(stmt->tableElts, stmt->inhRelations,
-                        stmt->relation->relpersistence,
-                        stmt->partbound != NULL,
-                        &inheritOids, &old_constraints, &parentOidCount);
+	/*
+	 * Look up inheritance ancestors and generate relation schema, including
+	 * inherited attributes.  (Note that stmt->tableElts is destructively
+	 * modified by MergeAttributes.)
+	 */
+	stmt->tableElts =
+		MergeAttributes(stmt->tableElts, stmt->inhRelations,
+						stmt->relation->relpersistence,
+						stmt->partbound != NULL,
+						&inheritOids, &old_constraints, &parentOidCount);
 
-    /*
-     * Create a tuple descriptor from the relation schema.  Note that this
-     * deals with column names, types, and NOT NULL constraints, but not
-     * default values or CHECK constraints; we handle those below.
-     */
-    descriptor = BuildDescForRelation(stmt->tableElts);
+	/*
+	 * Create a tuple descriptor from the relation schema.  Note that this
+	 * deals with column names, types, and NOT NULL constraints, but not
+	 * default values or CHECK constraints; we handle those below.
+	 */
+	descriptor = BuildDescForRelation(stmt->tableElts);
 
-    /*
-     * Notice that we allow OIDs here only for plain tables and partitioned
-     * tables, even though some other relkinds can support them.  This is
-     * necessary because the default_with_oids GUC must apply only to plain
-     * tables and not any other relkind; doing otherwise would break existing
-     * pg_dump files.  We could allow explicit "WITH OIDS" while not allowing
-     * default_with_oids to affect other relkinds, but it would complicate
-     * interpretOidsOption().
-     */
-    localHasOids = interpretOidsOption(stmt->options,
-                                       (relkind == RELKIND_RELATION ||
-                                        relkind == RELKIND_PARTITIONED_TABLE));
-    descriptor->tdhasoid = (localHasOids || parentOidCount > 0);
+	/*
+	 * Notice that we allow OIDs here only for plain tables and partitioned
+	 * tables, even though some other relkinds can support them.  This is
+	 * necessary because the default_with_oids GUC must apply only to plain
+	 * tables and not any other relkind; doing otherwise would break existing
+	 * pg_dump files.  We could allow explicit "WITH OIDS" while not allowing
+	 * default_with_oids to affect other relkinds, but it would complicate
+	 * interpretOidsOption().
+	 */
+	localHasOids = interpretOidsOption(stmt->options,
+									   (relkind == RELKIND_RELATION ||
+										relkind == RELKIND_PARTITIONED_TABLE));
+	descriptor->tdhasoid = (localHasOids || parentOidCount > 0);
 #ifdef _SHARDING_
     if(IS_PGXC_DATANODE)
         has_extent = interpretExtentOption(stmt->options,
@@ -1215,19 +1225,170 @@ DropErrorMsgWrongType(const char *relname, char wrongkind, char rightkind)
              (wentry->kind != '\0') ? errhint("%s", _(wentry->drophint_msg)) : 0));
 }
 
+#ifdef __TBASE__
+
+/*
+ * replace all invisible characters with ' ',
+ * leave no spaces next to ',' or '.'
+ */
+static void
+OmitqueryStringSpace(char *queryString)
+{
+    char *front = queryString;
+    char *last = queryString;
+    bool skip = false;
+
+    if (queryString == NULL)
+    {
+        return;
+    }
+
+    /* omit space */
+    while (scanner_isspace(*front))
+    {
+        ++front;
+    }
+
+    while ((*front) != '\0')
+    {
+        if(scanner_isspace(*front) && skip == false)
+        {
+            while(scanner_isspace(*front))
+            {
+                ++front;
+            }
+
+            if ((*front) == ',' || (*front) == '.')
+            {
+                /* no need space */
+            }
+            else if (last != queryString && (*(last - 1) == ',' || *(last - 1) == '.'))
+            {
+                /* no need space */
+            }
+            else
+            {
+                /* replace all invisible characters with ' ' */
+                *last = ' ';
+                ++last;
+                continue;
+            }
+        }
+
+        if ((*front) == '\"')
+        {
+            skip = (skip == true) ? false : true;
+            *last = *front;
+            ++front;
+        }
+        else
+        {
+            *last = *front;
+            ++front;
+        }
+        ++last;
+    }
+    *last = '\0';
+}
+
+/*
+ * remove relname in query string (replace with ' ')
+ */
+static void
+RemoveRelnameInQueryString(char *queryString, RangeVar *rel)
+{
+    char *ptr = NULL;
+    char *tmp = NULL;
+    char *tmpStr = NULL;
+    char *start_ptr = queryString;
+    char *end_ptr = queryString + strlen(queryString) - 1;
+    int  len = 0;
+    char full_name[MAXFULLNAMEDATALEN];
+
+    /* get remove obj full name */
+    snprintf(full_name, MAXFULLNAMEDATALEN, "%s%s%s%s%s", (rel->catalogname) ? (rel->catalogname) : "",
+                                                            (rel->catalogname) ? "." : "",
+                                                            (rel->schemaname) ? (rel->schemaname) : "",
+                                                             (rel->schemaname) ? "." : "",
+                                                             rel->relname);
+    tmpStr = queryString;
+    len = strlen(full_name);
+    while ((ptr = strstr(tmpStr, full_name)) != NULL)
+    {
+        /* is not independent string, skip */
+        if (((ptr - 1) >= start_ptr && *(ptr - 1) != ' ' && (*(ptr - 1) != ',')) ||
+                    ((ptr + len) <= end_ptr && *(ptr + len) != ' ' && *(ptr + len) != ',' && *(ptr + len) != ';'))
+        {
+            if (((ptr - 1) >= start_ptr && *(ptr - 1) == '\"' && (ptr + len) <= end_ptr && *(ptr + len) == '\"') &&
+                        ((ptr - 2) < start_ptr || *(ptr - 2) != '.'))
+            {
+                *(ptr - 1) = ' ';
+                *(ptr + len) = ' ';
+            }
+            else
+            {
+                tmpStr = ptr + len;
+                continue;
+            }
+        }
+
+        /* replace obj name with ' ' */
+        MemSet(ptr, ' ', len);
+
+        /* find the previous ',' */
+        tmp = ptr - 1;
+        while (tmp >= start_ptr && *tmp == ' ')
+        {
+            tmp--;
+        }
+
+        if (tmp >= start_ptr && *tmp == ',')
+        {
+            *tmp = ' ';
+        }
+        else
+        {
+            /* find the following ',' */
+            tmp = ptr + len;
+            while (tmp <= end_ptr && *tmp == ' ')
+            {
+                tmp++;
+            }
+
+            if (tmp <= end_ptr && *tmp == ',')
+            {
+                *tmp = ' ';
+            }
+        }
+
+        tmpStr = ptr + len;
+    }
+}
+
+#endif
+
 /*
  * RemoveRelations
  *        Implements DROP TABLE, DROP INDEX, DROP SEQUENCE, DROP VIEW,
  *        DROP MATERIALIZED VIEW, DROP FOREIGN TABLE
  */
+#ifdef __TBASE__
+int
+RemoveRelations(DropStmt *drop, char* queryString)
+#else
 void
 RemoveRelations(DropStmt *drop)
-{// #lizard forgives
+#endif
+{
     ObjectAddresses *objects;
     char        relkind;
     ListCell   *cell;
     int            flags = 0;
     LOCKMODE    lockmode = AccessExclusiveLock;
+#ifdef __TBASE__
+    bool        querystring_omit = false;
+    int         drop_cnt = 0;
+#endif
 
     /* DROP CONCURRENTLY uses a weaker lock, and has some restrictions */
     if (drop->concurrent)
@@ -1323,6 +1484,15 @@ RemoveRelations(DropStmt *drop)
         if (!OidIsValid(relOid))
         {
             DropErrorMsgNonExistent(rel, relkind, drop->missing_ok);
+#ifdef __TBASE__
+			if (!querystring_omit)
+            {
+                OmitqueryStringSpace(queryString);
+                querystring_omit = true;
+            }
+
+            RemoveRelnameInQueryString(queryString, rel);
+#endif
             continue;
         }
 
@@ -1369,11 +1539,18 @@ RemoveRelations(DropStmt *drop)
         obj.objectSubId = 0;
 
         add_exact_object_address(&obj, objects);
+#ifdef __TBASE__
+        drop_cnt++;
+#endif
     }
 
     performMultipleDeletions(objects, drop->behavior, flags);
 
     free_object_addresses(objects);
+
+#ifdef __TBASE__
+    return drop_cnt;
+#endif
 }
 
 /*

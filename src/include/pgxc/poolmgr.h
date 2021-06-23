@@ -105,7 +105,7 @@ typedef struct
 
     /* trace info */    
     int32  refcount;   /* reference count */
-    int32  m_version;  /* version of node slot */
+	time_t m_version;  /* version of node slot */
     int32  pid;           /* agent pid that contains the slot */
     int32  seqnum;       /* slot seqnum for the slot, unique for one slot */
     bool   bdestoryed; /* used to show whether we are destoryed */
@@ -128,7 +128,7 @@ typedef struct
     int            size;          /* total pool size */
 
     char        node_name[NAMEDATALEN]; /* name of the node.*/
-    int32       m_version;    /* version of node pool */
+	time_t		m_version;	/* version of node pool */
     PGXCNodePoolSlot **slot;
 } PGXCNodePool;
 
@@ -174,6 +174,7 @@ typedef struct PGXCASyncTaskCtl
     CommandId             m_max_command_id;
 
     /* errmsg and error status. */
+	bool                  m_missing_ok;
     int32                  m_error_offset;
     char                  m_error_msg[PGXC_POOL_ERROR_MSG_LEN];
 }PGXCASyncTaskCtl;
@@ -186,34 +187,36 @@ typedef struct PGXCASyncTaskCtl
  */
 typedef struct
 {
-    /* Process ID of postmaster child process associated to pool agent */
-    int                pid;
-    /* communication channel */
-    PoolPort        port;
-    DatabasePool   *pool;
-    MemoryContext    mcxt;
-    int                num_dn_connections;
-    int                num_coord_connections;
-    Oid                  *dn_conn_oids;        /* one for each Datanode */
-    Oid                  *coord_conn_oids;    /* one for each Coordinator */
-    PGXCNodePoolSlot **dn_connections; /* one for each Datanode */
-    PGXCNodePoolSlot **coord_connections; /* one for each Coordinator */
-    
-    char           *session_params;
-    char           *local_params;
-    List            *session_params_list; /* session param list */
-    List             *local_params_list;   /* local param list */
-    
-    bool            is_temp; /* Temporary objects used for this pool session? */
+	/* Process ID of postmaster child process associated to pool agent */
+	int				pid;
+	/* communication channel */
+	PoolPort		port;
+	DatabasePool   *pool;
+	MemoryContext	mcxt;
+	int				num_dn_connections;
+	int				num_coord_connections;
+	Oid		   	   *dn_conn_oids;		/* one for each Datanode */
+	Oid		   	   *coord_conn_oids;	/* one for each Coordinator */
+	PGXCNodePoolSlot **dn_connections; /* one for each Datanode */
+	PGXCNodePoolSlot **coord_connections; /* one for each Coordinator */
+	
+	char		   *session_params;
+	char		   *local_params;
+	List            *session_params_list; /* session param list */
+	List 			*local_params_list;   /* local param list */
+	
+	bool			is_temp; /* Temporary objects used for this pool session? */
 
-    int             query_count;   /* query count, if exceed, need to reconnect database */
-    bool            breconnecting; /* whether we are reconnecting */
-    int             agentindex;
+	int             query_count;   /* query count, if exceed, need to reconnect database */
+	bool            breconnecting; /* whether we are reconnecting */
+	int             agentindex;
 
-    
-    bool            destory_pending; /* whether we have been ordered to destory */
-    int32            ref_count;         /* reference count */
-    PGXCASyncTaskCtl *task_control;  /* in error situation, we need to free the task control */
+	
+	bool            destory_pending; /* whether we have been ordered to destory */
+	int32			ref_count;		 /* reference count */
+	PGXCASyncTaskCtl *task_control;  /* in error situation, we need to free the task control */
+
+    pg_time_t cmd_start_time;        /* command start time */
 } PoolAgent;
 
 /* Handle to the pool manager (Session's side) */
@@ -222,6 +225,23 @@ typedef struct
     /* communication channel */
     PoolPort    port;
 } PoolHandle;
+
+typedef struct PoolerCmdStatistics
+{
+    uint64 total_request_times;     /* command total request times */
+    union
+    {
+        uint64 total_costtime;      /* total time spent processing commands */
+        uint64 avg_costtime;        /* avg time spent processing command */
+    };
+    uint64 max_costtime;            /* max time spent processing command */
+    uint64 min_costtime;            /* min time spent processing command */
+} PoolerCmdStatistics;
+
+
+#define POOLER_CMD_COUNT (18)
+
+
 
 #define     POOLER_ERROR_MSG_LEN  256
 
@@ -248,6 +268,7 @@ extern int  PoolDNSetTimeout;
 extern int  PoolCheckSlotTimeout;
 extern int  PoolPrintStatTimeout;
 extern bool PoolConnectDebugPrint; 
+extern bool PoolSubThreadLogPrint;
 /* Status inquiry functions */
 extern void PGXCPoolerProcessIam(void);
 extern bool IsPGXCPoolerProcess(void);
@@ -309,7 +330,7 @@ extern int PoolManagerSetCommand(PGXCNodeHandle **connections, int32 count, Pool
                                   const char *set_command);
 
 /* Get pooled connections */
-extern int *PoolManagerGetConnections(List *datanodelist, List *coordlist, int **pids);
+extern int *PoolManagerGetConnections(List *datanodelist, List *coordlist, bool raise_error, int **pids);
 
 /* Clean pool connections */
 extern void PoolManagerCleanConnection(List *datanodelist, List *coordlist, char *dbname, char *username);
@@ -348,5 +369,9 @@ extern bool check_persistent_connections(bool *newval, void **extra,
 /* Refresh connection data in pooler and drop connections of altered nodes in pooler */
 extern int PoolManagerRefreshConnectionInfo(void);
 extern int PoolManagerClosePooledConnections(const char *dbname, const char *username);
+
+extern int PoolManagerGetCmdStatistics(char *s, int size);
+extern void PoolManagerResetCmdStatistics(void);
+extern int PoolManagerGetConnStatistics(StringInfo s);
 
 #endif

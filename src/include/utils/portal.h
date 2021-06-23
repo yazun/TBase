@@ -263,6 +263,10 @@ typedef struct PortalData
                                  * portal marked failed in subtransaction 
                                  * in AtSubAbort_Portals
                                  */
+	
+	/* information about EvalPlanQual, pass it to queryDesc */
+	RemoteEPQContext *epqContext;
+	int			up_instrument;	/* explain analyze option from cn */
 #endif
 }            PortalData;
 
@@ -278,6 +282,12 @@ typedef struct PortalData
 #define PortalGetQueryDesc(portal)    ((portal)->queryDesc)
 #define PortalGetHeapMemory(portal) ((portal)->heap)
 
+/* Hook for plugins to get control after PortalStart() */
+typedef void (*PortalStart_hook_type) (Portal portal);
+extern PGDLLIMPORT PortalStart_hook_type PortalStart_hook;
+/* Hook for plugins to get control before PortalDrop() */
+typedef void (*PortalDrop_hook_type) (Portal portal);
+extern PGDLLIMPORT PortalDrop_hook_type PortalDrop_hook;
 
 /* Prototypes for functions in utils/mmgr/portalmem.c */
 extern void EnablePortalManager(void);

@@ -352,37 +352,37 @@ add_rtes_to_flat_rtable(PlannerInfo *root, bool recursing)
 static void
 flatten_unplanned_rtes(PlannerGlobal *glob, RangeTblEntry *rte)
 {
-    /* Use query_tree_walker to find all RTEs in the parse tree */
-    (void) query_tree_walker(rte->subquery,
-                             flatten_rtes_walker,
-                             (void *) glob,
-                             QTW_EXAMINE_RTES);
+	/* Use query_tree_walker to find all RTEs in the parse tree */
+	(void) query_tree_walker(rte->subquery,
+							 flatten_rtes_walker,
+							 (void *) glob,
+							 QTW_EXAMINE_RTES_BEFORE);
 }
 
 static bool
 flatten_rtes_walker(Node *node, PlannerGlobal *glob)
 {
-    if (node == NULL)
-        return false;
-    if (IsA(node, RangeTblEntry))
-    {
-        RangeTblEntry *rte = (RangeTblEntry *) node;
+	if (node == NULL)
+		return false;
+	if (IsA(node, RangeTblEntry))
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) node;
 
-        /* As above, we need only save relation RTEs */
-        if (rte->rtekind == RTE_RELATION)
-            add_rte_to_flat_rtable(glob, rte);
-        return false;
-    }
-    if (IsA(node, Query))
-    {
-        /* Recurse into subselects */
-        return query_tree_walker((Query *) node,
-                                 flatten_rtes_walker,
-                                 (void *) glob,
-                                 QTW_EXAMINE_RTES);
-    }
-    return expression_tree_walker(node, flatten_rtes_walker,
-                                  (void *) glob);
+		/* As above, we need only save relation RTEs */
+		if (rte->rtekind == RTE_RELATION)
+			add_rte_to_flat_rtable(glob, rte);
+		return false;
+	}
+	if (IsA(node, Query))
+	{
+		/* Recurse into subselects */
+		return query_tree_walker((Query *) node,
+								 flatten_rtes_walker,
+								 (void *) glob,
+								 QTW_EXAMINE_RTES_BEFORE);
+	}
+	return expression_tree_walker(node, flatten_rtes_walker,
+								  (void *) glob);
 }
 
 /*
@@ -1653,119 +1653,123 @@ fix_scan_expr_walker(Node *node, fix_scan_expr_context *context)
  */
 static void
 set_join_references(PlannerInfo *root, Join *join, int rtoffset)
-{// #lizard forgives
-    Plan       *outer_plan = join->plan.lefttree;
-    Plan       *inner_plan = join->plan.righttree;
-    indexed_tlist *outer_itlist;
-    indexed_tlist *inner_itlist;
+{
+	Plan	   *outer_plan = join->plan.lefttree;
+	Plan	   *inner_plan = join->plan.righttree;
+	indexed_tlist *outer_itlist;
+	indexed_tlist *inner_itlist;
 
-    outer_itlist = build_tlist_index(outer_plan->targetlist);
-    inner_itlist = build_tlist_index(inner_plan->targetlist);
+	outer_itlist = build_tlist_index(outer_plan->targetlist);
+	inner_itlist = build_tlist_index(inner_plan->targetlist);
 
-    /*
-     * First process the joinquals (including merge or hash clauses).  These
-     * are logically below the join so they can always use all values
-     * available from the input tlists.  It's okay to also handle
-     * NestLoopParams now, because those couldn't refer to nullable
-     * subexpressions.
-     */
-    join->joinqual = fix_join_expr(root,
-                                   join->joinqual,
-                                   outer_itlist,
-                                   inner_itlist,
-                                   (Index) 0,
-                                   rtoffset);
+	/*
+	 * First process the joinquals (including merge or hash clauses).  These
+	 * are logically below the join so they can always use all values
+	 * available from the input tlists.  It's okay to also handle
+	 * NestLoopParams now, because those couldn't refer to nullable
+	 * subexpressions.
+	 */
+	join->joinqual = fix_join_expr(root,
+								   join->joinqual,
+								   outer_itlist,
+								   inner_itlist,
+								   (Index) 0,
+								   rtoffset);
 
-    /* Now do join-type-specific stuff */
-    if (IsA(join, NestLoop))
-    {
-        NestLoop   *nl = (NestLoop *) join;
-        ListCell   *lc;
+	/* Now do join-type-specific stuff */
+	if (IsA(join, NestLoop))
+	{
+		NestLoop   *nl = (NestLoop *) join;
+		ListCell   *lc;
 
-        foreach(lc, nl->nestParams)
-        {
-            NestLoopParam *nlp = (NestLoopParam *) lfirst(lc);
+		foreach(lc, nl->nestParams)
+		{
+			NestLoopParam *nlp = (NestLoopParam *) lfirst(lc);
 
-            nlp->paramval = (Var *) fix_upper_expr(root,
-                                                   (Node *) nlp->paramval,
-                                                   outer_itlist,
-                                                   OUTER_VAR,
-                                                   rtoffset);
+			nlp->paramval = (Var *) fix_upper_expr(root,
+												   (Node *) nlp->paramval,
+												   outer_itlist,
+												   OUTER_VAR,
+												   rtoffset);
 
-            /* Check we replaced any PlaceHolderVar with simple Var */
-            if (!(IsA(nlp->paramval, Var) &&
-                  nlp->paramval->varno == OUTER_VAR))
-                elog(ERROR, "NestLoopParam was not reduced to a simple Var");
-        }
-    }
-    else if (IsA(join, MergeJoin))
-    {
-        MergeJoin  *mj = (MergeJoin *) join;
+			/* Check we replaced any PlaceHolderVar with simple Var */
+			if (!(IsA(nlp->paramval, Var) &&
+				  nlp->paramval->varno == OUTER_VAR))
+				elog(ERROR, "NestLoopParam was not reduced to a simple Var");
+		}
+	}
+	else if (IsA(join, MergeJoin))
+	{
+		MergeJoin  *mj = (MergeJoin *) join;
 
-        mj->mergeclauses = fix_join_expr(root,
-                                         mj->mergeclauses,
-                                         outer_itlist,
-                                         inner_itlist,
-                                         (Index) 0,
-                                         rtoffset);
-    }
-    else if (IsA(join, HashJoin))
-    {
-        HashJoin   *hj = (HashJoin *) join;
+		mj->mergeclauses = fix_join_expr(root,
+										 mj->mergeclauses,
+										 outer_itlist,
+										 inner_itlist,
+										 (Index) 0,
+										 rtoffset);
+	}
+	else if (IsA(join, HashJoin))
+	{
+		HashJoin   *hj = (HashJoin *) join;
 
-        hj->hashclauses = fix_join_expr(root,
-                                        hj->hashclauses,
-                                        outer_itlist,
-                                        inner_itlist,
-                                        (Index) 0,
-                                        rtoffset);
-    }
+		hj->hashclauses = fix_join_expr(root,
+										hj->hashclauses,
+										outer_itlist,
+										inner_itlist,
+										(Index) 0,
+										rtoffset);
+	}
 
-    /*
-     * Now we need to fix up the targetlist and qpqual, which are logically
-     * above the join.  This means they should not re-use any input expression
-     * that was computed in the nullable side of an outer join.  Vars and
-     * PlaceHolderVars are fine, so we can implement this restriction just by
-     * clearing has_non_vars in the indexed_tlist structs.
-     *
-     * XXX This is a grotty workaround for the fact that we don't clearly
-     * distinguish between a Var appearing below an outer join and the "same"
-     * Var appearing above it.  If we did, we'd not need to hack the matching
-     * rules this way.
-     */
-    switch (join->jointype)
-    {
-        case JOIN_LEFT:
-        case JOIN_SEMI:
-        case JOIN_ANTI:
-            inner_itlist->has_non_vars = false;
-            break;
-        case JOIN_RIGHT:
-            outer_itlist->has_non_vars = false;
-            break;
-        case JOIN_FULL:
-            outer_itlist->has_non_vars = false;
-            inner_itlist->has_non_vars = false;
-            break;
-        default:
-            break;
-    }
+	/*
+	 * Now we need to fix up the targetlist and qpqual, which are logically
+	 * above the join.  This means they should not re-use any input expression
+	 * that was computed in the nullable side of an outer join.  Vars and
+	 * PlaceHolderVars are fine, so we can implement this restriction just by
+	 * clearing has_non_vars in the indexed_tlist structs.
+	 *
+	 * XXX This is a grotty workaround for the fact that we don't clearly
+	 * distinguish between a Var appearing below an outer join and the "same"
+	 * Var appearing above it.  If we did, we'd not need to hack the matching
+	 * rules this way.
+	 */
+	switch (join->jointype)
+	{
+		case JOIN_LEFT:
+		case JOIN_SEMI:
+		case JOIN_ANTI:
+#ifdef __TBASE__
+        case JOIN_LEFT_SCALAR:
+        case JOIN_LEFT_SEMI:
+#endif
+			inner_itlist->has_non_vars = false;
+			break;
+		case JOIN_RIGHT:
+			outer_itlist->has_non_vars = false;
+			break;
+		case JOIN_FULL:
+			outer_itlist->has_non_vars = false;
+			inner_itlist->has_non_vars = false;
+			break;
+		default:
+			break;
+	}
 
-    join->plan.targetlist = fix_join_expr(root,
-                                          join->plan.targetlist,
-                                          outer_itlist,
-                                          inner_itlist,
-                                          (Index) 0,
-                                          rtoffset);
-    join->plan.qual = fix_join_expr(root,
-                                    join->plan.qual,
-                                    outer_itlist,
-                                    inner_itlist,
-                                    (Index) 0,
-                                    rtoffset);
+	join->plan.targetlist = fix_join_expr(root,
+										  join->plan.targetlist,
+										  outer_itlist,
+										  inner_itlist,
+										  (Index) 0,
+										  rtoffset);
+	join->plan.qual = fix_join_expr(root,
+									join->plan.qual,
+									outer_itlist,
+									inner_itlist,
+									(Index) 0,
+									rtoffset);
 
-    pfree(outer_itlist);
-    pfree(inner_itlist);
+	pfree(outer_itlist);
+	pfree(inner_itlist);
 }
 
 /*

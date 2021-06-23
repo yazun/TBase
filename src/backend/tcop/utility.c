@@ -148,6 +148,9 @@ static void RemoveSequeceBarely(DropStmt *stmt);
 extern void RegisterSeqDrop(char *name, int32 type);
 
 extern bool    g_GTM_skip_catalog;
+
+bool is_txn_has_parallel_ddl;
+bool enable_parallel_ddl;
 #endif
 
 #endif
@@ -1408,8 +1411,22 @@ ProcessUtilityPost(PlannedStmt *pstmt,
                         break;
                     }
                 }
+
+				/*
+				 * Also truncate on coordinators which makes parallel ddl possible.
+				 * temp table only exists on current coordinator
+				 * which parallel ddl has no effect.
+				 */
+				if (!is_temp)
+				{
+					exec_type = EXEC_ON_ALL_NODES;
+				}
+				else
+				{
                 exec_type = EXEC_ON_DATANODES;
             }
+
+			}
             break;
 
         case T_AlterDatabaseStmt:
@@ -1730,6 +1747,46 @@ ProcessUtilityPost(PlannedStmt *pstmt,
         ExecUtilityStmtOnNodes(parsetree, queryString, NULL, sentToRemote, auto_commit,
                 exec_type, is_temp, add_context);
 }
+
+#ifdef __TBASE__
+/*
+ * Enable parallel ddl for specific query.
+ */
+static void
+parallel_ddl_process(Node *node)
+{
+    if (!enable_parallel_ddl || !IS_PGXC_LOCAL_COORDINATOR)
+    {
+        return ;
+    }
+
+	switch (nodeTag(node))
+	{
+		case T_CreateStmt:
+		case T_CreateForeignTableStmt:
+		case T_CreateTableAsStmt:
+		case T_CreateSchemaStmt:
+		case T_AlterTableStmt:
+		case T_DefineStmt:
+		case T_DropStmt:
+		case T_RenameStmt:
+		case T_TruncateStmt:
+		case T_IndexStmt:
+    /* CONCURRENT INDEX is not supported */
+    if (IsA(node,IndexStmt) && castNode(IndexStmt,node)->concurrent)
+    {
+				return ;
+    }
+			break;
+		default:
+			return ;
+    }
+
+    /* Parallel ddl is enabled, set parallel ddl flag */
+    is_txn_has_parallel_ddl = true;
+}
+#endif
+
 /*
  * standard_ProcessUtility itself deals only with utility commands for
  * which we do not provide event trigger support.  Commands that do have
@@ -1755,6 +1812,10 @@ standard_ProcessUtility(PlannedStmt *pstmt,
     bool        isTopLevel = (context == PROCESS_UTILITY_TOPLEVEL);
     ParseState *pstate;
 
+#ifdef __TBASE__
+	 /* parallel enable check */
+	 parallel_ddl_process(parsetree);
+#endif
     /*
      * For more detail see comments in function pgxc_lock_for_backup.
      *
@@ -3066,6 +3127,14 @@ ProcessUtilitySlow(ParseState *pstate,
                     stmts = transformCreateStmt((CreateStmt *) parsetree,
                             queryString, !is_local && !sentToRemote);
 
+#ifdef __TBASE__
+					if (NULL == stmts)
+                    {
+                        commandCollected = true;
+                        break;
+                    }
+#endif
+
                     if (IS_PGXC_LOCAL_COORDINATOR)
                     {
                         /*
@@ -3801,67 +3870,70 @@ ProcessUtilitySlow(ParseState *pstate,
 
                     }
 #endif
-                    /*
-                     * Add the CREATE INDEX node itself to stash right away;
-                     * if there were any commands stashed in the ALTER TABLE
-                     * code, we need them to appear after this one.
-                     */
-                    EventTriggerCollectSimpleCommand(address, secondaryObject,
-                                                     parsetree);
-                    commandCollected = true;
-                    EventTriggerAlterTableEnd();
-                }
-                break;
+					/*
+					 * Add the CREATE INDEX node itself to stash right away;
+					 * if there were any commands stashed in the ALTER TABLE
+					 * code, we need them to appear after this one.
+					 */
+					EventTriggerCollectSimpleCommand(address, secondaryObject,
+													 parsetree);
+					commandCollected = true;
+					EventTriggerAlterTableEnd();
+				}
+				break;
 
-            case T_CreateExtensionStmt:
-#ifdef __TBASE__                
-                {
-                    CreateExtensionStmt *stmt = (CreateExtensionStmt *) parsetree;
-                    char *extension_query_string = NULL;
-                    if (IS_PGXC_LOCAL_COORDINATOR && CREATEEXT_CREATE == stmt->action)
-                    {
-                        StringInfo qstring;
-                        /* stage 1 */
-                        address = PrepareExtension(pstate, stmt);
+			case T_CreateExtensionStmt:
+#ifdef __TBASE__				
+				{
+					CreateExtensionStmt *stmt = (CreateExtensionStmt *) parsetree;
+					char *extension_query_string = NULL;
+					if (IS_PGXC_LOCAL_COORDINATOR && CREATEEXT_CREATE == stmt->action)
+					{
+						StringInfo qstring;
+						/* stage 1 */
+						address = PrepareExtension(pstate, stmt);
 
-                        qstring = makeStringInfo();
-                        initStringInfo(qstring);
-                    
-                        appendStringInfo(qstring, 
-                                        _("PREPARE %s"),
-                                        queryString);
-                        /* Send prepare extension msg to all other cn and dn */
-                        extension_query_string = qstring->data;
-                        ExecUtilityStmtOnNodes(parsetree, extension_query_string, NULL, sentToRemote, false, EXEC_ON_ALL_NODES, false, false);    
-                        
-                        /* stage 2 */
-                        ExecuteExtension(pstate, (CreateExtensionStmt *) parsetree);
-                        resetStringInfo(qstring);
-                        appendStringInfo(qstring, 
-                                        _("EXECUTE %s"),
-                                        queryString);
-                        /* Send execute extension msg to all other cn and dn */
-                        extension_query_string = qstring->data;
-                        ExecUtilityStmtOnNodes(parsetree, extension_query_string, NULL, sentToRemote, false, EXEC_ON_ALL_NODES, false, false);
+						if (ObjectAddressIsEqual(InvalidObjectAddress, address))
+							break;
 
-                        pfree(qstring->data);
-                        pfree(qstring);
-                    }
-                    else if (CREATEEXT_PREPARE == stmt->action)
-                    {
-                        address = PrepareExtension(pstate, stmt);
-                    }
-                    else if (CREATEEXT_EXECUTE == stmt->action)
-                    {
-                        ExecuteExtension(pstate, stmt);
-                    }
-                    else
-                    {
-                        address = CreateExtension(pstate, (CreateExtensionStmt *) parsetree);
-                    }
-                    
-                    break;
-                }
+						qstring = makeStringInfo();
+						initStringInfo(qstring);
+					
+						appendStringInfo(qstring, 
+										_("PREPARE %s"),
+										queryString);
+						/* Send prepare extension msg to all other cn and dn */
+						extension_query_string = qstring->data;
+						ExecUtilityStmtOnNodes(parsetree, extension_query_string, NULL, sentToRemote, false, EXEC_ON_ALL_NODES, false, false);	
+						
+						/* stage 2 */
+						ExecuteExtension(pstate, (CreateExtensionStmt *) parsetree);
+						resetStringInfo(qstring);
+						appendStringInfo(qstring, 
+										_("EXECUTE %s"),
+										queryString);
+						/* Send execute extension msg to all other cn and dn */
+						extension_query_string = qstring->data;
+						ExecUtilityStmtOnNodes(parsetree, extension_query_string, NULL, sentToRemote, false, EXEC_ON_ALL_NODES, false, false);
+
+						pfree(qstring->data);
+						pfree(qstring);
+					}
+					else if (CREATEEXT_PREPARE == stmt->action)
+					{
+						address = PrepareExtension(pstate, stmt);
+					}
+					else if (CREATEEXT_EXECUTE == stmt->action)
+					{
+						ExecuteExtension(pstate, stmt);
+					}
+					else
+					{
+						address = CreateExtension(pstate, (CreateExtensionStmt *) parsetree);
+					}
+					
+					break;
+				}
 #endif
             case T_AlterExtensionStmt:
                 address = ExecAlterExtensionStmt(pstate, (AlterExtensionStmt *) parsetree);
@@ -4337,18 +4409,43 @@ ExecDropStmt(DropStmt *stmt, bool isTopLevel)
 #ifdef PGXC
             {
                 bool        is_temp = false;
+#ifdef __TBASE__
+				int         drop_cnt = 0;
+                char        *new_query_string = pstrdup(queryString);
+#endif
                 RemoteQueryExecType exec_type = EXEC_ON_ALL_NODES;
 
                 /* Check restrictions on objects dropped */
                 DropStmtPreTreatment((DropStmt *) stmt, queryString, sentToRemote,
                         &is_temp, &exec_type);
 #endif
+
+#ifdef __TBASE__
+                drop_cnt = RemoveRelations(stmt, new_query_string);
+#else
                 RemoveRelations(stmt);
+#endif
+
 #ifdef PGXC
+#ifdef __TBASE__
+                /* if drop nothing, skip */
+                if (drop_cnt == 0)
+                {
+                    pfree(new_query_string);
+                    break;
+                }
+
+				/* DROP is done depending on the object type and its temporary type */
+				if (IS_PGXC_LOCAL_COORDINATOR)
+					ExecUtilityStmtOnNodes(NULL, new_query_string, NULL, sentToRemote, false,
+							exec_type, is_temp, false);
+                pfree(new_query_string);
+#else
                 /* DROP is done depending on the object type and its temporary type */
                 if (IS_PGXC_LOCAL_COORDINATOR)
                     ExecUtilityStmtOnNodes(NULL, queryString, NULL, sentToRemote, false,
                             exec_type, is_temp, false);
+#endif				
             }
 #endif
             break;
@@ -6529,7 +6626,11 @@ IsStmtAllowedInLockedMode(Node *parsetree, const char *queryString)
 #ifdef XCP
         case T_PauseClusterStmt:
 #endif
-            return ALLOW;
+#ifdef __TBASE__
+		/* Node Lock/Unlock do not modify any data */
+		case T_LockNodeStmt:
+#endif
+			return ALLOW;
 
         default:
             return DISALLOW;

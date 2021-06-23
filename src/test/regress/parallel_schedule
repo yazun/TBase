@@ -23,10 +23,10 @@ test: tablespace
 # ----------
 # The first group of parallel tests
 # ----------
-test: boolean char name varchar text int2 int4 int8 oid float4 float8 bit numeric txid uuid enum money rangetypes pg_lsn regproc
+test: boolean char name varchar text int2 int4 int8 oid float4 float8 bit numeric txid uuid enum money rangetypes pg_lsn regproc zhcn_utf8
 
 # Depends on things setup during char, varchar and text
-test: strings
+test: strings zhcn_gb18030
 # Depends on int2, int4, int8, float4, float8
 test: numerology
 
@@ -161,3 +161,6 @@ test: xc_notrans_block
 
 # This runs XL specific tests
 test: xl_primary_key xl_foreign_key xl_distribution_column_types xl_alter_table xl_distribution_column_types_modulo xl_plan_pushdown xl_functions xl_limitations xl_user_defined_functions xl_join xl_distributed_xact xl_create_table
+
+# This runs TBase specific tests
+test: tbase_explain

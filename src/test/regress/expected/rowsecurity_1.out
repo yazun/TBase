@@ -737,13 +737,13 @@ EXPLAIN (COSTS OFF) SELECT * FROM t1 WHERE f_leak(b) FOR SHARE;
 (9 rows)
 
 -- union all query
-SELECT a, b, oid FROM t2 UNION ALL SELECT a, b, oid FROM t3;
+SELECT a, b, oid FROM t2 UNION ALL SELECT a, b, oid FROM t3 order by oid;
  a |  b  | oid 
 ---+-----+-----
  1 | abc | 201
+ 3 | cde | 203
  1 | xxx | 301
  2 | yyy | 302
- 3 | cde | 203
  3 | zzz | 303
 (5 rows)
 
@@ -1572,49 +1572,163 @@ UPDATE t1 SET b = b WHERE f_leak(b);
 -- updates with from clause
 EXPLAIN (COSTS OFF) UPDATE t2 SET b=t2.b FROM t3
 WHERE t2.a = 3 and t3.a = 2 AND f_leak(t2.b) AND f_leak(t3.b);
-ERROR:  could not plan this distributed update
-DETAIL:  correlated UPDATE or updating distribution column currently not supported in Postgres-XL.
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Remote Subquery Scan on all (datanode_2)
+   ->  Update on t2
+         ->  Nested Loop
+               ->  Seq Scan on t2
+                     Filter: ((a = 3) AND ((a % 2) = 1) AND f_leak(b))
+               ->  Materialize
+                     ->  Remote Subquery Scan on all (datanode_1)
+                           ->  Seq Scan on t3
+                                 Filter: ((a = 2) AND f_leak(b))
+(9 rows)
+
 UPDATE t2 SET b=t2.b FROM t3
 WHERE t2.a = 3 and t3.a = 2 AND f_leak(t2.b) AND f_leak(t3.b);
-ERROR:  could not plan this distributed update
-DETAIL:  correlated UPDATE or updating distribution column currently not supported in Postgres-XL.
 EXPLAIN (COSTS OFF) UPDATE t1 SET b=t1.b FROM t2
 WHERE t1.a = 3 and t2.a = 3 AND f_leak(t1.b) AND f_leak(t2.b);
-ERROR:  could not plan this distributed update
-DETAIL:  correlated UPDATE or updating distribution column currently not supported in Postgres-XL.
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Remote Subquery Scan on all (datanode_2)
+   ->  Update on t1
+         Update on t1
+         Update on t2 t2_1
+         Update on t3
+         ->  Nested Loop
+               ->  Seq Scan on t1
+                     Filter: ((a = 3) AND ((a % 2) = 0) AND f_leak(b))
+               ->  Materialize
+                     ->  Remote Subquery Scan on all (datanode_2)
+                           ->  Seq Scan on t2
+                                 Filter: ((a = 3) AND ((a % 2) = 1) AND f_leak(b))
+         ->  Nested Loop
+               ->  Seq Scan on t2 t2_1
+                     Filter: ((a = 3) AND ((a % 2) = 0) AND f_leak(b))
+               ->  Materialize
+                     ->  Remote Subquery Scan on all (datanode_2)
+                           ->  Seq Scan on t2
+                                 Filter: ((a = 3) AND ((a % 2) = 1) AND f_leak(b))
+         ->  Nested Loop
+               ->  Seq Scan on t3
+                     Filter: ((a = 3) AND ((a % 2) = 0) AND f_leak(b))
+               ->  Materialize
+                     ->  Remote Subquery Scan on all (datanode_2)
+                           ->  Seq Scan on t2
+                                 Filter: ((a = 3) AND ((a % 2) = 1) AND f_leak(b))
+(26 rows)
+
 UPDATE t1 SET b=t1.b FROM t2
 WHERE t1.a = 3 and t2.a = 3 AND f_leak(t1.b) AND f_leak(t2.b);
-ERROR:  could not plan this distributed update
-DETAIL:  correlated UPDATE or updating distribution column currently not supported in Postgres-XL.
 EXPLAIN (COSTS OFF) UPDATE t2 SET b=t2.b FROM t1
 WHERE t1.a = 3 and t2.a = 3 AND f_leak(t1.b) AND f_leak(t2.b);
-ERROR:  could not plan this distributed update
-DETAIL:  correlated UPDATE or updating distribution column currently not supported in Postgres-XL.
+                                       QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ Remote Subquery Scan on all (datanode_2)
+   ->  Update on t2
+         ->  Nested Loop
+               ->  Seq Scan on t2
+                     Filter: ((a = 3) AND ((a % 2) = 1) AND f_leak(b))
+               ->  Materialize
+                     ->  Remote Subquery Scan on all (datanode_2)
+                           ->  Append
+                                 ->  Seq Scan on t1
+                                       Filter: ((a = 3) AND ((a % 2) = 0) AND f_leak(b))
+                                 ->  Seq Scan on t2 t2_1
+                                       Filter: ((a = 3) AND ((a % 2) = 0) AND f_leak(b))
+                                 ->  Seq Scan on t3
+                                       Filter: ((a = 3) AND ((a % 2) = 0) AND f_leak(b))
+(14 rows)
+
 UPDATE t2 SET b=t2.b FROM t1
 WHERE t1.a = 3 and t2.a = 3 AND f_leak(t1.b) AND f_leak(t2.b);
-ERROR:  could not plan this distributed update
-DETAIL:  correlated UPDATE or updating distribution column currently not supported in Postgres-XL.
 -- updates with from clause self join
 EXPLAIN (COSTS OFF) UPDATE t2 t2_1 SET b = t2_2.b FROM t2 t2_2
 WHERE t2_1.a = 3 AND t2_2.a = t2_1.a AND t2_2.b = t2_1.b
 AND f_leak(t2_1.b) AND f_leak(t2_2.b) RETURNING *, t2_1, t2_2;
-ERROR:  could not plan this distributed update
-DETAIL:  correlated UPDATE or updating distribution column currently not supported in Postgres-XL.
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Remote Subquery Scan on all (datanode_2)
+   ->  Update on t2 t2_1
+         ->  Nested Loop
+               Join Filter: (t2_1.b = t2_2.b)
+               ->  Seq Scan on t2 t2_1
+                     Filter: ((a = 3) AND ((a % 2) = 1) AND f_leak(b))
+               ->  Materialize
+                     ->  Remote Subquery Scan on all (datanode_2)
+                           ->  Seq Scan on t2 t2_2
+                                 Filter: ((a = 3) AND ((a % 2) = 1) AND f_leak(b))
+(10 rows)
+
 UPDATE t2 t2_1 SET b = t2_2.b FROM t2 t2_2
 WHERE t2_1.a = 3 AND t2_2.a = t2_1.a AND t2_2.b = t2_1.b
 AND f_leak(t2_1.b) AND f_leak(t2_2.b) RETURNING *, t2_1, t2_2;
-ERROR:  could not plan this distributed update
-DETAIL:  correlated UPDATE or updating distribution column currently not supported in Postgres-XL.
+ a |  b  |  c  | a |  b  |  c  |    t2_1     |    t2_2     
+---+-----+-----+---+-----+-----+-------------+-------------
+ 3 | cde | 3.3 | 3 | cde | 3.3 | (3,cde,3.3) | (3,cde,3.3)
+(1 row)
+
 EXPLAIN (COSTS OFF) UPDATE t1 t1_1 SET b = t1_2.b FROM t1 t1_2
 WHERE t1_1.a = 4 AND t1_2.a = t1_1.a AND t1_2.b = t1_1.b
 AND f_leak(t1_1.b) AND f_leak(t1_2.b) RETURNING *, t1_1, t1_2;
-ERROR:  could not plan this distributed update
-DETAIL:  correlated UPDATE or updating distribution column currently not supported in Postgres-XL.
+                                       QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ Remote Subquery Scan on all (datanode_2)
+   ->  Update on t1 t1_1
+         Update on t1 t1_1
+         Update on t2 t1_1_1
+         Update on t3 t1_1_2
+         ->  Hash Join
+               Hash Cond: (b = t1_1.b)
+               ->  Remote Subquery Scan on all (datanode_2)
+                     ->  Append
+                           ->  Seq Scan on t1 t1_2
+                                 Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
+                           ->  Seq Scan on t2 t1_2_1
+                                 Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
+                           ->  Seq Scan on t3 t1_2_2
+                                 Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
+               ->  Hash
+                     ->  Seq Scan on t1 t1_1
+                           Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
+         ->  Nested Loop
+               Join Filter: (t1_1_1.b = b)
+               ->  Seq Scan on t2 t1_1_1
+                     Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
+               ->  Materialize
+                     ->  Remote Subquery Scan on all (datanode_2)
+                           ->  Append
+                                 ->  Seq Scan on t1 t1_2
+                                       Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
+                                 ->  Seq Scan on t2 t1_2_1
+                                       Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
+                                 ->  Seq Scan on t3 t1_2_2
+                                       Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
+         ->  Nested Loop
+               Join Filter: (t1_1_2.b = b)
+               ->  Seq Scan on t3 t1_1_2
+                     Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
+               ->  Materialize
+                     ->  Remote Subquery Scan on all (datanode_2)
+                           ->  Append
+                                 ->  Seq Scan on t1 t1_2
+                                       Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
+                                 ->  Seq Scan on t2 t1_2_1
+                                       Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
+                                 ->  Seq Scan on t3 t1_2_2
+                                       Filter: ((a = 4) AND ((a % 2) = 0) AND f_leak(b))
+(44 rows)
+
 UPDATE t1 t1_1 SET b = t1_2.b FROM t1 t1_2
 WHERE t1_1.a = 4 AND t1_2.a = t1_1.a AND t1_2.b = t1_1.b
 AND f_leak(t1_1.b) AND f_leak(t1_2.b) RETURNING *, t1_1, t1_2;
-ERROR:  could not plan this distributed update
-DETAIL:  correlated UPDATE or updating distribution column currently not supported in Postgres-XL.
+ a |      b      | a |      b      |      t1_1       |      t1_2       
+---+-------------+---+-------------+-----------------+-----------------
+ 4 | daddad_updt | 4 | daddad_updt | (4,daddad_updt) | (4,daddad_updt)
+ 4 | defdef      | 4 | defdef      | (4,defdef)      | (4,defdef)
+(2 rows)
+
 RESET SESSION AUTHORIZATION;
 SET row_security TO OFF;
 SELECT * FROM t1 ORDER BY a,b;
@@ -1934,7 +2048,7 @@ EXPLAIN (COSTS OFF) EXECUTE plancache_test;
          Filter: (((a % 2) = 0) AND f_leak(b))
 (3 rows)
 
-PREPARE plancache_test2 AS WITH q AS (SELECT * FROM z1 WHERE f_leak(b)) SELECT * FROM q,z2;
+PREPARE plancache_test2 AS WITH q AS MATERIALIZED (SELECT * FROM z1 WHERE f_leak(b)) SELECT * FROM q,z2;
 EXPLAIN (COSTS OFF) EXECUTE plancache_test2;
                            QUERY PLAN                            
 -----------------------------------------------------------------
@@ -1949,19 +2063,19 @@ EXPLAIN (COSTS OFF) EXECUTE plancache_test2;
                ->  Seq Scan on z2
 (9 rows)
 
-PREPARE plancache_test3 AS WITH q AS (SELECT * FROM z2) SELECT * FROM q,z1 WHERE f_leak(z1.b);
+PREPARE plancache_test3 AS WITH q AS MATERIALIZED (SELECT * FROM z2) SELECT * FROM q,z1 WHERE f_leak(z1.b);
 EXPLAIN (COSTS OFF) EXECUTE plancache_test3;
-                           QUERY PLAN                            
------------------------------------------------------------------
+                         QUERY PLAN                          
+-------------------------------------------------------------
  Nested Loop
    CTE q
      ->  Remote Subquery Scan on all (datanode_1,datanode_2)
            ->  Seq Scan on z2
-   ->  CTE Scan on q
+   ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+         ->  Seq Scan on z1
+               Filter: (((a % 2) = 0) AND f_leak(b))
    ->  Materialize
-         ->  Remote Subquery Scan on all (datanode_1,datanode_2)
-               ->  Seq Scan on z1
-                     Filter: (((a % 2) = 0) AND f_leak(b))
+         ->  CTE Scan on q
 (9 rows)
 
 SET ROLE regress_rls_group1;
@@ -2003,17 +2117,17 @@ EXPLAIN (COSTS OFF) EXECUTE plancache_test2;
 (9 rows)
 
 EXPLAIN (COSTS OFF) EXECUTE plancache_test3;
-                           QUERY PLAN                            
------------------------------------------------------------------
+                         QUERY PLAN                          
+-------------------------------------------------------------
  Nested Loop
    CTE q
      ->  Remote Subquery Scan on all (datanode_1,datanode_2)
            ->  Seq Scan on z2
-   ->  CTE Scan on q
+   ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+         ->  Seq Scan on z1
+               Filter: (((a % 2) = 0) AND f_leak(b))
    ->  Materialize
-         ->  Remote Subquery Scan on all (datanode_1,datanode_2)
-               ->  Seq Scan on z1
-                     Filter: (((a % 2) = 0) AND f_leak(b))
+         ->  CTE Scan on q
 (9 rows)
 
 SET SESSION AUTHORIZATION regress_rls_carol;
@@ -2055,17 +2169,17 @@ EXPLAIN (COSTS OFF) EXECUTE plancache_test2;
 (9 rows)
 
 EXPLAIN (COSTS OFF) EXECUTE plancache_test3;
-                           QUERY PLAN                            
------------------------------------------------------------------
+                         QUERY PLAN                          
+-------------------------------------------------------------
  Nested Loop
    CTE q
      ->  Remote Subquery Scan on all (datanode_1,datanode_2)
            ->  Seq Scan on z2
-   ->  CTE Scan on q
+   ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+         ->  Seq Scan on z1
+               Filter: (((a % 2) = 1) AND f_leak(b))
    ->  Materialize
-         ->  Remote Subquery Scan on all (datanode_1,datanode_2)
-               ->  Seq Scan on z1
-                     Filter: (((a % 2) = 1) AND f_leak(b))
+         ->  CTE Scan on q
 (9 rows)
 
 SET ROLE regress_rls_group2;
@@ -2107,17 +2221,17 @@ EXPLAIN (COSTS OFF) EXECUTE plancache_test2;
 (9 rows)
 
 EXPLAIN (COSTS OFF) EXECUTE plancache_test3;
-                           QUERY PLAN                            
------------------------------------------------------------------
+                         QUERY PLAN                          
+-------------------------------------------------------------
  Nested Loop
    CTE q
      ->  Remote Subquery Scan on all (datanode_1,datanode_2)
            ->  Seq Scan on z2
-   ->  CTE Scan on q
+   ->  Remote Subquery Scan on all (datanode_1,datanode_2)
+         ->  Seq Scan on z1
+               Filter: (((a % 2) = 1) AND f_leak(b))
    ->  Materialize
-         ->  Remote Subquery Scan on all (datanode_1,datanode_2)
-               ->  Seq Scan on z1
-                     Filter: (((a % 2) = 1) AND f_leak(b))
+         ->  CTE Scan on q
 (9 rows)
 
 --
@@ -2129,7 +2243,7 @@ CREATE VIEW rls_view AS SELECT * FROM z1 WHERE f_leak(b) order by 1;
 GRANT SELECT ON rls_view TO regress_rls_bob;
 -- Query as role that is not owner of view or table.  Should return all records.
 SET SESSION AUTHORIZATION regress_rls_bob;
-SELECT * FROM rls_view;
+SELECT * FROM rls_view ORDER BY a,b;
  a |  b  
 ---+-----
  1 | aba
@@ -2150,7 +2264,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
 
 -- Query as view/table owner.  Should return all records.
 SET SESSION AUTHORIZATION regress_rls_alice;
-SELECT * FROM rls_view;
+SELECT * FROM rls_view ORDER BY a,b;
  a |  b  
 ---+-----
  1 | aba
@@ -2177,7 +2291,7 @@ GRANT SELECT ON rls_view TO regress_rls_alice;
 -- Query as role that is not owner of view but is owner of table.
 -- Should return records based on view owner policies.
 SET SESSION AUTHORIZATION regress_rls_alice;
-SELECT * FROM rls_view;
+SELECT * FROM rls_view ORDER BY a,b;
  a |  b  
 ---+-----
  2 | bbb
@@ -2197,7 +2311,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
 -- Query as role that is not owner of table but is owner of view.
 -- Should return records based on view owner policies.
 SET SESSION AUTHORIZATION regress_rls_bob;
-SELECT * FROM rls_view;
+SELECT * FROM rls_view ORDER BY a,b;
  a |  b  
 ---+-----
  2 | bbb
@@ -2223,7 +2337,7 @@ ERROR:  permission denied for relation rls_view
 -- Query as role that is not the owner of the table or view with permissions.
 SET SESSION AUTHORIZATION regress_rls_bob;
 GRANT SELECT ON rls_view TO regress_rls_carol;
-SELECT * FROM rls_view;
+SELECT * FROM rls_view ORDER BY a,b;
  a |  b  
 ---+-----
  2 | bbb
@@ -2533,7 +2647,7 @@ ALTER TABLE t1 ENABLE ROW LEVEL SECURITY;
 GRANT ALL ON t1 TO regress_rls_bob;
 INSERT INTO t1 (SELECT x, md5(x::text) FROM generate_series(0,20) x);
 SET SESSION AUTHORIZATION regress_rls_bob;
-WITH cte1 AS (SELECT * FROM t1 WHERE f_leak(b) order by 1) SELECT * FROM cte1;
+WITH cte1 AS MATERIALIZED (SELECT * FROM t1 WHERE f_leak(b) order by 1) SELECT * FROM cte1;
  a  |                b                 
 ----+----------------------------------
   0 | cfcd208495d565ef66e7dff9f98764da
@@ -2549,7 +2663,8 @@ WITH cte1 AS (SELECT * FROM t1 WHERE f_leak(b) order by 1) SELECT * FROM cte1;
  20 | 98f13708210194c475687be6106a3b84
 (11 rows)
 
-EXPLAIN (COSTS OFF) WITH cte1 AS (SELECT * FROM t1 WHERE f_leak(b)) SELECT * FROM cte1;
+EXPLAIN (COSTS OFF)
+WITH cte1 AS MATERIALIZED (SELECT * FROM t1 WHERE f_leak(b)) SELECT * FROM cte1;
                          QUERY PLAN                          
 -------------------------------------------------------------
  CTE Scan on cte1

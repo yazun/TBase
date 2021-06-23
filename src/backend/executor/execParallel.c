@@ -28,9 +28,11 @@
 #include "executor/nodeBitmapHeapscan.h"
 #include "executor/nodeCustom.h"
 #include "executor/nodeForeignscan.h"
-#include "executor/nodeSeqscan.h"
+#include "executor/nodeHash.h"
 #include "executor/nodeIndexscan.h"
 #include "executor/nodeIndexonlyscan.h"
+#include "executor/nodeSeqscan.h"
+#include "executor/nodeSort.h"
 #include "executor/tqueue.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/planmain.h"
@@ -80,6 +82,7 @@
 
 #define PARALLEL_KEY_EXEC_ERROR        UINT64CONST(0xE0000000000000B1)
 #define PARALLEL_KEY_EXEC_DONE         UINT64CONST(0xE0000000000000B2)
+#define PARALLEL_REMOTEINSTR_OFFSET    UINT64CONST(0xEC00000000000000)
 #endif
 
 #define PARALLEL_TUPLE_QUEUE_SIZE        65536
@@ -135,6 +138,15 @@ typedef struct ExecParallelInitializeDSMContext
     int            nnodes;
 } ExecParallelInitializeDSMContext;
 
+#ifdef __TBASE__
+/* Context object for ExecParallelInitializeRemoteInstr. */
+typedef struct ExecParallelRemoteInstrContext
+{
+	ParallelContext *pcxt;
+	int			ndatanode;
+} ExecParallelRemoteInstrContext;
+#endif
+
 /* Helper functions that run in the parallel leader. */
 static char *ExecSerializePlan(Plan *plan, EState *estate);
 static bool ExecParallelEstimate(PlanState *node,
@@ -143,9 +155,17 @@ static bool ExecParallelInitializeDSM(PlanState *node,
                           ExecParallelInitializeDSMContext *d);
 static shm_mq_handle **ExecParallelSetupTupleQueues(ParallelContext *pcxt,
                              bool reinitialize);
+static bool ExecParallelReInitializeDSM(PlanState *planstate,
+							ParallelContext *pcxt);
 static bool ExecParallelRetrieveInstrumentation(PlanState *planstate,
                                     SharedExecutorInstrumentation *instrumentation);
-
+#ifdef __TBASE__
+static bool ExecParallelEstimateRemoteInstr(PlanState *planstate,
+                                            ExecParallelRemoteInstrContext *ri);
+static bool ExecParallelInitRemoteInstrDSM(PlanState *planstate,
+                                           ExecParallelRemoteInstrContext *ri);
+static bool ExecInitializeWorkerRemoteInstr(PlanState *planstate, ParallelWorkerContext *pcxt);
+#endif
 /* Helper function that runs in the parallel worker. */
 static DestReceiver *ExecParallelGetReceiver(dsm_segment *seg, shm_toc *toc);
 
@@ -227,67 +247,100 @@ ExecSerializePlan(Plan *plan, EState *estate)
 }
 
 /*
- * Ordinary plan nodes won't do anything here, but parallel-aware plan nodes
- * may need some state which is shared across all parallel workers.  Before
- * we size the DSM, give them a chance to call shm_toc_estimate_chunk or
- * shm_toc_estimate_keys on &pcxt->estimator.
+ * Parallel-aware plan nodes (and occasionally others) may need some state
+ * which is shared across all parallel workers.  Before we size the DSM, give
+ * them a chance to call shm_toc_estimate_chunk or shm_toc_estimate_keys on
+ * &pcxt->estimator.
  *
  * While we're at it, count the number of PlanState nodes in the tree, so
  * we know how many SharedPlanStateInstrumentation structures we need.
  */
 static bool
 ExecParallelEstimate(PlanState *planstate, ExecParallelEstimateContext *e)
-{// #lizard forgives
+{
+#ifdef __TBASE__
+	int previous_nworkers;
+#endif
     if (planstate == NULL)
         return false;
 
     /* Count this node. */
     e->nnodes++;
 
-    /* Call estimators for parallel-aware nodes. */
-    if (planstate->plan->parallel_aware)
-    {
         switch (nodeTag(planstate))
         {
             case T_SeqScanState:
+			if (planstate->plan->parallel_aware)
                 ExecSeqScanEstimate((SeqScanState *) planstate,
                                     e->pcxt);
                 break;
             case T_IndexScanState:
+			if (planstate->plan->parallel_aware)
                 ExecIndexScanEstimate((IndexScanState *) planstate,
                                       e->pcxt);
                 break;
             case T_IndexOnlyScanState:
+			if (planstate->plan->parallel_aware)
                 ExecIndexOnlyScanEstimate((IndexOnlyScanState *) planstate,
                                           e->pcxt);
                 break;
             case T_ForeignScanState:
+			if (planstate->plan->parallel_aware)
                 ExecForeignScanEstimate((ForeignScanState *) planstate,
                                         e->pcxt);
                 break;
             case T_CustomScanState:
+			if (planstate->plan->parallel_aware)
                 ExecCustomScanEstimate((CustomScanState *) planstate,
                                        e->pcxt);
                 break;
             case T_BitmapHeapScanState:
+			if (planstate->plan->parallel_aware)
                 ExecBitmapHeapEstimate((BitmapHeapScanState *) planstate,
                                        e->pcxt);
                 break;
+		case T_HashState:
+			/* even when not parallel-aware, for EXPLAIN ANALYZE */
+			ExecHashEstimate((HashState *) planstate, e->pcxt);
+			break;
+		case T_SortState:
+			/* even when not parallel-aware, for EXPLAIN ANALYZE */
+			ExecSortEstimate((SortState *) planstate, e->pcxt);
 #ifdef __TBASE__
-
+			if (planstate->plan->parallel_aware)
+				ReDistributeEstimate(planstate, e->pcxt);
+			break;
             /* For remote query and remote subplan, there is no need for shared storage. */
             case T_RemoteQueryState:                
+			break;
             case T_RemoteSubplanState:
+			/*
+             * If we are running with instrument option, must init full plantree here,
+             * to ensure e->nnodes correct. Further, we estimate per node instrument
+             * for remote instrumentation.
+             */
+			if (planstate->instrument && NULL == planstate->lefttree)
+			{
+				ExecParallelRemoteInstrContext ri;
+				RemoteSubplanState *node = (RemoteSubplanState *) planstate;
+				
+				ri.ndatanode = list_length(((RemoteSubplan *)planstate->plan)->nodeList);
+				ri.pcxt = e->pcxt;
+				
+				planstate->lefttree = ExecInitNode(planstate->plan->lefttree,
+				                                   planstate->state,
+				                                   EXEC_FLAG_EXPLAIN_ONLY);
+				planstate_tree_walker(planstate, ExecParallelEstimateRemoteInstr, &ri);
+				node->combiner.remote_parallel_estimated = true;
+			}
                 break;
-                
             case T_HashJoinState:
+			if (planstate->plan->parallel_aware)
                 ExecParallelHashJoinEstimate((HashJoinState*) planstate,
                                              e->pcxt);
                 break;
-            case T_SortState:
-                ReDistributeEstimate(planstate, e->pcxt);
-                break;
             case T_AggState:
+			if (planstate->plan->parallel_aware)
                 {
                     AggState *aggstate = (AggState *)planstate;
 
@@ -295,13 +348,24 @@ ExecParallelEstimate(PlanState *planstate, ExecParallelEstimateContext *e)
                         ReDistributeEstimate(planstate, e->pcxt);
                 }
                 break;
+		case T_GatherState:
+			previous_nworkers = e->pcxt->nworkers;
+			e->pcxt->nworkers = ((Gather *) planstate->plan)->num_workers;
 #endif
             default:
                 break;
         }
-    }
 
+#ifdef __TBASE__
+	planstate_tree_walker(planstate, ExecParallelEstimate, e);
+	
+	if (IsA(planstate, GatherState))
+		e->pcxt->nworkers = previous_nworkers;
+	
+	return false;
+#else
     return planstate_tree_walker(planstate, ExecParallelEstimate, e);
+#endif
 }
 
 /*
@@ -311,7 +375,10 @@ ExecParallelEstimate(PlanState *planstate, ExecParallelEstimateContext *e)
 static bool
 ExecParallelInitializeDSM(PlanState *planstate,
                           ExecParallelInitializeDSMContext *d)
-{// #lizard forgives
+{
+#ifdef __TBASE__
+	int previous_nworkers;
+#endif
     if (planstate == NULL)
         return false;
 
@@ -324,60 +391,86 @@ ExecParallelInitializeDSM(PlanState *planstate,
     d->nnodes++;
 
     /*
-     * Call initializers for parallel-aware plan nodes.
+	 * Call initializers for DSM-using plan nodes.
      *
-     * Ordinary plan nodes won't do anything here, but parallel-aware plan
-     * nodes may need to initialize shared state in the DSM before parallel
-     * workers are available.  They can allocate the space they previously
+	 * Most plan nodes won't do anything here, but plan nodes that allocated
+	 * DSM may need to initialize shared state in the DSM before parallel
+	 * workers are launched.  They can allocate the space they previously
      * estimated using shm_toc_allocate, and add the keys they previously
      * estimated using shm_toc_insert, in each case targeting pcxt->toc.
      */
-    if (planstate->plan->parallel_aware)
-    {
         switch (nodeTag(planstate))
         {
             case T_SeqScanState:
+			if (planstate->plan->parallel_aware)
                 ExecSeqScanInitializeDSM((SeqScanState *) planstate,
                                          d->pcxt);
                 break;
             case T_IndexScanState:
+			if (planstate->plan->parallel_aware)
                 ExecIndexScanInitializeDSM((IndexScanState *) planstate,
                                            d->pcxt);
                 break;
             case T_IndexOnlyScanState:
+			if (planstate->plan->parallel_aware)
                 ExecIndexOnlyScanInitializeDSM((IndexOnlyScanState *) planstate,
                                                d->pcxt);
                 break;
             case T_ForeignScanState:
+			if (planstate->plan->parallel_aware)
                 ExecForeignScanInitializeDSM((ForeignScanState *) planstate,
                                              d->pcxt);
                 break;
             case T_CustomScanState:
+			if (planstate->plan->parallel_aware)
                 ExecCustomScanInitializeDSM((CustomScanState *) planstate,
                                             d->pcxt);
                 break;
             case T_BitmapHeapScanState:
+			if (planstate->plan->parallel_aware)
                 ExecBitmapHeapInitializeDSM((BitmapHeapScanState *) planstate,
                                             d->pcxt);
                 break;
-            
+		case T_HashState:
+			/* even when not parallel-aware, for EXPLAIN ANALYZE */
+			ExecHashInitializeDSM((HashState *) planstate, d->pcxt);
+			break;
+		case T_SortState:
+			/* even when not parallel-aware, for EXPLAIN ANALYZE */
+			ExecSortInitializeDSM((SortState *) planstate, d->pcxt);
 #ifdef __TBASE__
+			if (planstate->plan->parallel_aware)
+				ReDistributeInitializeDSM(planstate, d->pcxt);
+			break;
             case T_RemoteQueryState:
+			if (planstate->plan->parallel_aware)
                 ExecRemoteQueryInitializeDSM((RemoteQueryState *)planstate,
                                                   d->pcxt);
                 break;
             case T_RemoteSubplanState:
+			{
+				RemoteSubplanState *node = (RemoteSubplanState *) planstate;
+				if (node->combiner.remote_parallel_estimated)
+				{
+					ExecParallelRemoteInstrContext ri;
+					
+					ri.ndatanode = list_length(((RemoteSubplan *)planstate->plan)->nodeList);
+					ri.pcxt = d->pcxt;
+					
+					planstate_tree_walker(planstate, ExecParallelInitRemoteInstrDSM, &ri);
+				}
+			if (planstate->plan->parallel_aware)
                 ExecRemoteSubPlanInitializeDSM((RemoteSubplanState *)planstate,
                                                   d->pcxt);
+			}
                 break;                
             case T_HashJoinState:
+			if (planstate->plan->parallel_aware)
                 ExecParallelHashJoinInitializeDSM((HashJoinState *) planstate,
                                                   d->pcxt);
                 break;
-            case T_SortState:
-                ReDistributeInitializeDSM(planstate, d->pcxt);
-                break;
             case T_AggState:
+			if (planstate->plan->parallel_aware)
                 {
                     AggState *aggstate = (AggState *)planstate;
                     
@@ -385,14 +478,24 @@ ExecParallelInitializeDSM(PlanState *planstate,
                         ReDistributeInitializeDSM(planstate, d->pcxt);
                 }
                 break;
+		case T_GatherState:
+			previous_nworkers = d->pcxt->nworkers;
+			d->pcxt->nworkers = ((Gather *) planstate->plan)->num_workers;
 #endif
-
             default:
                 break;
         }
-    }
 
+#ifdef __TBASE__
+	planstate_tree_walker(planstate, ExecParallelInitializeDSM, d);
+	
+	if (IsA(planstate, GatherState))
+		d->pcxt->nworkers = previous_nworkers;
+	
+	return false;
+#else
     return planstate_tree_walker(planstate, ExecParallelInitializeDSM, d);
+#endif
 }
 
 /*
@@ -445,18 +548,6 @@ ExecParallelSetupTupleQueues(ParallelContext *pcxt, bool reinitialize)
 
     /* Return array of handles. */
     return responseq;
-}
-
-/*
- * Re-initialize the parallel executor info such that it can be reused by
- * workers.
- */
-void
-ExecParallelReinitialize(ParallelExecutorInfo *pei)
-{
-    ReinitializeParallelDSM(pei->pcxt);
-    pei->tqueue = ExecParallelSetupTupleQueues(pei->pcxt, true);
-    pei->finished = false;
 }
 
 /*
@@ -847,7 +938,7 @@ ExecInitParallelPlan(PlanState *planstate, EState *estate, int nworkers)
     ExecParallelInitializeDSM(planstate, &d);
 
     /*
-     * Make sure that the world hasn't shifted under our feat.  This could
+	 * Make sure that the world hasn't shifted under our feet.  This could
      * probably just be an Assert(), but let's be conservative for now.
      */
     if (e.nnodes != d.nnodes)
@@ -855,6 +946,86 @@ ExecInitParallelPlan(PlanState *planstate, EState *estate, int nworkers)
 
     /* OK, we're ready to rock and roll. */
     return pei;
+}
+
+/*
+ * Re-initialize the parallel executor shared memory state before launching
+ * a fresh batch of workers.
+ */
+void
+ExecParallelReinitialize(PlanState *planstate,
+						 ParallelExecutorInfo *pei)
+{
+	/* Old workers must already be shut down */
+	Assert(pei->finished);
+
+	ReinitializeParallelDSM(pei->pcxt);
+	pei->tqueue = ExecParallelSetupTupleQueues(pei->pcxt, true);
+	pei->finished = false;
+
+	/* Traverse plan tree and let each child node reset associated state. */
+	ExecParallelReInitializeDSM(planstate, pei->pcxt);
+}
+
+/*
+ * Traverse plan tree to reinitialize per-node dynamic shared memory state
+ */
+static bool
+ExecParallelReInitializeDSM(PlanState *planstate,
+							ParallelContext *pcxt)
+{
+	if (planstate == NULL)
+		return false;
+
+	/*
+	 * Call reinitializers for DSM-using plan nodes.
+	 */
+	switch (nodeTag(planstate))
+	{
+		case T_SeqScanState:
+			if (planstate->plan->parallel_aware)
+				ExecSeqScanReInitializeDSM((SeqScanState *) planstate,
+										   pcxt);
+			break;
+		case T_IndexScanState:
+			if (planstate->plan->parallel_aware)
+				ExecIndexScanReInitializeDSM((IndexScanState *) planstate,
+											 pcxt);
+			break;
+		case T_IndexOnlyScanState:
+			if (planstate->plan->parallel_aware)
+				ExecIndexOnlyScanReInitializeDSM((IndexOnlyScanState *) planstate,
+												 pcxt);
+			break;
+		case T_ForeignScanState:
+			if (planstate->plan->parallel_aware)
+				ExecForeignScanReInitializeDSM((ForeignScanState *) planstate,
+											   pcxt);
+			break;
+		case T_CustomScanState:
+			if (planstate->plan->parallel_aware)
+				ExecCustomScanReInitializeDSM((CustomScanState *) planstate,
+											  pcxt);
+			break;
+		case T_BitmapHeapScanState:
+			if (planstate->plan->parallel_aware)
+				ExecBitmapHeapReInitializeDSM((BitmapHeapScanState *) planstate,
+											  pcxt);
+			break;
+		case T_HashState:
+			/* even when not parallel-aware, for EXPLAIN ANALYZE */
+			ExecHashReInitializeDSM((HashState *) planstate, pcxt);
+			break;
+		case T_SortState:
+			/* even when not parallel-aware, for EXPLAIN ANALYZE */
+			ExecSortReInitializeDSM((SortState *) planstate, pcxt);
+			break;
+
+		default:
+			break;
+	}
+
+	return planstate_tree_walker(planstate, ExecParallelReInitializeDSM, pcxt);
 }
 
 /*
@@ -896,10 +1067,45 @@ ExecParallelRetrieveInstrumentation(PlanState *planstate,
     ibytes = mul_size(instrumentation->num_workers, sizeof(Instrumentation));
     planstate->worker_instrument =
         palloc(ibytes + offsetof(WorkerInstrumentation, instrument));
+#ifndef __TBASE__
     MemoryContextSwitchTo(oldcontext);
+#endif
 
     planstate->worker_instrument->num_workers = instrumentation->num_workers;
     memcpy(&planstate->worker_instrument->instrument, instrument, ibytes);
+
+	/* Perform any node-type-specific work that needs to be done. */
+	switch (nodeTag(planstate))
+	{
+		case T_SortState:
+		ExecSortRetrieveInstrumentation((SortState *) planstate);
+			break;
+		case T_HashState:
+			ExecHashRetrieveInstrumentation((HashState *) planstate);
+			break;
+		default:
+			break;
+	}
+#ifdef __TBASE__
+	/* also retrieve instrumentation from remote */
+	if (planstate->dn_instrument != NULL)
+	{
+		DatanodeInstrumentation *tmp_instrument = planstate->dn_instrument;
+		int     nnode = planstate->dn_instrument->nnode;
+		Size    size = offsetof(DatanodeInstrumentation, instrument) +
+		               mul_size(nnode, sizeof(RemoteInstrumentation));
+		
+		elog(DEBUG1, "retrieve downstream instrumentation, plan_node_id %d nnode %d", plan_node_id, nnode);
+		
+		planstate->dn_instrument = palloc0(size);
+		memcpy(planstate->dn_instrument, tmp_instrument, size);
+	}
+	/*
+	 * TBase switch memory context later to keep retrieved instrumentation live until 
+	 * sending them back to upstream.
+	 */
+	MemoryContextSwitchTo(oldcontext);
+#endif
 
     return planstate_tree_walker(planstate, ExecParallelRetrieveInstrumentation,
                                  instrumentation);
@@ -1058,67 +1264,189 @@ ExecParallelReportInstrumentation(PlanState *planstate,
  * is allocated and initialized by executor; that is, after ExecutorStart().
  */
 static bool
-ExecParallelInitializeWorker(PlanState *planstate, shm_toc *toc)
-{// #lizard forgives
+ExecParallelInitializeWorker(PlanState *planstate, ParallelWorkerContext *pwcxt)
+{
     if (planstate == NULL)
         return false;
 
-    /* Call initializers for parallel-aware plan nodes. */
-    if (planstate->plan->parallel_aware)
-    {
         switch (nodeTag(planstate))
         {
             case T_SeqScanState:
-                ExecSeqScanInitializeWorker((SeqScanState *) planstate, toc);
+			if (planstate->plan->parallel_aware)
+				ExecSeqScanInitializeWorker((SeqScanState *) planstate, pwcxt);
                 break;
             case T_IndexScanState:
-                ExecIndexScanInitializeWorker((IndexScanState *) planstate, toc);
+			if (planstate->plan->parallel_aware)
+				ExecIndexScanInitializeWorker((IndexScanState *) planstate,
+											  pwcxt);
                 break;
             case T_IndexOnlyScanState:
-                ExecIndexOnlyScanInitializeWorker((IndexOnlyScanState *) planstate, toc);
+			if (planstate->plan->parallel_aware)
+				ExecIndexOnlyScanInitializeWorker((IndexOnlyScanState *) planstate,
+												  pwcxt);
                 break;
             case T_ForeignScanState:
+			if (planstate->plan->parallel_aware)
                 ExecForeignScanInitializeWorker((ForeignScanState *) planstate,
-                                                toc);
+												pwcxt);
                 break;
             case T_CustomScanState:
+			if (planstate->plan->parallel_aware)
                 ExecCustomScanInitializeWorker((CustomScanState *) planstate,
-                                               toc);
+				                               pwcxt);
                 break;
             case T_BitmapHeapScanState:
-                ExecBitmapHeapInitializeWorker((BitmapHeapScanState *) planstate, toc);
+			if (planstate->plan->parallel_aware)
+				ExecBitmapHeapInitializeWorker((BitmapHeapScanState *) planstate, pwcxt);
                 break;
+		case T_HashState:
+			/* even when not parallel-aware, for EXPLAIN ANALYZE */
+			ExecHashInitializeWorker((HashState *) planstate, pwcxt);
+			break;
+		case T_SortState:
+			/* even when not parallel-aware, for EXPLAIN ANALYZE */
+			ExecSortInitializeWorker((SortState *) planstate, pwcxt);
 #ifdef __TBASE__
+			if (planstate->plan->parallel_aware)
+				ReDistributeInitializeWorker(planstate, pwcxt);
+			break;
             case T_RemoteQueryState:
-                ExecRemoteQueryInitializeDSMWorker((RemoteQueryState *)planstate, toc);
+			if (planstate->plan->parallel_aware)
+				ExecRemoteQueryInitializeDSMWorker((RemoteQueryState *)planstate, pwcxt);
                 break;
-                
-            case T_RemoteSubplanState:                
-                ExecRemoteSubPlanInitDSMWorker((RemoteSubplanState *)planstate, toc);
-                break;
-                
-            case T_HashJoinState:
-                ExecParallelHashJoinInitWorker((HashJoinState *) planstate, toc);
-                break;
-            case T_SortState:
-                ReDistributeInitializeWorker(planstate, toc);
+            case T_RemoteSubplanState: 
+			if (planstate->instrument && NULL == planstate->lefttree)
+			{
+				/* if instrument needed, init full plantree in worker */
+				planstate->lefttree = ExecInitNode(planstate->plan->lefttree,
+				                                   planstate->state,
+				                                   EXEC_FLAG_EXPLAIN_ONLY);
+				/* attach share memory for it's child */
+				planstate_tree_walker(planstate, ExecInitializeWorkerRemoteInstr, pwcxt);
+			}
+            if (planstate->plan->parallel_aware)        
+				ExecRemoteSubPlanInitDSMWorker((RemoteSubplanState *)planstate, pwcxt);
+			break;
+		case T_HashJoinState:
+			if (planstate->plan->parallel_aware)
+				ExecParallelHashJoinInitWorker((HashJoinState *) planstate, pwcxt);
                 break;
             case T_AggState:
+			    if (planstate->plan->parallel_aware)
                 {
                     AggState *aggstate = (AggState *)planstate;
 
                     if (aggstate->aggstrategy == AGG_HASHED)
-                        ReDistributeInitializeWorker(planstate, toc);
+					ReDistributeInitializeWorker(planstate, pwcxt);
                 }
                 break;
 #endif
             default:
                 break;
         }
-    }
 
-    return planstate_tree_walker(planstate, ExecParallelInitializeWorker, toc);
+	return planstate_tree_walker(planstate, ExecParallelInitializeWorker,
+								 pwcxt);
 }
+
+#ifdef __TBASE__
+/*
+ * Estimate share memory space for plan nodes executed by remote, they contain instruments
+ * from all datanodes involved, and only leader worker receive these instruments.
+ */
+static bool
+ExecParallelEstimateRemoteInstr(PlanState *node, ExecParallelRemoteInstrContext *ri)
+{
+	ParallelContext *pcxt = ri->pcxt;
+	Size size = mul_size(ri->ndatanode, sizeof(RemoteInstrumentation));
+	size = add_size(size, offsetof(DatanodeInstrumentation, instrument));
+	
+	if (node == NULL)
+		return false;
+	
+	/*
+	 * only remote plan node could be here, we need disable parallel for these nodes
+	 * to prevent them from initializing other share memory for execution, they don't
+	 * need that, only init share memory for instrument collecting.
+	 */
+	node->plan->parallel_aware = false;
+	
+	shm_toc_estimate_chunk(&pcxt->estimator, size);
+	shm_toc_estimate_keys(&pcxt->estimator, 1);
+	
+	/* for sub-plan */
+	if (IsA(node, RemoteSubplanState) && node->lefttree == NULL)
+	{
+		node->lefttree = ExecInitNode(node->plan->lefttree,
+		                              node->state,
+		                              EXEC_FLAG_EXPLAIN_ONLY);
+	}
+	
+	elog(DEBUG1, "parallel estimate shm remote instrument for plan node %d", node->plan->plan_node_id);
+	
+	return planstate_tree_walker(node, ExecParallelEstimateRemoteInstr,
+	                             ri);
+}
+
+/*
+ * Allocate share memory space for plan nodes executed by remote, they contain instruments
+ * from all datanodes involved, and only leader worker receive these instruments. use
+ * plan_node_id + offset as a unique key.
+ */
+static bool
+ExecParallelInitRemoteInstrDSM(PlanState *node, ExecParallelRemoteInstrContext *ri)
+{
+	ParallelContext *pcxt = ri->pcxt;
+	Size size = mul_size(ri->ndatanode, sizeof(RemoteInstrumentation));
+	size = add_size(size, offsetof(DatanodeInstrumentation, instrument));
+	
+	if (node == NULL)
+		return false;
+	
+	node->dn_instrument = shm_toc_allocate(pcxt->toc, size);
+	memset(node->dn_instrument, 0, size);
+	node->dn_instrument->nnode = ri->ndatanode;
+	shm_toc_insert(pcxt->toc, node->plan->plan_node_id + PARALLEL_REMOTEINSTR_OFFSET,
+	               node->dn_instrument);
+	
+	elog(DEBUG1, "parallel allocate shm remote instrument for plan node %d", node->plan->plan_node_id);
+	
+	return planstate_tree_walker(node, ExecParallelInitRemoteInstrDSM,
+	                             ri);
+}
+
+/*
+ * Fetch the share memory for plan nodes executed by remote, they will be fulfilled
+ * with instruments during RemoteSubplan node's execution. use plan_node_id + offset
+ * as the unique key.
+ */
+static bool
+ExecInitializeWorkerRemoteInstr(PlanState *planstate, ParallelWorkerContext *pwcxt)
+{
+	/*
+	 * only remote plan node could be here, we need disable parallel for these nodes
+	 * to prevent them from initializing other share memory for execution, they don't
+	 * need that, only init share memory for instrument collecting.
+	 */
+	planstate->plan->parallel_aware = false;
+	planstate->dn_instrument = shm_toc_lookup(pwcxt->toc,
+	                                          planstate->plan->plan_node_id + PARALLEL_REMOTEINSTR_OFFSET,
+	                                          false);
+	
+	/* for sub-plan */
+	if (IsA(planstate, RemoteSubplanState) && planstate->lefttree == NULL)
+	{
+		planstate->lefttree = ExecInitNode(planstate->plan->lefttree,
+		                                   planstate->state,
+		                                   EXEC_FLAG_EXPLAIN_ONLY);
+	}
+	
+	elog(DEBUG1, "parallel init worker remote instrument for plan node %d", planstate->plan->plan_node_id);
+	
+	return planstate_tree_walker(planstate, ExecInitializeWorkerRemoteInstr,
+	                             pwcxt);
+}
+#endif
 
 /*
  * Main entrypoint for parallel query worker processes.
@@ -1146,6 +1474,7 @@ ParallelQueryMain(dsm_segment *seg, shm_toc *toc)
     int            instrument_options = 0;
     void       *area_space;
     dsa_area   *area;
+	ParallelWorkerContext pwcxt;
 #ifdef __TBASE__
     int i                               = 0;
     int nWorkers                        = 0;
@@ -1277,13 +1606,14 @@ ParallelQueryMain(dsm_segment *seg, shm_toc *toc)
         }
     }
 #endif
-
+	pwcxt.toc = toc;
+	pwcxt.seg = seg;
     /* Start up the executor */
     ExecutorStart(queryDesc, 0);
 
     /* Special executor initialization steps for parallel workers */
     queryDesc->planstate->state->es_query_dsa = area;
-    ExecParallelInitializeWorker(queryDesc->planstate, toc);
+	ExecParallelInitializeWorker(queryDesc->planstate, &pwcxt);
 
     /* Run the plan */
     ExecutorRun(queryDesc, ForwardScanDirection, 0L, true);

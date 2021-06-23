@@ -299,7 +299,7 @@ SELECT * FROM t1 WHERE f_leak(b) ORDER BY a FOR SHARE;
 EXPLAIN (COSTS OFF) SELECT * FROM t1 WHERE f_leak(b) FOR SHARE;
 
 -- union all query
-SELECT a, b, oid FROM t2 UNION ALL SELECT a, b, oid FROM t3;
+SELECT a, b, oid FROM t2 UNION ALL SELECT a, b, oid FROM t3 order by oid;
 EXPLAIN (COSTS OFF) SELECT a, b, oid FROM t2 UNION ALL SELECT a, b, oid FROM t3;
 
 -- superuser is allowed to bypass RLS checks
@@ -847,10 +847,10 @@ EXPLAIN (COSTS OFF) SELECT * FROM z1 WHERE f_leak(b);
 PREPARE plancache_test AS SELECT * FROM z1 WHERE f_leak(b);
 EXPLAIN (COSTS OFF) EXECUTE plancache_test;
 
-PREPARE plancache_test2 AS WITH q AS (SELECT * FROM z1 WHERE f_leak(b)) SELECT * FROM q,z2;
+PREPARE plancache_test2 AS WITH q AS MATERIALIZED (SELECT * FROM z1 WHERE f_leak(b)) SELECT * FROM q,z2;
 EXPLAIN (COSTS OFF) EXECUTE plancache_test2;
 
-PREPARE plancache_test3 AS WITH q AS (SELECT * FROM z2) SELECT * FROM q,z1 WHERE f_leak(z1.b);
+PREPARE plancache_test3 AS WITH q AS MATERIALIZED (SELECT * FROM z2) SELECT * FROM q,z1 WHERE f_leak(z1.b);
 EXPLAIN (COSTS OFF) EXECUTE plancache_test3;
 
 SET ROLE regress_rls_group1;
@@ -887,12 +887,12 @@ GRANT SELECT ON rls_view TO regress_rls_bob;
 
 -- Query as role that is not owner of view or table.  Should return all records.
 SET SESSION AUTHORIZATION regress_rls_bob;
-SELECT * FROM rls_view;
+SELECT * FROM rls_view ORDER BY a,b;
 EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
 
 -- Query as view/table owner.  Should return all records.
 SET SESSION AUTHORIZATION regress_rls_alice;
-SELECT * FROM rls_view;
+SELECT * FROM rls_view ORDER BY a,b;
 EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
 DROP VIEW rls_view;
 
@@ -904,13 +904,13 @@ GRANT SELECT ON rls_view TO regress_rls_alice;
 -- Query as role that is not owner of view but is owner of table.
 -- Should return records based on view owner policies.
 SET SESSION AUTHORIZATION regress_rls_alice;
-SELECT * FROM rls_view;
+SELECT * FROM rls_view ORDER BY a,b;
 EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
 
 -- Query as role that is not owner of table but is owner of view.
 -- Should return records based on view owner policies.
 SET SESSION AUTHORIZATION regress_rls_bob;
-SELECT * FROM rls_view;
+SELECT * FROM rls_view ORDER BY a,b;
 EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
 
 -- Query as role that is not the owner of the table or view without permissions.
@@ -921,7 +921,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM rls_view; --fail - permission denied.
 -- Query as role that is not the owner of the table or view with permissions.
 SET SESSION AUTHORIZATION regress_rls_bob;
 GRANT SELECT ON rls_view TO regress_rls_carol;
-SELECT * FROM rls_view;
+SELECT * FROM rls_view ORDER BY a,b;
 EXPLAIN (COSTS OFF) SELECT * FROM rls_view;
 
 SET SESSION AUTHORIZATION regress_rls_bob;
@@ -1078,8 +1078,9 @@ INSERT INTO t1 (SELECT x, md5(x::text) FROM generate_series(0,20) x);
 
 SET SESSION AUTHORIZATION regress_rls_bob;
 
-WITH cte1 AS (SELECT * FROM t1 WHERE f_leak(b) order by 1) SELECT * FROM cte1;
-EXPLAIN (COSTS OFF) WITH cte1 AS (SELECT * FROM t1 WHERE f_leak(b)) SELECT * FROM cte1;
+WITH cte1 AS MATERIALIZED (SELECT * FROM t1 WHERE f_leak(b) order by 1) SELECT * FROM cte1;
+EXPLAIN (COSTS OFF)
+WITH cte1 AS MATERIALIZED (SELECT * FROM t1 WHERE f_leak(b)) SELECT * FROM cte1;
 
 WITH cte1 AS (UPDATE t1 SET a = a + 1 RETURNING *) SELECT * FROM cte1; --fail
 WITH cte1 AS (UPDATE t1 SET a = a RETURNING *) SELECT * FROM cte1; --ok

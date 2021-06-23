@@ -49,6 +49,7 @@
 #include "utils/lsyscache.h"
 #include "utils/resowner.h"
 #include "lib/stringinfo.h"
+#include "libpq/libpq-be.h"
 #include "libpq/pqformat.h"
 #include "common/username.h"
 #include "pgxc/locator.h"
@@ -65,6 +66,7 @@
 #include "utils/varlena.h"
 #include "port.h"
 #include <math.h>
+#include <sys/timeb.h>
 
 /* the mini use conut of a connection */
 #define  MINI_USE_COUNT    10
@@ -80,8 +82,6 @@ int            PoolConnKeepAlive      = 600;
 int            PoolMaintenanceTimeout = 30;
 int            PoolSizeCheckGap       = 120;  /* max check memory size gap, in seconds */
 int            PoolConnMaxLifetime    = 600;  /* max lifetime of a pooled connection, in seconds */
-int            PoolWarmConnMaxLifetime = 7200;  /* max lifetime of a warm-needed pooled connection, in seconds */
-int            PoolConnDeadtime       = 1800; /* a pooled connection must be closed when lifetime exceed this, in seconds */
 int            PoolMaxMemoryLimit     = 10;
 int            PoolConnectTimeOut     = 10;
 int            PoolScaleFactor        = 2;
@@ -98,6 +98,7 @@ char        *g_unpooled_user         = "mls_admin";
 
 bool         PoolConnectDebugPrint  = false; /* Pooler connect debug print */
 bool         PoolerStuckExit         = true;  /* Pooler exit when stucked */
+bool         PoolSubThreadLogPrint  = true;  /* Pooler sub thread log print */
 
 #define      POOL_ASYN_WARM_PIPE_LEN      32   /* length of asyn warm pipe */
 #define      POOL_ASYN_WARN_NUM           1      /* how many connections to warm once maintaince per node pool */
@@ -137,6 +138,33 @@ typedef struct PoolerStatistics
 
 PoolerStatistics g_pooler_stat;
 
+/* global command statistics handle */
+PoolerCmdStatistics* g_pooler_cmd_stat = NULL;
+
+unsigned char g_pooler_cmd[POOLER_CMD_COUNT] =
+{
+    'a',                    /* ABORT */
+    'b',                    /* Fire transaction-block commands on given nodes */
+    'c',                    /* CONNECT */
+    'd',                    /* DISCONNECT */
+    'f',                    /* CLEAN CONNECTION */
+    'g',                    /* GET CONNECTIONS */
+    'h',                    /* Cancel SQL Command in progress on specified connections */
+    'o',                    /* Lock/unlock pooler */
+    'p',                    /* Reload connection info */
+    'P',                    /* Ping connection info */
+    'q',                    /* Check connection info consistency */
+    'r',                    /* RELEASE CONNECTIONS */
+    'R',                    /* Refresh connection info */
+    's',                    /* Session-related COMMAND */
+    't',                    /* Close pooler connections*/
+    'x',                    /* Get command statistics */
+    'y',                    /* Reset command statistics */
+    'z'                     /* Get connection statistics */
+};
+
+/* a map used to change msgtype to id */
+uint8 g_qtype2id[256];
 
 /* Flag to tell if we are Postgres-XC pooler process */
 static bool am_pgxc_pooler = false;
@@ -178,7 +206,7 @@ typedef struct
     Oid                  nodeoid;      /* Node Oid related to this pool */
     char                *connstr;    /* palloc memory, need free */
 
-    int32             m_version;  /* version of node pool */
+	time_t            m_version;  /* version of node pool */
     int32             size;        /* total pool size */
     int32               validSize;  /* valid data element number */    
     bool              failed;
@@ -345,26 +373,42 @@ char *poolErrorMsg[] = {"No Error",
 
 typedef struct
 {
-    int32             cmd;            /* refer to handle_agent_input command tag */
-    bool              bCoord;          /* coordinator or datanode*/
-    PGXCASyncTaskCtl  *taskControl;    
-    PoolAgent         *agent;
-    PGXCNodePool      *nodepool;      /* node pool for current node */
-    PGXCNodePoolSlot  *slot;          /* connection slot , no need to free */
-    int32             current_status; /* currrent connect status*/
-    int32             final_status;   /* final status we are going to get to*/
-    int32             nodeindex;      /* node index of the remote peer */
-    bool              needfree;       /* whether need to free taskControl, last thread set the flag */
+	int32             cmd;  	      /* refer to handle_agent_input command tag */
+	bool              bCoord;		  /* coordinator or datanode*/
+	PGXCASyncTaskCtl  *taskControl;	
+	PoolAgent         *agent;
+	PGXCNodePool      *nodepool;	  /* node pool for current node */
+	PGXCNodePoolSlot  *slot;		  /* connection slot , no need to free */
+	int32             current_status; /* currrent connect status*/
+	int32             final_status;   /* final status we are going to get to*/
+	int32             nodeindex;      /* node index of the remote peer */
+	bool			  needfree;       /* whether need to free taskControl, last thread set the flag */
 
-    int32              req_seq;          /* req sequence number */
-    int32             pid;              /* pid that acquires the connection */
-    bool              needConnect;      /* check whether we need to build a new connection , we acquire new connections */    
-    bool              error_flag;      /* set when error */
-    SendSetQueryStatus setquery_status;    /* send set query status */ 
-    struct  timeval   start_time;        /* when acquire conn by sync thread, the time begin request */
-    struct  timeval   end_time;            /* when acquire conn by sync thread, the time finish request */
-    char              errmsg[POOLER_ERROR_MSG_LEN];
+	int32			  req_seq;		  /* req sequence number */
+	int32             pid;			  /* pid that acquires the connection */
+	bool              needConnect;	  /* check whether we need to build a new connection , we acquire new connections */	
+	bool			  error_flag;	  /* set when error */
+	SendSetQueryStatus setquery_status;    /* send set query status */ 
+	struct  timeval   start_time;		/* when acquire conn by sync thread, the time begin request */
+	struct  timeval   end_time;			/* when acquire conn by sync thread, the time finish request */
+	char              errmsg[POOLER_ERROR_MSG_LEN];
+	pg_time_t         cmd_start_time;   /* command start time, including the processing time in the main process */
+    pg_time_t         cmd_end_time;     /* command end time */
 }PGXCPoolAsyncReq;
+
+static void pooler_subthread_write_log(int elevel, int lineno, const char *filename, const char *funcname, const char *fmt, ...)__attribute__((format(printf, 5, 6)));
+
+/* Use this macro when a sub thread needs to print logs */
+#define pooler_thread_logger(elevel, ...) \
+    do { \
+        pooler_subthread_write_log(elevel, __LINE__, __FILE__, PG_FUNCNAME_MACRO, __VA_ARGS__); \
+    } while(0)
+
+#define FORMATTED_TS_LEN                (128)                                          /* format timestamp buf length */
+#define POOLER_WRITE_LOG_ONCE_LIMIT     (5)                                            /* number of logs written at a time */
+#define MAX_THREAD_LOG_PIPE_LEN         (2 * 1024)                                     /* length of thread log pipe */
+#define DEFAULT_LOG_BUF_LEN             (1024)                                         /* length of thread log length */
+PGPipe  *g_ThreadLogQueue = NULL;
 
 static inline void RebuildAgentIndex(void);
 
@@ -458,7 +502,8 @@ static void insert_database_pool(DatabasePool *pool);
 static void reload_database_pools(PoolAgent *agent);
 static DatabasePool *find_database_pool(const char *database, const char *user_name, const char *pgoptions);
 
-static int agent_acquire_connections(PoolAgent *agent, List *datanodelist, List *coordlist, int32 *num, int **fd_result, int **pid_result);
+static int agent_acquire_connections(PoolAgent *agent, List *datanodelist, List *coordlist,
+									 bool raise_error, int32 *num, int **fd_result, int **pid_result);
 static int send_local_commands(PoolAgent *agent, List *datanodelist, List *coordlist);
 static int cancel_query_on_connections(PoolAgent *agent, List *datanodelist, List *coordlist, int signal);
 static PGXCNodePoolSlot *acquire_connection(DatabasePool *dbPool, PGXCNodePool **pool,int32 nodeidx, Oid node, bool bCoord);
@@ -521,7 +566,7 @@ static void  *pooler_async_utility_thread(void *arg);
 static void  *pooler_async_connection_management_thread(void *arg);
 static void  *pooler_sync_remote_operator_thread(void *arg);
 
-static bool   pooler_async_build_connection(DatabasePool *pool, int32 pool_version, int32 nodeidx, Oid node, 
+static bool   pooler_async_build_connection(DatabasePool *pool, time_t pool_version, int32 nodeidx, Oid node, 
                                             int32 size, char *connStr, bool bCoord);
 static BitmapMgr *BmpMgrCreate(uint32 objnum);
 static int        BmpMgrAlloc(BitmapMgr *mgr);
@@ -551,7 +596,6 @@ static void handle_clean_connection(PoolAgent * agent, StringInfo s);
 static void handle_get_connections(PoolAgent * agent, StringInfo s);
 static void handle_query_cancel(PoolAgent * agent, StringInfo s);
 static void handle_session_command(PoolAgent * agent, StringInfo s);
-static bool remove_all_agent_references(Oid nodeoid);
 static int  refresh_database_pools(PoolAgent *agent);
 
 static void pooler_async_ping_node(Oid node);
@@ -561,6 +605,11 @@ static int handle_close_pooled_connections(PoolAgent * agent, StringInfo s);
 static void ConnectPoolManager(void);
 #endif
 
+static void init_pooler_cmd_statistics(void);
+static void reset_pooler_cmd_statistics(void);
+static void update_pooler_cmd_statistics(unsigned char qtype, uint64 costtime);
+static void handle_get_cmd_statistics(PoolAgent *agent);
+static void handle_get_conn_statistics(PoolAgent *agent);
 
 #define IncreaseSlotRefCount(slot,filename,linenumber)\
 do\
@@ -692,8 +741,6 @@ do\
     }\
 }while(0)
 
-
-
 void
 PGXCPoolerProcessIam(void)
 {
@@ -742,9 +789,9 @@ PoolManagerInit()
      * processes do this.)
      */
 #ifdef HAVE_SETSID
-    if (setsid() < 0)
-        elog(LOG, POOL_MGR_PREFIX"setsid() failed: %m");
-        //elog(FATAL, POOL_MGR_PREFIX"setsid() failed: %m");
+	if (setsid() < 0)
+		elog(DEBUG1, POOL_MGR_PREFIX"setsid() failed: %m");
+		//elog(FATAL, POOL_MGR_PREFIX"setsid() failed: %m");
 #endif
     /*
      * Properly accept or ignore signals the postmaster might send us
@@ -1421,8 +1468,8 @@ PoolManagerSendLocalCommand(int dn_count, int* dn_list, int co_count, int* co_li
     pool_putmessage(&poolHandle->port, 'b', (char *) buf, (2 + dn_count + co_count) * sizeof(uint32));
     pool_flush(&poolHandle->port);
 
-    /* Get result */
-    return pool_recvres(&poolHandle->port);
+	/* Get result */
+	return pool_recvres(&poolHandle->port, true);
 }
 
 /*
@@ -1457,6 +1504,95 @@ PoolManagerLock(bool is_lock)
     pool_flush(&poolHandle->port);
 
     RESUME_POOLER_RELOAD();
+}
+
+/*
+ * get pooler command statistics
+ */
+int
+PoolManagerGetCmdStatistics(char *s, int size)
+{
+    int qtype = 0;
+    char msgtype = 'x';
+    HOLD_POOLER_RELOAD();
+
+    if (poolHandle == NULL)
+    {
+        ConnectPoolManager();
+    }
+
+    /* Message type */
+    pool_putbytes(&poolHandle->port, &msgtype, 1);
+    pool_flush(&poolHandle->port);
+
+    qtype = pool_getbyte(&poolHandle->port);
+    if (qtype == EOF || (unsigned char)qtype != msgtype)
+    {
+        elog(ERROR, POOL_MGR_PREFIX"get command statistics error, qtype:%d", qtype);
+        RESUME_POOLER_RELOAD();
+        return -1;
+    }
+
+    /* get all command statistics messages */
+    pool_getbytes(&poolHandle->port, s, size);
+
+    RESUME_POOLER_RELOAD();
+    return 0;
+}
+
+/*
+ * reset command statistics
+ */
+void
+PoolManagerResetCmdStatistics(void)
+{
+    char msgtype = 'y';
+    HOLD_POOLER_RELOAD();
+
+    if (poolHandle == NULL)
+    {
+        ConnectPoolManager();
+    }
+
+    /* Message type */
+    pool_putbytes(&poolHandle->port, &msgtype, 1);
+    pool_flush(&poolHandle->port);
+
+    RESUME_POOLER_RELOAD();
+}
+
+/*
+ * get pooler connections statistics
+ */
+int
+PoolManagerGetConnStatistics(StringInfo s)
+{
+    int qtype = 0;
+    char msgtype = 'z';
+    HOLD_POOLER_RELOAD();
+
+    if (poolHandle == NULL)
+    {
+        ConnectPoolManager();
+    }
+
+    /* Message type */
+    pool_putbytes(&poolHandle->port, &msgtype, 1);
+    pool_flush(&poolHandle->port);
+
+    qtype = pool_getbyte(&poolHandle->port);
+    if (qtype == EOF || (unsigned char)qtype != msgtype)
+    {
+        elog(ERROR, POOL_MGR_PREFIX"get conn statistics error, qtype:%d", qtype);
+        RESUME_POOLER_RELOAD();
+        return -1;
+    }
+
+    /* get all the messages left */
+    pool_getmessage(&poolHandle->port, s, 0);
+
+    RESUME_POOLER_RELOAD();
+    return 0;
 }
 
 /*
@@ -1674,13 +1810,15 @@ PoolManagerDisconnect(void)
  * Get pooled connections
  */
 int *
-PoolManagerGetConnections(List *datanodelist, List *coordlist, int **pids)
-{// #lizard forgives
+PoolManagerGetConnections(List *datanodelist, List *coordlist, bool raise_error, int **pids)
+{
     int            i;
     ListCell   *nodelist_item;
     int           *fds;
     int            totlen = list_length(datanodelist) + list_length(coordlist);
+	int         totsize = sizeof(int) * (totlen + 2) + 1; /* sizeof nodes list + raise_error flag */
     int            nodes[totlen + 2];
+	char       *msg;
     int         pool_recvpids_num;
     int         pool_recvfds_ret;
 
@@ -1727,7 +1865,11 @@ PoolManagerGetConnections(List *datanodelist, List *coordlist, int **pids)
                  errmsg(POOL_MGR_PREFIX"out of memory")));
     }
 
-    pool_putmessage(&poolHandle->port, 'g', (char *) nodes, sizeof(int) * (totlen + 2));
+	msg = palloc(totsize);
+	memcpy(msg, (char *) nodes, totsize - 1);
+	msg[totsize - 1] = (char) raise_error;
+	pool_putmessage(&poolHandle->port, 'g', msg, totsize);
+	pfree(msg);
 
     if (PoolConnectDebugPrint)
     {
@@ -1900,13 +2042,13 @@ PoolManagerCleanConnection(List *datanodelist, List *coordlist, char *dbname, ch
 
     RESUME_POOLER_RELOAD();
 
-    /* Receive result message */
-    if (pool_recvres(&poolHandle->port) != CLEAN_CONNECTION_COMPLETED)
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_INTERNAL_ERROR),
-                 errmsg(POOL_MGR_PREFIX"Clean connections not completed. HINT: cannot drop the currently open database")));
-    }
+	/* Receive result message */
+	if (pool_recvres(&poolHandle->port, true) != CLEAN_CONNECTION_COMPLETED)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg(POOL_MGR_PREFIX"Clean connections not completed. HINT: cannot drop the currently open database")));
+	}
 }
 
 
@@ -1927,11 +2069,11 @@ PoolManagerCheckConnectionInfo(void)
 		ConnectPoolManager();
     }
     
-    PgxcNodeListAndCount();
+	PgxcNodeListAndCountWrapTransaction();
     pool_putmessage(&poolHandle->port, 'q', NULL, 0);
     pool_flush(&poolHandle->port);
 
-    res = pool_recvres(&poolHandle->port);
+	res = pool_recvres(&poolHandle->port, true);
 
     if (res == POOL_CHECK_SUCCESS)
         return true;
@@ -1947,11 +2089,21 @@ void
 PoolManagerReloadConnectionInfo(void)
 {
     Assert(poolHandle);
-    PgxcNodeListAndCount();
+	PgxcNodeListAndCountWrapTransaction();
     pool_putmessage(&poolHandle->port, 'p', NULL, 0);
     pool_flush(&poolHandle->port);
 }
 
+/*
+ * get systime time, ms
+ */
+static pg_time_t
+get_system_time()
+{
+    struct timeb t;
+    ftime(&t);
+    return 1000 * t.time + t.millitm;
+}
 
 /*
  * Handle messages to agent
@@ -1968,6 +2120,8 @@ agent_handle_input(PoolAgent * agent, StringInfo s)
     for (;;)
     {
         int            res;
+
+        agent->cmd_start_time = get_system_time();
 
         /*
          * During a pool cleaning, Abort, Connect and Get Connections messages
@@ -2099,7 +2253,19 @@ agent_handle_input(PoolAgent * agent, StringInfo s)
                 /* Send result */
                 pool_sendres(&agent->port, res, NULL, 0, true);
                 break;
-                
+
+            case 'x':          /* get command statistics */
+		        handle_get_cmd_statistics(agent);
+		        break;
+
+            case 'y':          /* reset command statistics */
+                reset_pooler_cmd_statistics();
+                break;
+
+            case 'z':          /* get connections statistics */
+                handle_get_conn_statistics(agent);
+                break;
+
             case EOF:            /* EOF */
                 agent_destroy(agent);
                 return;    
@@ -2107,6 +2273,12 @@ agent_handle_input(PoolAgent * agent, StringInfo s)
                 elog(WARNING, POOL_MGR_PREFIX"invalid request tag:%c", qtype);
                 agent_destroy(agent);
                 return;
+        }
+
+        /* if cmd_start_time is not 0, means cmd handle in main loop sync, statistic here */
+        if (agent->cmd_start_time != 0)
+        {
+            update_pooler_cmd_statistics(qtype, get_system_time() - agent->cmd_start_time);
         }
 
         /* avoid reading from connection */
@@ -2760,8 +2932,9 @@ FATAL_ERROR:
  * return 0 : when fd_result and pid_result is not NULL, acquire connection is done(acquire from freeslot in pool).
  */
 static int 
-agent_acquire_connections(PoolAgent *agent, List *datanodelist, List *coordlist, int32 *num, int **fd_result, int **pid_result)
-{// #lizard forgives
+agent_acquire_connections(PoolAgent *agent, List *datanodelist, List *coordlist,
+						  bool raise_error, int32 *num, int **fd_result, int **pid_result)
+{
     int32              i    = 0;
     int32             acquire_seq = 0;
     int                  node = 0;
@@ -2948,6 +3121,7 @@ agent_acquire_connections(PoolAgent *agent, List *datanodelist, List *coordlist,
                     elog(LOG, POOL_MGR_PREFIX"[agent_acquire_connections]going to acquire conn by sync thread for node:%s.", nodePool->node_name);
                 }
                 
+				asyncTaskCtl->m_missing_ok = !raise_error;
                 /* dispatch build connection request */
                 succeed = dispatch_connection_request(asyncTaskCtl,
                                                         false,
@@ -2973,6 +3147,17 @@ agent_acquire_connections(PoolAgent *agent, List *datanodelist, List *coordlist,
             else
             {
                 acquire_succeed_num++;    
+				if (!slot->bdestoryed && difftime(time(NULL), slot->created) > PoolConnMaxLifetime)
+				{
+					elog(WARNING,
+						POOL_MGR_PREFIX"agent_acquire_connections acquired connection to "
+						"database:%s user:%s "
+						"node:%s backend_pid:%d nodeidx:%d "
+						"nodepool size:%d freeSize:%d that should be destoried.",
+						agent->pool->database, agent->pool->user_name,
+						nodePool->node_name, slot->backend_pid, node,
+						nodePool->size, nodePool->freeSize);
+				}
                 if (PoolConnectDebugPrint)
                 {
                     /* double check, to ensure no double destory and multiple agents for one slot */
@@ -3000,6 +3185,7 @@ agent_acquire_connections(PoolAgent *agent, List *datanodelist, List *coordlist,
                         asyncTaskCtl = create_task_control(datanodelist, coordlist, *fd_result, *pid_result);
                     }
                     
+					asyncTaskCtl->m_missing_ok = !raise_error;
                     /* dispatch set param request */
                     succeed = dispatch_connection_request(asyncTaskCtl,
                                                             false,
@@ -3080,6 +3266,7 @@ agent_acquire_connections(PoolAgent *agent, List *datanodelist, List *coordlist,
                     asyncTaskCtl = create_task_control(datanodelist, coordlist, *fd_result, *pid_result);
                 }
 
+				asyncTaskCtl->m_missing_ok = !raise_error;
                 /* dispatch build connection request */
                 succeed = dispatch_connection_request(asyncTaskCtl,
                                                         true,
@@ -3134,6 +3321,8 @@ agent_acquire_connections(PoolAgent *agent, List *datanodelist, List *coordlist,
                     {
                         asyncTaskCtl = create_task_control(datanodelist, coordlist, *fd_result, *pid_result);
                     }
+					
+					asyncTaskCtl->m_missing_ok = !raise_error;
                     /* dispatch set param request */
                     succeed = dispatch_connection_request(asyncTaskCtl,
                                                             true,
@@ -3741,7 +3930,7 @@ PoolManagerCancelQuery(int dn_count, int* dn_list, int co_count, int* co_list, i
     pool_putmessage(&poolHandle->port, 'h', (char *) buf, (2 + dn_count + co_count + 1) * sizeof(uint32));
     pool_flush(&poolHandle->port);
 
-    res = pool_recvres(&poolHandle->port);
+	res = pool_recvres(&poolHandle->port, false);
 
     if (res != (dn_count + co_count))
     {
@@ -4290,7 +4479,12 @@ reload_database_pools(PoolAgent *agent)
                 if (nodePool->size == nodePool->freeSize)
 #endif
                 {
-                    elog(LOG, POOL_MGR_PREFIX"nodePool:%s has been changed, size:%d, freeSize:%d, destory it now", nodePool->connstr, nodePool->size, nodePool->freeSize);                    
+					elog(LOG, POOL_MGR_PREFIX"nodePool:%s has been changed, "
+						"size:%d, freeSize:%d, reload_database_pools: nodePools "
+						"of node (%u, %s) is removed.",
+						nodePool->connstr,
+						nodePool->size, nodePool->freeSize,
+						nodePool->nodeoid, nodePool->node_name);
                     destroy_node_pool(nodePool);
                     hash_search(databasePool->nodePools, &nodePool->nodeoid,
                                 HASH_REMOVE, NULL);
@@ -4300,7 +4494,13 @@ reload_database_pools(PoolAgent *agent)
                     destroy_node_pool_free_slots(nodePool);
 
                     /* increase the node pool version */
-                    nodePool->m_version++;    
+					nodePool->m_version = time(NULL);
+					elog(LOG, POOL_MGR_PREFIX"nodePool:%s has been changed, "
+						"size:%d, freeSize:%d, reload_database_pools: nodePools "
+						"of node (%u, %s) has increased version %lu.",
+						nodePool->connstr,
+						nodePool->size, nodePool->freeSize,
+						nodePool->nodeoid, nodePool->node_name, nodePool->m_version);
 
                     /* fresh the connect string so that new coming connection will connect to the new node  */
                     if (connstr_chk)
@@ -4507,7 +4707,11 @@ release_connection(DatabasePool *dbPool, PGXCNodePoolSlot *slot,
 
     nodePool = (PGXCNodePool *) hash_search(dbPool->nodePools, &node, HASH_FIND,
                                             NULL);
-    if (nodePool == NULL)
+	/*
+	 * The node pool of connections may has been created just now and the size is
+	 * initialized to 0. This situation needs to be excluded.
+	 */
+	if ((nodePool == NULL) || (nodePool->size == 0))
     {
         /*
          * The node may be altered or dropped.
@@ -4515,8 +4719,14 @@ release_connection(DatabasePool *dbPool, PGXCNodePoolSlot *slot,
          */
         if (PoolConnectDebugPrint)
         {
-            elog(LOG, POOL_MGR_PREFIX"release_connection connection to node:%s backend_pid:%d nodeidx:%d size:%d freeSize:%d can not find nodepool, just destory it", nodePool->node_name, slot->backend_pid, nodeidx, nodePool->size, nodePool->freeSize);
-            abort();
+			elog(LOG,
+				POOL_MGR_PREFIX"release_connection connection to "
+				"database:%s user:%s "
+				"node:%s backend_pid:%d nodeidx:%d "
+				"size:%d freeSize:%d can not find nodepool, just destory it",
+				dbPool->database, dbPool->user_name,
+				nodePool->node_name, slot->backend_pid, nodeidx,
+				nodePool->size, nodePool->freeSize);
         }
         destroy_slot(nodeidx, node, slot);
         return;
@@ -4524,7 +4734,14 @@ release_connection(DatabasePool *dbPool, PGXCNodePoolSlot *slot,
 
     if (PoolConnectDebugPrint)
     {
-        elog(LOG, POOL_MGR_PREFIX"release_connection connection to nodename:%s backend_pid:%d nodeidx:%d size:%d freeSize:%d begin to release", nodePool->node_name, slot->backend_pid, nodeidx, nodePool->size, nodePool->freeSize);
+		elog(LOG,
+			POOL_MGR_PREFIX"release_connection connection to "
+			"database:%s user:%s "
+			"nodename:%s backend_pid:%d nodeidx:%d "
+			"size:%d freeSize:%d begin to release",
+			dbPool->database, dbPool->user_name,
+			nodePool->node_name, slot->backend_pid, nodeidx,
+			nodePool->size, nodePool->freeSize);
     }
 
     /* force destroy the connection when pool not enabled */
@@ -4536,11 +4753,19 @@ release_connection(DatabasePool *dbPool, PGXCNodePoolSlot *slot,
     /* destory the slot of former nodePool */
     if (slot->m_version != nodePool->m_version)
     {
-        force_destroy = true;
         if (PoolConnectDebugPrint)
         {
-            elog(LOG, POOL_MGR_PREFIX"release_connection connection to node:%s backend_pid:%d nodeidx:%d agentCount:%d size:%d freeSize:%d node version:%d slot version:%d not match", nodePool->node_name, slot->backend_pid, nodeidx, agentCount, nodePool->size, nodePool->freeSize, nodePool->m_version, slot->m_version);
+			elog(LOG,
+				POOL_MGR_PREFIX"release_connection connection to "
+				"database:%s user:%s "
+				"node:%s backend_pid:%d nodeidx:%d agentCount:%d "
+				"size:%d freeSize:%d node version:%lu slot version:%lu not match",
+				dbPool->database, dbPool->user_name,
+				nodePool->node_name, slot->backend_pid, nodeidx, agentCount,
+				nodePool->size, nodePool->freeSize, nodePool->m_version, slot->m_version);
         }
+		destroy_slot(nodeidx, node, slot);
+		return;
     }
     
     if (!force_destroy)
@@ -4551,36 +4776,56 @@ release_connection(DatabasePool *dbPool, PGXCNodePoolSlot *slot,
             /* warm a connection is a hard job, when release them, we need make sure it has worked long enough. */
             if (slot->bwarmed)
             {
-                if (nodePool->freeSize > MinFreeSize && difftime(now, slot->created) > PoolWarmConnMaxLifetime)
+				if (nodePool->freeSize > MinFreeSize || difftime(now, slot->created) > PoolConnMaxLifetime)
                 {
                     force_destroy = true;
                     if (PoolConnectDebugPrint)
                     {
-                        elog(LOG, POOL_MGR_PREFIX"warmed connection to node:%s backend_pid:%d nodeidx:%d lifetime expired, closed it, size:%d freeSize:%d", nodePool->node_name, slot->backend_pid, nodeidx, nodePool->size, nodePool->freeSize);
+						elog(LOG,
+							POOL_MGR_PREFIX"warmed connection to "
+							"database:%s user:%s "
+							"node:%s backend_pid:%d nodeidx:%d lifetime expired, "
+							"closed it, size:%d freeSize:%d",
+							dbPool->database, dbPool->user_name,
+							nodePool->node_name, slot->backend_pid, nodeidx,
+							nodePool->size, nodePool->freeSize);
                     }
                 }                
             }
             else 
             {
                 if (((nodePool->freeSize > 0) && (nodePool->nwarming + nodePool->nquery) > MinFreeSize) ||                                         
-                    (difftime(now, slot->created) >= PoolWarmConnMaxLifetime))
+					(difftime(now, slot->created) >= PoolConnMaxLifetime))
                 {
                     force_destroy = true;
                     if (PoolConnectDebugPrint)
                     {
-                        elog(LOG, POOL_MGR_PREFIX"unwarmed connection to node:%s backend_pid:%d nodeidx:%d lifetime expired, closed it, size:%d freeSize:%d", nodePool->node_name, slot->backend_pid, nodeidx, nodePool->size, nodePool->freeSize);
+						elog(LOG,
+							POOL_MGR_PREFIX"unwarmed connection to "
+							"database:%s user:%s "
+							"node:%s backend_pid:%d nodeidx:%d lifetime expired, "
+							"closed it, size:%d freeSize:%d",
+							dbPool->database, dbPool->user_name,
+							nodePool->node_name, slot->backend_pid, nodeidx,
+							nodePool->size, nodePool->freeSize);
                     }
                 }
             }
         }    
         else if (((nodePool->freeSize > 0) && (nodePool->nwarming + nodePool->nquery) > MinFreeSize) ||                                         
-            (difftime(now, slot->created) >= PoolConnMaxLifetime) ||
-             ((difftime(now, slot->created) >= PoolConnDeadtime) && (PoolConnDeadtime > PoolConnMaxLifetime)))
+			(difftime(now, slot->created) >= PoolConnMaxLifetime))
         {
             force_destroy = true;
             if (PoolConnectDebugPrint)
             {
-                elog(LOG, POOL_MGR_PREFIX"connection to node:%s backend_pid:%d nodeidx:%d lifetime expired, closed it, size:%d freeSize:%d", nodePool->node_name, slot->backend_pid, nodeidx, nodePool->size, nodePool->freeSize);
+				elog(LOG,
+					POOL_MGR_PREFIX"connection to "
+					"database:%s user:%s "
+					"node:%s backend_pid:%d nodeidx:%d lifetime expired, "
+					"closed it, size:%d freeSize:%d",
+					dbPool->database, dbPool->user_name,
+					nodePool->node_name, slot->backend_pid, nodeidx,
+					nodePool->size, nodePool->freeSize);
             }
         }
     }
@@ -4596,7 +4841,6 @@ release_connection(DatabasePool *dbPool, PGXCNodePoolSlot *slot,
             pooler_async_warm_connection(dbPool, slot, nodePool, node);
             grow_pool(dbPool, nodeidx, node, bCoord);
         }
-
         else
         {        
             if ((difftime(now, slot->checked) >=  PoolSizeCheckGap) && !IS_ASYNC_PIPE_FULL())
@@ -4617,7 +4861,14 @@ release_connection(DatabasePool *dbPool, PGXCNodePoolSlot *slot,
                 slot->released = now;
                 if (PoolConnectDebugPrint)
                 {
-                    elog(LOG, POOL_MGR_PREFIX"release_connection return connection to node:%s backend_pid:%d nodeidx:%d nodepool size:%d freeSize:%d", nodePool->node_name, slot->backend_pid, nodeidx, nodePool->size, nodePool->freeSize);
+					elog(LOG,
+						POOL_MGR_PREFIX"release_connection return connection to "
+						"database:%s user:%s "
+						"node:%s backend_pid:%d nodeidx:%d "
+						"nodepool size:%d freeSize:%d",
+						dbPool->database, dbPool->user_name,
+						nodePool->node_name, slot->backend_pid, nodeidx,
+						nodePool->size, nodePool->freeSize);
                 }
             }
         }    
@@ -4627,7 +4878,14 @@ release_connection(DatabasePool *dbPool, PGXCNodePoolSlot *slot,
         elog(DEBUG1, POOL_MGR_PREFIX"Cleaning up connection from pool %s, closing", nodePool->connstr);
         if (PoolConnectDebugPrint)
         {
-            elog(LOG, POOL_MGR_PREFIX"release_connection destory connection to node:%s backend_pid:%d nodeidx:%d nodepool size:%d freeSize:%d", nodePool->node_name, slot->backend_pid, nodeidx, nodePool->size, nodePool->freeSize);
+			elog(LOG,
+				POOL_MGR_PREFIX"release_connection destory connection to "
+				"database:%s user:%s "
+				"node:%s backend_pid:%d nodeidx:%d "
+				"nodepool size:%d freeSize:%d",
+				dbPool->database, dbPool->user_name,
+				nodePool->node_name, slot->backend_pid, nodeidx,
+				nodePool->size, nodePool->freeSize);
         }
         destroy_slot(nodeidx, node, slot);
         
@@ -4641,6 +4899,18 @@ release_connection(DatabasePool *dbPool, PGXCNodePoolSlot *slot,
             grow_pool(dbPool, nodeidx, node, bCoord);
         }        
     }
+
+	if (!slot->bdestoryed && difftime(time(NULL), slot->created) > PoolConnMaxLifetime)
+	{
+		elog(WARNING,
+			POOL_MGR_PREFIX"release_connection has not destoried connection to "
+			"database:%s user:%s "
+			"node:%s backend_pid:%d nodeidx:%d "
+			"nodepool size:%d freeSize:%d",
+			dbPool->database, dbPool->user_name,
+			nodePool->node_name, slot->backend_pid, nodeidx,
+			nodePool->size, nodePool->freeSize);
+	}
 }
 
 /*
@@ -4694,6 +4964,11 @@ grow_pool(DatabasePool *dbPool, int32 nodeidx, Oid node, bool bCoord)
         }
         snprintf(nodePool->node_name, NAMEDATALEN, "%s", name_str);
         MemoryContextSwitchTo(oldcontext);
+
+		nodePool->m_version = time(NULL);
+		elog(LOG,
+			"grow_pool: nodePools of node (%u, %s) is created.",
+			nodePool->nodeoid, nodePool->node_name);
     }    
 
     /* here, we move the connection build work to async threads */
@@ -4932,6 +5207,8 @@ destroy_node_pool(PGXCNodePool *node_pool)
             destroy_slot(nodeidx, node_pool->nodeoid, node_pool->slot[i]);
         }
         pfree(node_pool->slot);
+		node_pool->size -= node_pool->freeSize;
+		node_pool->freeSize = 0;
     }
 }
 
@@ -4950,8 +5227,11 @@ destroy_node_pool_free_slots(PGXCNodePool *node_pool)
 
     if (PoolConnectDebugPrint)
     {
-        elog(LOG, POOL_MGR_PREFIX"About to destroy slots of node pool %s, agentCount is %d, node_pool version:%d current size is %d, freeSize is %d, %d connections are in use",
-             node_pool->connstr, node_pool->m_version, agentCount, node_pool->size, node_pool->freeSize, node_pool->size - node_pool->freeSize);    
+		elog(LOG,
+			POOL_MGR_PREFIX"About to destroy slots of node pool %s, node_pool version:%lu "
+			"agentCount is %d current size is %d, freeSize is %d, %d connections are in use",
+			node_pool->connstr, node_pool->m_version,
+			agentCount, node_pool->size, node_pool->freeSize, node_pool->size - node_pool->freeSize);
     }
 
     if (node_pool->slot)
@@ -4963,8 +5243,172 @@ destroy_node_pool_free_slots(PGXCNodePool *node_pool)
             destroy_slot(nodeidx, node_pool->nodeoid, node_pool->slot[i]);
             node_pool->slot[i] = NULL;
         }
-        node_pool->freeSize = 0;
         node_pool->size     -= node_pool->freeSize;        
+		node_pool->freeSize = 0;
+    }
+}
+
+/*
+ * setup current log time
+ */
+static void
+setup_formatted_current_log_time(char* formatted_current_log_time)
+{
+    pg_time_t	stamp_time;
+    char		msbuf[13];
+    struct timeval timeval;
+
+    gettimeofday(&timeval, NULL);
+    stamp_time = (pg_time_t) timeval.tv_sec;
+
+    /*
+     * Note: we expect that guc.c will ensure that log_timezone is set up (at
+     * least with a minimal GMT value) before Log_line_prefix can become
+     * nonempty or CSV mode can be selected.
+     */
+    pg_strftime(formatted_current_log_time, FORMATTED_TS_LEN,
+            /* leave room for milliseconds... */
+                "%Y-%m-%d %H:%M:%S     %Z",
+                pg_localtime(&stamp_time, log_timezone));
+
+    /* 'paste' milliseconds into place... */
+    sprintf(msbuf, ".%03d", (int) (timeval.tv_usec / 1000));
+    memcpy(formatted_current_log_time + 19, msbuf, 4);
+}
+
+/*
+ * write pooler's subthread log into thread log queue
+ * only call by pooler's subthread in elog
+ */
+static void
+pooler_subthread_write_log(int elevel, int lineno, const char *filename, const char *funcname, const char *fmt, ...)
+{
+    char *buf = NULL;
+    int buf_len = 0;
+    int offset = 0;
+    char formatted_current_log_time[FORMATTED_TS_LEN];
+
+    if (!PoolSubThreadLogPrint)
+    {
+        /* not enable sun thread log print, return */
+        return;
+    }
+
+    if (PipeIsFull(g_ThreadLogQueue))
+    {
+        return;
+    }
+
+    /* use malloc in sub thread */
+    buf_len = strlen(filename) + strlen(funcname) + DEFAULT_LOG_BUF_LEN;
+    buf = (char*)malloc(buf_len);
+    if (buf == NULL)
+    {
+        /* no log */
+        return;
+    }
+
+    /* construction log, format: elevel | lineno | filename | funcname | log content */
+    *(int*)(buf + offset) = elevel;
+    offset += sizeof(elevel);
+    *(int*)(buf + offset) = lineno;
+    offset += sizeof(lineno);
+    memcpy(buf + offset, filename, strlen(filename) + 1);
+    offset += (strlen(filename) + 1);
+    memcpy(buf + offset, funcname, strlen(funcname) + 1);
+    offset += (strlen(funcname) + 1);
+
+    /*
+     * because the main thread writes the log of the sub thread asynchronously,
+     * record the actual log writing time here
+     */
+    setup_formatted_current_log_time(formatted_current_log_time);
+    memcpy(buf + offset, formatted_current_log_time, strlen(formatted_current_log_time));
+    offset += strlen(formatted_current_log_time);
+    *(char*)(buf + offset) = ' ';
+    offset += sizeof(char);
+
+    /* Generate actual output --- have to use appendStringInfoVA */
+    for (;;)
+    {
+        va_list		args;
+        int			avail;
+        int			nprinted;
+
+        avail = buf_len - offset - 1;
+        va_start(args, fmt);
+        nprinted = vsnprintf(buf + offset, avail, fmt, args);
+        va_end(args);
+        if (nprinted >= 0 && nprinted < avail - 1)
+        {
+            offset += nprinted;
+            *(char*)(buf + offset) = '\0';
+			offset += sizeof(char);
+            break;
+        }
+
+        buf_len = (buf_len * 2 > (int) MaxAllocSize) ? MaxAllocSize : buf_len * 2;
+        buf = (char *) realloc(buf, buf_len);
+        if (buf == NULL)
+        {
+            /* no log */
+            return;
+        }
+    }
+
+    /* put log into thread log queue, drop log if queue is full */
+    if (-1 == PipePut(g_ThreadLogQueue, buf))
+    {
+        free(buf);
+    }
+}
+
+/*
+ * write subthread log in main thread
+ */
+static void
+pooler_handle_subthread_log(bool is_pooler_exit)
+{
+    int write_log_cnt = 0;
+    int offset = 0;
+    int elevel = LOG;
+    int lineno = 0;
+    char *log_buf = NULL;
+    char *filename = NULL;
+    char *funcname = NULL;
+    char *log_content = NULL;
+
+    while ((log_buf = (char*)PipeGet(g_ThreadLogQueue)) != NULL)
+    {
+        /* elevel | lineno | filename | funcname | log content */
+        elevel = *(int*)log_buf;
+        offset = sizeof(elevel);
+        lineno = *(int*)(log_buf + offset);
+        offset += sizeof(lineno);
+        filename = log_buf + offset;
+        offset += (strlen(filename) + 1);
+        funcname = log_buf + offset;
+        offset += (strlen(funcname) + 1);
+        log_content = log_buf + offset;
+
+        /* write log here */
+        elog_start(filename, lineno,
+#ifdef USE_MODULE_MSGIDS
+                PGXL_MSG_MODULE, PGXL_MSG_FILEID, __COUNTER__,
+#endif
+                funcname);
+        elog_finish(elevel, "%s", log_content);
+
+        free(log_buf);
+
+        /*
+         * if the number of logs written at one time exceeds POOLER_WRITE_LOG_ONCE_LIMIT,
+         * in order not to block the main thread, return here
+         */
+        if (write_log_cnt++ >= POOLER_WRITE_LOG_ONCE_LIMIT && !is_pooler_exit)
+        {
+            return;
+        }
     }
 }
 
@@ -4973,8 +5417,8 @@ destroy_node_pool_free_slots(PGXCNodePool *node_pool)
  */
 static void
 PoolerLoop(void)
-{// #lizard forgives
-    bool           warme_initd = false;
+{
+	bool           warm_inited = false;
     StringInfoData input_message;
     int            maxfd       = MaxConnections + 1024;
     struct pollfd *pool_fd;
@@ -5033,6 +5477,9 @@ PoolerLoop(void)
         pfree(rawstring);
     }
 #endif
+
+    /* create log queue */
+    g_ThreadLogQueue = CreatePipe(MAX_THREAD_LOG_PIPE_LEN);
 
     /* create utility thread */
     g_AsynUtilityPipeSender = CreatePipe(POOL_ASYN_WARM_PIPE_LEN);
@@ -5096,7 +5543,8 @@ PoolerLoop(void)
         pool_fd[i].events = POLLIN | POLLPRI | POLLRDNORM | POLLRDBAND;
     }
 
-    reset_pooler_statistics();
+	reset_pooler_statistics();
+    init_pooler_cmd_statistics();
 
     for (;;)
     {
@@ -5115,6 +5563,7 @@ PoolerLoop(void)
          */
         if (!PostmasterIsAlive())
         {
+            pooler_handle_subthread_log(true);
             exit(1);
         }
         
@@ -5142,6 +5591,7 @@ PoolerLoop(void)
              *  Just close the socket and exit. Linux will help to release the resouces.
               */        
             close(server_fd);
+            pooler_handle_subthread_log(true);
             exit(0);
         }        
 
@@ -5238,10 +5688,10 @@ PoolerLoop(void)
         }
 
         /* create preload database pooler */
-        if (!warme_initd)
+		if (!warm_inited)
         {
             connect_pools();
-            warme_initd = true;
+			warm_inited = true;
         }
         pooler_pools_warm();
         
@@ -5253,6 +5703,9 @@ PoolerLoop(void)
         check_duplicate_allocated_conn();
 #endif
         print_pooler_statistics();
+
+		/* handle sub thread's log */
+        pooler_handle_subthread_log(false);
     }
 }
 
@@ -5474,12 +5927,18 @@ shrink_pool(DatabasePool *pool)
             {
                 /* no need to shrik warmed slot, only discard them when they use too much memroy */
                 if (!slot->bwarmed && ((difftime(now, slot->released) > PoolConnKeepAlive) || 
-                                      (difftime(now, slot->created) > PoolConnDeadtime)   ||
                                       (difftime(now, slot->created) >= PoolConnMaxLifetime)))
                 {                    
                     if (PoolConnectDebugPrint)
                     {
-                        elog(LOG, POOL_MGR_PREFIX"shrink_pool destroy a connection to node:%s backend_pid:%d nodeidx:%d nodepool size:%d freeSize:%d", nodePool->node_name, slot->backend_pid, nodeidx, nodePool->size, nodePool->freeSize);
+						elog(LOG,
+							POOL_MGR_PREFIX"shrink_pool destroy a connection to "
+							"database:%s user:%s "
+							"node:%s backend_pid:%d nodeidx:%d "
+							"nodepool size:%d freeSize:%d",
+							pool->database, pool->user_name,
+							nodePool->node_name, slot->backend_pid, nodeidx,
+							nodePool->size, nodePool->freeSize);
                     }
                     /* connection is idle for long, close it */                    
                     destroy_slot(nodeidx, nodePool->nodeoid, slot);
@@ -5534,9 +5993,13 @@ shrink_pool(DatabasePool *pool)
         {
             if (PoolConnectDebugPrint)
             {
-                elog(LOG, POOL_MGR_PREFIX"close %d long time free node:%u, poolsize:%d, freeSize:%d", freeCount, nodePool->nodeoid, 
-                                                                                       nodePool->size, 
-                                                                                       nodePool->freeSize);            
+				elog(LOG,
+					POOL_MGR_PREFIX"close %d long time free connections of "
+						"database:%s user:%s "
+						"node:%u, poolsize:%d, freeSize:%d",
+						freeCount,
+						pool->database, pool->user_name,
+						nodePool->nodeoid, nodePool->size, nodePool->freeSize);
             }
 
             /* only grow pool when pool needed. */
@@ -5546,12 +6009,40 @@ shrink_pool(DatabasePool *pool)
             }
         }
         
+		if (PoolConnectDebugPrint)
+		{
+			for (i = 0; i < nodePool->freeSize; i++)
+			{
+				PGXCNodePoolSlot *slot = nodePool->slot[i];
+
+				if (slot && !slot->bdestoryed && difftime(time(NULL), slot->created) > PoolConnMaxLifetime)
+				{
+					elog(WARNING,
+						POOL_MGR_PREFIX"shrink_pool found connection to "
+						"database:%s user:%s "
+						"nodename:%s nodeid:%d "
+						"nodepool size:%d freeSize:%d that should be destoried.",
+						pool->database, pool->user_name,
+						nodePool->node_name, nodePool->nodeoid,
+						nodePool->size, nodePool->freeSize);
+
+					break;
+				}
+			}
+		}
+
         if (nodePool->size > 0)
         {
             empty = false;
         }
         else
         {
+			if (PoolConnectDebugPrint)
+			{
+				elog(LOG,
+					"shrink_pool: nodePools of node (%u, %s) is removed.",
+					nodePool->nodeoid, nodePool->node_name);
+			}
             destroy_node_pool(nodePool);
             hash_search(pool->nodePools, &nodePool->nodeoid, HASH_REMOVE, NULL);
         }
@@ -6129,6 +6620,11 @@ static void pooler_handle_sync_response_queue(void)
                     abort();
                 }
             }
+
+            if (connRsp->cmd_start_time != 0)
+            {
+                update_pooler_cmd_statistics(connRsp->cmd, connRsp->cmd_end_time - connRsp->cmd_start_time);
+            }
             
             /* handle pending agent, if any */
             agent_handle_pending_agent(agent);
@@ -6206,9 +6702,10 @@ static void pooler_sync_connections_to_nodepool(void)
                 
                 nodePool = (PGXCNodePool *) hash_search(asyncInfo->dbPool->nodePools, &asyncInfo->node,
                                     HASH_ENTER, &found);
-
                 if (!found)
                 {
+					elog(WARNING, POOL_MGR_PREFIX"The nodePool has not found when the slot is warmed up.");
+
                     oldcontext = MemoryContextSwitchTo(PoolerMemoryContext);
                     nodePool->connstr = build_node_conn_str(asyncInfo->node, asyncInfo->dbPool);
                     if (!nodePool->connstr)
@@ -6232,6 +6729,7 @@ static void pooler_sync_connections_to_nodepool(void)
                     nodePool->coord      = false; /* in this case, only datanode */
                     nodePool->nwarming   = 0;
                     nodePool->nquery     = 0;
+					nodePool->m_version = time(NULL);
 
                     name_str = get_node_name_by_nodeoid(asyncInfo->node);
                     if (NULL == name_str)
@@ -6277,16 +6775,18 @@ static void pooler_sync_connections_to_nodepool(void)
                 }
                 else
                 {                    
-                    
-                    nodeidx = get_node_index_by_nodeoid(asyncInfo->node);
-                    destroy_slot(nodeidx, asyncInfo->node, asyncInfo->slot);
-                    
-                    /* Decrease pool size */
-                    DecreasePoolerSize(nodePool,__FILE__, __LINE__);                    
                     if (PoolConnectDebugPrint)
                     {
-                        elog(LOG, POOL_MGR_PREFIX"destory connection to node:%u nodeidx:%d nodepool size:%d freeSize:%d for unmatch version, slot->m_version:%d, nodePool->m_version:%d", asyncInfo->node, nodeidx, nodePool->size, nodePool->freeSize, asyncInfo->slot->m_version, nodePool->m_version);
+						elog(LOG, POOL_MGR_PREFIX"destory connection to node:%u "
+							"nodeidx:%d nodepool size:%d freeSize:%d for unmatch "
+							"version, slot->m_version:%lu, nodePool->m_version:%lu",
+							asyncInfo->node,
+							nodeidx, nodePool->size, nodePool->freeSize,
+							asyncInfo->slot->m_version, nodePool->m_version);
                     }
+					nodeidx = get_node_index_by_nodeoid(asyncInfo->node);
+					destroy_slot(nodeidx, asyncInfo->node, asyncInfo->slot);
+					break;
                 }
                 
                 if (COMMAND_CONNECTION_WARM == asyncInfo->cmd)
@@ -6398,6 +6898,12 @@ static void pooler_sync_connections_to_nodepool(void)
                                      errmsg(POOL_MGR_PREFIX"get node %u name failed", connRsp->nodeoid)));
                         }
                         snprintf(nodePool->node_name, NAMEDATALEN, "%s", name_str);
+
+						nodePool->m_version = now;
+						elog(LOG,
+							"pooler_sync_connections_to_nodepool: nodePools of "
+							"node (%u, %s) is created.",
+							nodePool->nodeoid, nodePool->node_name);
                     }
 
                     /* add connection to hash table */
@@ -6446,14 +6952,12 @@ static void pooler_sync_connections_to_nodepool(void)
                             destroy_slot(connRsp->nodeindex, connRsp->nodeoid, slot);
                             if (PoolConnectDebugPrint)
                             {
-                                elog(LOG, POOL_MGR_PREFIX"destroy slot poolsize:%d, freeSize:%d, node:%u, MaxPoolSize:%d, connRsp->m_version:%d, nodePool->m_version:%d", 
+								elog(LOG, POOL_MGR_PREFIX"destroy slot poolsize:%d, "
+									"freeSize:%d, node:%u, MaxPoolSize:%d, "
+									"connRsp->m_version:%lu, nodePool->m_version:%lu",
                                                                                                                            nodePool->size, 
-                                                                                                                           nodePool->freeSize, 
-                                                                                                                           nodePool->nodeoid, 
-                                                                                                                           MaxPoolSize,
-                                                                                                                           connRsp->m_version,
-                                                                                                                           nodePool->m_version
-                                                                                                                           );
+									nodePool->freeSize, nodePool->nodeoid, MaxPoolSize,
+									connRsp->m_version, nodePool->m_version);
                             }
                         }
                                     
@@ -6643,7 +7147,7 @@ static void pooler_async_ping_node(Oid node)
 
 
 /* async batch connection build  */
-static bool pooler_async_build_connection(DatabasePool *pool, int32 pool_version, int32 nodeidx, Oid node, int32 size, char *connStr, bool bCoord)
+static bool pooler_async_build_connection(DatabasePool *pool, time_t pool_version, int32 nodeidx, Oid node, int32 size, char *connStr, bool bCoord)
 {
 	int32 threadid; 
 	uint64 pipeput_loops = 0;
@@ -6953,6 +7457,11 @@ preconnect_and_warm(DatabasePool *dbPool)
                          errmsg(POOL_MGR_PREFIX"get node %u name failed", dnOids[i])));
             }
             snprintf(nodePool->node_name, NAMEDATALEN, "%s", name_str);
+
+			nodePool->m_version = time(NULL);
+			elog(LOG,
+				"preconnect_and_warm: nodePools of node (%u, %s) is created.",
+				nodePool->nodeoid, nodePool->node_name);
         }
 
         while (nodePool->size < MinPoolSize || (nodePool->freeSize < MinFreeSize && nodePool->size < MaxPoolSize))
@@ -6986,24 +7495,24 @@ preconnect_and_warm(DatabasePool *dbPool)
                 return false;
             }
 
-            slot->xc_cancelConn = (NODE_CANCEL *) PQgetCancel((PGconn *)slot->conn);
-            
-            
-            /* Increase count of pool size */            
-            nodePool->slot[nodePool->freeSize] = slot;
-            
-            /* Insert at the end of the pool */
-            IncreasePoolerSize(nodePool, __FILE__, __LINE__);
-            IncreasePoolerFreesize(nodePool,__FILE__,__LINE__);
-            slot->released = time(NULL);
-            slot->checked  = slot->released;
-            slot->created  = slot->released;
-            slot->node_name = nodePool->node_name;
-            slot->backend_pid = ((PGconn *) slot->conn)->be_pid;
-            if (dbPool->oldest_idle == (time_t) 0)
-            {
-                dbPool->oldest_idle = slot->released;
-            }
+			slot->xc_cancelConn = (NODE_CANCEL *) PQgetCancel((PGconn *)slot->conn);
+			SetSockKeepAlive(((PGconn *)slot->conn)->sock);
+			
+			/* Increase count of pool size */			
+			nodePool->slot[nodePool->freeSize] = slot;
+			
+			/* Insert at the end of the pool */
+			IncreasePoolerSize(nodePool, __FILE__, __LINE__);
+			IncreasePoolerFreesize(nodePool,__FILE__,__LINE__);
+			slot->released = time(NULL);
+			slot->checked  = slot->released;
+			slot->created  = slot->released;
+			slot->node_name = nodePool->node_name;
+			slot->backend_pid = ((PGconn *) slot->conn)->be_pid;
+			if (dbPool->oldest_idle == (time_t) 0)
+			{
+				dbPool->oldest_idle = slot->released;
+			}
 
             if (PoolConnectDebugPrint)
             {
@@ -7062,55 +7571,56 @@ void *pooler_async_connection_management_thread(void *arg)
     PGXCPoolConnectReq  *request     = NULL;
     PGXCNodePoolSlot     *slot        = NULL;    
 
-    threadIndex = ((PGXCPoolConnThreadParam*)arg)->threadIndex;
-    while (1)
-    {
-        /* wait for signal */
-        ThreadSemaDown(&g_PoolConnControl.sem[threadIndex]);        
-        
-        /* create connect as needed */
-        request = (PGXCPoolConnectReq*)PipeGet(g_PoolConnControl.request[threadIndex]);
-        if (request)
-        {
-            /* record status of the task */
-            pooler_async_task_start(&g_PoolConnControl, threadIndex, request->nodeindex, NULL, InvalidOid, request->cmd);
-            
-            switch (request->cmd)
-            {
-                case COMMAND_CONNECTION_BUILD:
-                {
-                    for (i = 0; i < request->size; i++, request->validSize++)
-                    {            
-                        slot =  &request->slot[i]; 
-                        /* If connection fails, be sure that slot is destroyed cleanly */
-                        slot->xc_cancelConn = NULL;
+	threadIndex = ((PGXCPoolConnThreadParam*)arg)->threadIndex;
+	while (1)
+	{
+		/* wait for signal */
+		ThreadSemaDown(&g_PoolConnControl.sem[threadIndex]);		
+		
+		/* create connect as needed */
+		request = (PGXCPoolConnectReq*)PipeGet(g_PoolConnControl.request[threadIndex]);
+		if (request)
+		{
+			/* record status of the task */
+			pooler_async_task_start(&g_PoolConnControl, threadIndex, request->nodeindex, NULL, InvalidOid, request->cmd);
+			
+			switch (request->cmd)
+			{
+				case COMMAND_CONNECTION_BUILD:
+				{
+					for (i = 0; i < request->size; i++, request->validSize++)
+					{			
+						slot =  &request->slot[i]; 
+						/* If connection fails, be sure that slot is destroyed cleanly */
+						slot->xc_cancelConn = NULL;
 
-                        /* Establish connection */
-                        slot->conn = PGXCNodeConnectBarely(request->connstr);
-                        if (!PGXCNodeConnected(slot->conn))
-                        {        
-                            request->failed = true;
-                            break;
-                        }        
-                        slot->xc_cancelConn = (NODE_CANCEL *) PQgetCancel((PGconn *)slot->conn);
-                        slot->bwarmed       = false;
-                    }                    
-                    break;
-                }
+						/* Establish connection */
+						slot->conn = PGXCNodeConnectBarely(request->connstr);
+						if (!PGXCNodeConnected(slot->conn))
+						{		
+							request->failed = true;
+							break;
+						}		
+						slot->xc_cancelConn = (NODE_CANCEL *) PQgetCancel((PGconn *)slot->conn);
+						slot->bwarmed       = false;
+						SetSockKeepAlive(((PGconn *)slot->conn)->sock);
+					}					
+					break;
+				}
 
-                case COMMAND_CONNECTION_CLOSE:
-                {                    
-                    PQfreeCancel((PGcancel *)request->slot[0].xc_cancelConn);    
-                    PGXCNodeClose(request->slot[0].conn);
-                    break;    
-                }
+				case COMMAND_CONNECTION_CLOSE:
+				{					
+					PQfreeCancel((PGcancel *)request->slot[0].xc_cancelConn);	
+					PGXCNodeClose(request->slot[0].conn);
+					break;	
+				}
 
-                default:
-                {
-                    /* should never happen */
-                    abort();
-                }
-            }
+				default:
+				{
+					/* should never happen */
+					abort();
+				}
+			}
 
             /* clear the work status */
             pooler_async_task_done(&g_PoolConnControl, threadIndex);    
@@ -7349,42 +7859,54 @@ void *pooler_sync_remote_operator_thread(void *arg)
                                         PGXCNodeClose(slot->conn);
                                         slot->conn = NULL;
                                     }
-                                    request->current_status = PoolConnectStaus_error;
+									
+									finish_task_request(request->taskControl);
+									
+									if (request->taskControl->m_missing_ok)
+									{
+										request->current_status = PoolConnectStaus_done;
+										break;
+									}
+									else
+									{
+                                        request->current_status = PoolConnectStaus_error;
 #ifdef __TBASE__
-                                    SpinLockAcquire(&request->agent->port.lock);
-                                    request->agent->port.error_code = POOL_ERR_GET_CONNECTIONS_CONNECTION_BAD;
-                                    snprintf(request->agent->port.err_msg, POOL_ERR_MSG_LEN, "%s, connection info [%s]", poolErrorMsg[POOL_ERR_GET_CONNECTIONS_CONNECTION_BAD],
-                                        request->nodepool->connstr);
-                                    SpinLockRelease(&request->agent->port.lock);
+                                        SpinLockAcquire(&request->agent->port.lock);
+                                        request->agent->port.error_code = POOL_ERR_GET_CONNECTIONS_CONNECTION_BAD;
+                                        snprintf(request->agent->port.err_msg, POOL_ERR_MSG_LEN, "%s, connection info [%s]", poolErrorMsg[POOL_ERR_GET_CONNECTIONS_CONNECTION_BAD],
+                                            request->nodepool->connstr);
+                                        SpinLockRelease(&request->agent->port.lock);
 #endif
-                                    set_task_status(request->taskControl, PoolAyncCtlStaus_error);        
-                                    finish_task_request(request->taskControl);
-                                    break;
-                                }                
+                                        set_task_status(request->taskControl, PoolAyncCtlStaus_error);		
+                                        pooler_thread_logger(LOG, "connection not connect for node:[%s] failed errno %d", request->nodepool->connstr, errno);
+                                        break;
+								    }				
+								}				
 
-                                slot->xc_cancelConn = (NODE_CANCEL *) PQgetCancel((PGconn *)slot->conn);
-                                slot->bwarmed       = false;
-                                
-                                /* set the time flags */
-                                slot->released = time(NULL);
-                                slot->checked  = slot->released;
-                                slot->created  = slot->released;
-                                
-                                /* increase usecount */
-                                slot->usecount++;
-                                slot->node_name = request->nodepool->node_name;
-                                slot->backend_pid = ((PGconn *) slot->conn)->be_pid;
-                                if (request->bCoord)
-                                {
-                                    request->agent->coord_connections[request->nodeindex] = slot;
-                                }
-                                else
-                                {
-                                    request->agent->dn_connections[request->nodeindex]       = slot;
-                                }
-                                request->current_status = PoolConnectStaus_connected;    
-#ifdef _POOLER_CHECK_                                
-                                snprintf(request->errmsg, POOLER_ERROR_MSG_LEN, "parallel connect thread build connection to node:%s backend_pid:%d nodeidx:%d succeed", slot->node_name, slot->backend_pid, request->nodeindex);
+								slot->xc_cancelConn = (NODE_CANCEL *) PQgetCancel((PGconn *)slot->conn);
+								slot->bwarmed       = false;
+								SetSockKeepAlive(((PGconn *)slot->conn)->sock);
+								
+								/* set the time flags */
+								slot->released = time(NULL);
+								slot->checked  = slot->released;
+								slot->created  = slot->released;
+								
+								/* increase usecount */
+								slot->usecount++;
+								slot->node_name = request->nodepool->node_name;
+								slot->backend_pid = ((PGconn *) slot->conn)->be_pid;
+								if (request->bCoord)
+								{
+									request->agent->coord_connections[request->nodeindex] = slot;
+								}
+								else
+								{
+									request->agent->dn_connections[request->nodeindex] 	  = slot;
+								}
+								request->current_status = PoolConnectStaus_connected;	
+#ifdef _POOLER_CHECK_								
+								snprintf(request->errmsg, POOLER_ERROR_MSG_LEN, "parallel connect thread build connection to node:%s backend_pid:%d nodeidx:%d succeed", slot->node_name, slot->backend_pid, request->nodeindex);
 #endif
                                 continue;
                             }
@@ -7393,8 +7915,9 @@ void *pooler_sync_remote_operator_thread(void *arg)
                             {
                                 if (PoolConnectStaus_connected == request->final_status)
                                 {
-                                    finish_task_request(request->taskControl);
+								    /* Increase success count first and then finish count */
                                     acquire_command_increase_succeed(request->taskControl);
+									finish_task_request(request->taskControl);
                                     request->current_status = PoolConnectStaus_done;
                                 }
                                 else
@@ -7479,8 +8002,9 @@ void *pooler_sync_remote_operator_thread(void *arg)
                                     {
                                         /* job succeed */
                                         request->current_status = PoolConnectStaus_done;
-                                        finish_task_request(request->taskControl);    
+                                        /* Increase success count first and then finish count */
                                         acquire_command_increase_succeed(request->taskControl);
+										finish_task_request(request->taskControl);
                                     }
                                 }                                                            
                                 continue;
@@ -7496,9 +8020,10 @@ void *pooler_sync_remote_operator_thread(void *arg)
                             {
                                 int32                ret2    = 0;
                                                 
+                                /* Increase success count first and then finish count */
+                                acquire_command_increase_succeed(request->taskControl);
                                 /* set myself finish count */
                                 finish_task_request(request->taskControl);
-                                acquire_command_increase_succeed(request->taskControl);
                                 
                                 /* wait for others to finish */    
                                 while (!check_is_task_done(request->taskControl))
@@ -7549,6 +8074,12 @@ void *pooler_sync_remote_operator_thread(void *arg)
 #endif
                                             node_number++;
                                         }
+										else if (request->taskControl->m_missing_ok)
+										{
+											request->taskControl->m_result[node_number] = 0;
+											request->taskControl->m_pidresult[node_number] = 0;
+											node_number++;
+										}
                                     }
 
                                     /* Save then in the array fds for Coordinators */
@@ -7565,6 +8096,12 @@ void *pooler_sync_remote_operator_thread(void *arg)
 #endif
                                             node_number++;
                                         }
+										else
+										{
+											request->taskControl->m_result[node_number] = 0;
+											request->taskControl->m_pidresult[node_number] = 0;
+											node_number++;
+										}
                                     }                
 
 #ifdef     _POOLER_CHECK_    
@@ -7845,6 +8382,11 @@ void *pooler_sync_remote_operator_thread(void *arg)
             {
                 gettimeofday(&request->end_time, NULL);        
             }
+
+            if (request->cmd_start_time != 0)
+            {
+                request->cmd_end_time = get_system_time();
+            }
             
             /* clear task status */
             pooler_async_task_done(&g_PoolSyncNetworkControl, threadIndex);            
@@ -7877,13 +8419,18 @@ void *pooler_async_utility_thread(void *arg)
                 case COMMAND_CONNECTION_WARM:
                 {
                     CommandId commandID = InvalidCommandId;
-                    ret = PGXCNodeSendSetQuery((NODE_CONNECTION *)pWarmInfo->slot->conn, "set warm_shared_buffer to true;", NULL, 0, &pWarmInfo->set_query_status, &commandID);
+
+					ret = PGXCNodeSendSetQuery(
+						(NODE_CONNECTION *) pWarmInfo->slot->conn,
+						"set warm_shared_buffer to true;",
+						NULL,
+						0,
+						&pWarmInfo->set_query_status, &commandID);
                     /* only set warm flag when warm succeed */
                     if (0 == ret)
                     {
                         pWarmInfo->slot->bwarmed = true;                    
                     }
-                    
                 }
                 break;
                 
@@ -7891,14 +8438,44 @@ void *pooler_async_utility_thread(void *arg)
                 {
                     int   mbytes = 0;
                     char *size = NULL;
-                    size = PGXCNodeSendShowQuery((NODE_CONNECTION *)pWarmInfo->slot->conn, "show session_memory_size;");
+					CommandId commandID = InvalidCommandId;
+
+					(void) PGXCNodeSendSetQuery(
+						(NODE_CONNECTION *) pWarmInfo->slot->conn,
+						"set remotetype to application;",
+						NULL,
+						0,
+						&pWarmInfo->set_query_status, &commandID);
+
+					size = PGXCNodeSendShowQuery(
+						(NODE_CONNECTION *) pWarmInfo->slot->conn,
+						"show session_memory_size;");
                     pWarmInfo->cmd = COMMAND_JUDGE_CONNECTION_MEMSIZE;
                     mbytes = atoi(size);
-                    if (mbytes >= PoolMaxMemoryLimit)
+					if (PoolMaxMemoryLimit > 0 && mbytes >= PoolMaxMemoryLimit)
                     {
                         pWarmInfo->cmd = COMMAND_CONNECTION_NEED_CLOSE;
                     }
                     pWarmInfo->size = mbytes;
+
+					if (IS_PGXC_COORDINATOR)
+					{
+						(void) PGXCNodeSendSetQuery(
+							(NODE_CONNECTION *) pWarmInfo->slot->conn,
+							"set remotetype to coordinator;",
+							NULL,
+							0,
+							&pWarmInfo->set_query_status, &commandID);
+					}
+					else
+					{
+						(void) PGXCNodeSendSetQuery(
+							(NODE_CONNECTION *) pWarmInfo->slot->conn,
+							"set remotetype to datanode;",
+							NULL,
+							0,
+							&pWarmInfo->set_query_status, &commandID);
+					}
                 }
                 break;
 
@@ -8032,6 +8609,9 @@ static inline bool dispatch_connection_request(PGXCASyncTaskCtl  *taskControl,
         
         /* use version to tag every slot */
         slot->m_version = nodepool->m_version;    
+		slot->created = time(NULL);
+		slot->checked = slot->created;
+		slot->released = slot->created;
     }
 
 
@@ -8040,9 +8620,12 @@ static inline bool dispatch_connection_request(PGXCASyncTaskCtl  *taskControl,
     {
         taskControl->m_status     = PoolAyncCtlStaus_dispatched;
 
-        /* also use this request to response to session*/
-        req->final_status         = PoolConnectStaus_destory;
-    }        
+		/* also use this request to response to session*/
+		req->final_status         = PoolConnectStaus_destory;
+
+		/* if last request, transfer cmd_start_time to req */
+        req->cmd_start_time       = agent->cmd_start_time;
+	}
 
     if (PoolConnectDebugPrint)
     {
@@ -8078,8 +8661,16 @@ static inline bool dispatch_connection_request(PGXCASyncTaskCtl  *taskControl,
         snprintf(agent->port.err_msg, POOL_ERR_MSG_LEN, "%s", poolErrorMsg[agent->port.error_code]);
         SpinLockRelease(&agent->port.lock);
 #endif
+	}
+    else
+    {
+        if (dispatched)
+        {
+            /* dispatch success, clear cmd start time in agent */
+            agent->cmd_start_time = 0;
+        }
     }
-    return ret;
+	return ret;
 }
 
 
@@ -8113,31 +8704,43 @@ static inline bool dispatch_local_set_request(PGXCASyncTaskCtl  *taskControl,
     {
         taskControl->m_status     = PoolAyncCtlStaus_dispatched;
 
-        /* also use this request to response to session*/
-        req->final_status         = PoolLocalSetStatus_destory;
-        req->current_status          = PoolLocalSetStatus_destory;
-    }    
-    
+		/* also use this request to response to session*/
+		req->final_status         = PoolLocalSetStatus_destory;
+		req->current_status    	  = PoolLocalSetStatus_destory;
+
+        /* if last request, transfer cmd_start_time to req */
+        req->cmd_start_time       = agent->cmd_start_time;
+	}	
+	
 
     if (PoolConnectDebugPrint)
     {
         elog(LOG, POOL_MGR_PREFIX"pid:%d dispatch async local set nodeindex:%d connection, current status:%d final status:%d", agent->pid, nodeindex, req->current_status, req->final_status);
     }
 
-    if (dispatched)
+	if (dispatched)
+	{
+		if (PoolConnectDebugPrint)
+		{
+			elog(LOG, POOL_MGR_PREFIX"pid:%d dispatch last local set request!! nodeindex:%d connection, current status:%d final status:%d request_num:%d", agent->pid, nodeindex, req->current_status, req->final_status, taskControl->m_mumber_total);
+		}
+	}
+	ret = dispatch_async_network_operation(req);
+	if (!ret)
+	{
+		elog(LOG, POOL_MGR_PREFIX"pid:%d dispatch async local set request failed!! nodeindex:%d connection, current status:%d final status:%d request_num:%d", agent->pid, nodeindex, req->current_status, req->final_status, taskControl->m_mumber_total);		
+		pfree(req);
+	}
+    else
     {
-        if (PoolConnectDebugPrint)
+        if (dispatched)
         {
-            elog(LOG, POOL_MGR_PREFIX"pid:%d dispatch last local set request!! nodeindex:%d connection, current status:%d final status:%d request_num:%d", agent->pid, nodeindex, req->current_status, req->final_status, taskControl->m_mumber_total);
+            /* dispatch success, clear cmd start time in agent */
+            agent->cmd_start_time = 0;
         }
     }
-    ret = dispatch_async_network_operation(req);
-    if (!ret)
-    {
-        elog(LOG, POOL_MGR_PREFIX"pid:%d dispatch async local set request failed!! nodeindex:%d connection, current status:%d final status:%d request_num:%d", agent->pid, nodeindex, req->current_status, req->final_status, taskControl->m_mumber_total);        
-        pfree(req);
-    }
-    return ret;
+
+	return ret;
 }
 
 static inline bool dispatch_set_command_request(PGXCASyncTaskCtl  *taskControl,
@@ -8180,10 +8783,13 @@ static inline bool dispatch_set_command_request(PGXCASyncTaskCtl  *taskControl,
     {
         taskControl->m_status     = PoolAyncCtlStaus_dispatched;
 
-        /* also use this request to response to session*/
-        req->final_status         = PoolSetCommandStatus_destory;
-        req->current_status       = PoolSetCommandStatus_destory;
-    }    
+		/* also use this request to response to session*/
+		req->final_status         = PoolSetCommandStatus_destory;
+		req->current_status       = PoolSetCommandStatus_destory;
+
+        /* if last request, transfer cmd_start_time to req */
+        req->cmd_start_time       = agent->cmd_start_time;
+	}	
 
     if (PoolConnectDebugPrint)
     {
@@ -8204,14 +8810,22 @@ static inline bool dispatch_set_command_request(PGXCASyncTaskCtl  *taskControl,
         }
     }
 
-    ret = dispatch_async_network_operation(req); 
-    if (!ret)
+	ret = dispatch_async_network_operation(req); 
+	if (!ret)
+	{
+		if (slot)
+		{
+			elog(LOG, POOL_MGR_PREFIX"pid:%d dispatch async set command request failed!! nodeindex:%d connection nodename:%s backend_pid:%d current status:%d final status:%d request_num:%d command:%s", agent->pid, nodeindex, slot->node_name, slot->backend_pid, req->current_status, req->final_status, taskControl->m_mumber_total, taskControl->m_command);		
+		}
+		pfree(req);
+	}
+    else
     {
-        if (slot)
+        if (dispatched)
         {
-            elog(LOG, POOL_MGR_PREFIX"pid:%d dispatch async set command request failed!! nodeindex:%d connection nodename:%s backend_pid:%d current status:%d final status:%d request_num:%d command:%s", agent->pid, nodeindex, slot->node_name, slot->backend_pid, req->current_status, req->final_status, taskControl->m_mumber_total, taskControl->m_command);        
+            /* dispatch success, clear cmd start time in agent */
+            agent->cmd_start_time = 0;
         }
-        pfree(req);
     }
 
     if (PoolConnectDebugPrint)
@@ -8265,34 +8879,37 @@ static inline bool dispatch_cancle_request(PGXCASyncTaskCtl  *taskControl,
     {
         taskControl->m_status     = PoolAyncCtlStaus_dispatched;
 
-        /* use this request to response to session*/
-        req->current_status          = PoolCancelStatus_destory;
-        req->final_status            = PoolCancelStatus_destory;
-    }
-    
-    if (bCoord)
-    {
-        slot = agent->coord_connections[nodeindex];
-        
-    }
-    else
-    {
-        slot = agent->dn_connections[nodeindex];
-    }
-                            
-    if (PoolConnectDebugPrint)
-    {
-        if (slot)
-        {
-            elog(LOG, POOL_MGR_PREFIX"pid:%d dispatch async CANCLE_QUERY nodeindex:%d connection, nodename:%s backend_pid:%d current status:%d final status:%d", 
-                                                                                                            agent->pid, 
-                                                                                                            nodeindex, 
-                                                                                                            slot->node_name, 
-                                                                                                            slot->backend_pid, 
-                                                                                                            req->current_status, 
-                                                                                                            req->final_status);
-        }
-    }
+		/* use this request to response to session*/
+		req->current_status    	  = PoolCancelStatus_destory;
+		req->final_status      	  = PoolCancelStatus_destory;
+
+        /* if last request, transfer cmd_start_time to req */
+        req->cmd_start_time       = agent->cmd_start_time;
+	}
+	
+	if (bCoord)
+	{
+		slot = agent->coord_connections[nodeindex];
+		
+	}
+	else
+	{
+		slot = agent->dn_connections[nodeindex];
+	}
+							
+	if (PoolConnectDebugPrint)
+	{
+		if (slot)
+		{
+			elog(LOG, POOL_MGR_PREFIX"pid:%d dispatch async CANCLE_QUERY nodeindex:%d connection, nodename:%s backend_pid:%d current status:%d final status:%d", 
+																										    agent->pid, 
+																										    nodeindex, 
+																										    slot->node_name, 
+																										    slot->backend_pid, 
+																										    req->current_status, 
+																										    req->final_status);
+		}
+	}
 
     if (dispatched)
     {
@@ -8333,8 +8950,17 @@ static inline bool dispatch_cancle_request(PGXCASyncTaskCtl  *taskControl,
         snprintf(agent->port.err_msg, POOL_ERR_MSG_LEN, "%s", poolErrorMsg[agent->port.error_code]);
         SpinLockRelease(&agent->port.lock);
 #endif
+	}
+    else
+    {
+        if (dispatched)
+        {
+            /* dispatch success, clear cmd start time in agent */
+            agent->cmd_start_time = 0;
+        }
     }
-    return ret;
+
+	return ret;
 }
 
 
@@ -8475,7 +9101,8 @@ static inline bool get_acquire_success_status(PGXCASyncTaskCtl  *taskControl)
 {        
     bool bsucceed;
     SpinLockAcquire(&taskControl->m_lock);
-    bsucceed = taskControl->m_number_done == taskControl->m_number_succeed;
+	bsucceed = taskControl->m_number_done == taskControl->m_number_succeed ||
+	           taskControl->m_missing_ok;
     SpinLockRelease(&taskControl->m_lock);
     return bsucceed;
 }
@@ -9449,7 +10076,7 @@ static void print_pooler_slot(PGXCNodePoolSlot  *slot)
     }
     else
     {
-        elog(LOG, "slot=%p bwarmed=%d usecount=%d refcount=%d m_version=%d pid=%d seqnum=%d "
+		elog(LOG, "slot=%p bwarmed=%d usecount=%d refcount=%d m_version=%lu pid=%d seqnum=%d "
                   "bdestoryed=%d file=%s lineno=%d node_name=%s backend_pid=%d",
                   slot, slot->bwarmed,
                   slot->usecount, slot->refcount,slot->m_version,slot->pid,slot->seqnum,
@@ -9623,19 +10250,19 @@ TryPingUnhealthyNode(Oid nodeoid)
 void
 PoolPingNodeRecheck(Oid nodeoid)
 {
-    int status;
-    NodeDefinition *nodeDef;
-    char connstr[MAXPGPATH * 2 + 256];
-    bool    healthy;
-    const char *username = NULL;
-    char *errstr = NULL;
+	int status;
+	NodeDefinition *nodeDef;
+	char connstr[MAXPGPATH * 2 + 256];
+	bool	healthy;
+	const char *username = NULL;
+	char *errstr = NULL;
 
-    username = get_user_name(&errstr);
-    if (errstr != NULL)
-    {
-        elog(WARNING, "Could not get current username errmsg: %s", errstr);
-        return;
-    }
+	username = get_user_name(&errstr);
+	if (errstr != NULL)
+	{
+		elog(WARNING, "Could not get current username errmsg: %s", errstr);
+		return;
+	}
 
     nodeDef = PgxcNodeGetDefinition(nodeoid);
     if (nodeDef == NULL)
@@ -10029,6 +10656,7 @@ handle_get_connections(PoolAgent * agent, StringInfo s)
     List   *datanodelist = NIL;
     List   *coordlist = NIL;
     int     connect_num = 0;
+	bool    raise_error = true;
     /*
      * Length of message is caused by:
      * - Message header = 4bytes
@@ -10036,10 +10664,11 @@ handle_get_connections(PoolAgent * agent, StringInfo s)
      * - List of Coordinators = NumPoolCoords * 4bytes (max)
      * - Number of Datanodes sent = 4bytes
      * - Number of Coordinators sent = 4bytes
+	 * - Raise error flag = 1byte
      * It is better to send in a same message the list of Co and Dn at the same
      * time, this permits to reduce interactions between postmaster and pooler
      */
-    pool_getmessage(&agent->port, s, 4 * agent->num_dn_connections + 4 * agent->num_coord_connections + 12);
+	pool_getmessage(&agent->port, s, 4 * agent->num_dn_connections + 4 * agent->num_coord_connections + 13);
     datanodecount = pq_getmsgint(s, 4);
     for (i = 0; i < datanodecount; i++)
     {
@@ -10061,6 +10690,8 @@ handle_get_connections(PoolAgent * agent, StringInfo s)
     {
         elog(LOG, POOL_MGR_PREFIX"backend required %d coordinator connections, pid:%d", coordcount, agent->pid);
     }
+	
+	raise_error = pq_getmsgbyte(s);
     pq_getmsgend(s);
 
     if(!is_pool_locked)
@@ -10070,7 +10701,7 @@ handle_get_connections(PoolAgent * agent, StringInfo s)
          * In case of error agent_acquire_connections will log
          * the error and return -1
          */
-        ret = agent_acquire_connections(agent, datanodelist, coordlist, &connect_num, &fds, &pids);
+		ret = agent_acquire_connections(agent, datanodelist, coordlist, raise_error, &connect_num, &fds, &pids);
         /* async acquire connection will be done in parallel threads */
         if (0 == ret && fds && pids)
         {
@@ -10273,65 +10904,6 @@ handle_session_command(PoolAgent * agent, StringInfo s)
 }
 
 
-
-static bool
-remove_all_agent_references(Oid nodeoid)
-{// #lizard forgives
-    int i, j;
-    bool res = true;
-
-    /*
-     * Identify if it's a coordinator or datanode first
-     * and get its index
-     */
-    for (i = 1; i <= agentCount; i++)
-    {
-        bool found = false;
-
-        PoolAgent *agent = poolAgents[i - 1];
-        for (j = 0; j < agent->num_dn_connections; j++)
-        {
-            if (agent->dn_conn_oids[j] == nodeoid)
-            {
-                found = true;
-                break;
-            }
-        }
-        if (found)
-        {
-            PGXCNodePoolSlot *slot = agent->dn_connections[j];
-            if (slot)
-                release_connection(agent->pool, slot, j, agent->dn_conn_oids[j], false, false);
-            agent->dn_connections[j] = NULL;
-        }
-        else
-        {
-            for (j = 0; j < agent->num_coord_connections; j++)
-            {
-                if (agent->coord_conn_oids[j] == nodeoid)
-                {
-                    found = true;
-                    break;
-                }
-            }
-            if (found)
-            {
-                PGXCNodePoolSlot *slot = agent->coord_connections[j];
-                if (slot)
-                    release_connection(agent->pool, slot, j, agent->coord_conn_oids[j], true, true);
-                agent->coord_connections[j] = NULL;
-            }
-            else
-            {
-                elog(LOG, "Node not found! (%u)", nodeoid);
-                res = false;
-            }
-        }
-    }
-    return res;
-}
-
-
 /*
  * refresh_database_pools
  *        refresh information for all database pools
@@ -10404,22 +10976,44 @@ refresh_database_pools(PoolAgent *agent)
 
             if (strcmp(connstr_chk, nodePool->connstr))
             {
-                elog(LOG, "Found an altered node (%u)", nodePool->nodeoid);
-                /*
-                 * Node has been altered. First remove
-                 * all references to this node from ALL the
-                 * agents before destroying it..
-                 */
-                if (!remove_all_agent_references(nodePool->nodeoid))
+				if (nodePool->size == nodePool->freeSize)
                 {
-                    res = POOL_REFRESH_FAILED;
-                    break;
-                }
-
+					elog(LOG,
+						"refresh_database_pools: Found an altered node (%u %s) "
+						"size %d freesize %d is removed. "
+						"connstr_chk=%s, nodePool->connstr=%s",
+						nodePool->nodeoid, nodePool->node_name,
+						nodePool->size, nodePool->freeSize,
+						connstr_chk, nodePool->connstr);
                 destroy_node_pool(nodePool);
                 hash_search(databasePool->nodePools, &nodePool->nodeoid,
                             HASH_REMOVE, NULL);
             }
+				else
+				{
+					destroy_node_pool_free_slots(nodePool);
+
+					/* increase the node pool version */
+					nodePool->m_version = time(NULL);
+					elog(LOG,
+						"refresh_database_pools: Found an altered node (%u %s) "
+						"size %d freesize %d increased m_version %lu"
+						"connstr_chk=%s, nodePool->connstr=%s",
+						nodePool->nodeoid, nodePool->node_name,
+						nodePool->size, nodePool->freeSize, nodePool->m_version,
+						connstr_chk, nodePool->connstr);
+
+					/* fresh the connect string so that new coming connection will connect to the new node  */
+					if (connstr_chk)
+					{
+						if (nodePool->connstr)
+						{
+							pfree(nodePool->connstr);
+						}
+						nodePool->connstr = pstrdup(connstr_chk);
+					}
+				}
+			}
 
             if (connstr_chk)
                 pfree(connstr_chk);
@@ -10458,11 +11052,11 @@ PoolManagerRefreshConnectionInfo(void)
     HOLD_POOLER_RELOAD();
 
     Assert(poolHandle);
-    PgxcNodeListAndCount();
+	PgxcNodeListAndCountWrapTransaction();
     pool_putmessage(&poolHandle->port, 'R', NULL, 0);
     pool_flush(&poolHandle->port);
 
-    res = pool_recvres(&poolHandle->port);
+	res = pool_recvres(&poolHandle->port, true);
 
     RESUME_POOLER_RELOAD();
 
@@ -10661,9 +11255,9 @@ PoolManagerClosePooledConnections(const char *dbname, const char *username)
 
     pool_flush(&poolHandle->port);
 
-    /* Then Get back Pids from Pooler */
-    res = pool_recvres(&poolHandle->port);
-    elog(LOG, "PoolManagerClosePooledConnections res:%d", res);
+	/* Then Get back Pids from Pooler */
+	res = pool_recvres(&poolHandle->port, true);
+	elog(LOG, "PoolManagerClosePooledConnections res:%d", res);
 
     RESUME_POOLER_RELOAD();
 
@@ -10710,7 +11304,7 @@ handle_close_pooled_connections(PoolAgent * agent, StringInfo s)
                 destroy_node_pool_free_slots(nodePool);
 
                 /* increase the node pool version */
-                nodePool->m_version++;    
+				nodePool->m_version = time(NULL);
             }
         }
 
@@ -10758,3 +11352,203 @@ ConnectPoolManager(void)
 
 }
 #endif
+
+/*
+ * init pooler command statistics
+ */
+static void
+init_pooler_cmd_statistics(void)
+{
+    int i = 0;
+    memset(g_qtype2id, -1, sizeof(g_qtype2id));
+
+    /* init type to id map */
+    for (i = 0; i < POOLER_CMD_COUNT; i++)
+    {
+        g_qtype2id[g_pooler_cmd[i]] = i;
+    }
+
+    /* init global statistics array */
+    g_pooler_cmd_stat = (PoolerCmdStatistics*) palloc(POOLER_CMD_COUNT * sizeof(PoolerCmdStatistics));
+    for (i = 0; i < POOLER_CMD_COUNT; i++)
+    {
+        g_pooler_cmd_stat[i].total_request_times = 0;
+        g_pooler_cmd_stat[i].total_costtime = 0;
+        g_pooler_cmd_stat[i].max_costtime = 0;
+        g_pooler_cmd_stat[i].min_costtime = MAX_UINT64;
+    }
+}
+
+/*
+ * reset pooler command statistics
+ */
+static void
+reset_pooler_cmd_statistics(void)
+{
+    int i = 0;
+    /* reset global statistics array */
+    for (i = 0; i < POOLER_CMD_COUNT; i++)
+    {
+        g_pooler_cmd_stat[i].total_request_times = 0;
+        g_pooler_cmd_stat[i].total_costtime = 0;
+        g_pooler_cmd_stat[i].max_costtime = 0;
+        g_pooler_cmd_stat[i].min_costtime = MAX_UINT64;
+    }
+}
+
+/*
+ * update pooler command statistics info
+ */
+static void
+update_pooler_cmd_statistics(unsigned char qtype, uint64 costtime)
+{
+    uint8 id = g_qtype2id[qtype];
+    if (id == MAX_UINT8)
+    {
+        return;
+    }
+
+    g_pooler_cmd_stat[id].total_request_times += 1;
+    g_pooler_cmd_stat[id].total_costtime += costtime;
+
+    if (costtime > g_pooler_cmd_stat[id].max_costtime)
+    {
+        g_pooler_cmd_stat[id].max_costtime = costtime;
+    }
+
+    if (costtime < g_pooler_cmd_stat[id].min_costtime)
+    {
+        g_pooler_cmd_stat[id].min_costtime = costtime;
+    }
+}
+
+/*
+ * handle get command statistics
+ */
+static void
+handle_get_cmd_statistics(PoolAgent *agent)
+{
+    int    i = 0;
+    uint64 n64 = 0;
+    char   msgtype = 'x';
+
+    /* response message type */
+    pool_putbytes(&agent->port, &msgtype, 1);
+
+    /* fixed length command statistics info */
+    for (i = 0; i < POOLER_CMD_COUNT; i++)
+    {
+        n64 = htobe64(g_pooler_cmd_stat[i].total_request_times);
+        pool_putbytes(&agent->port, (char *) &n64, sizeof(n64));
+
+        n64 = htobe64(g_pooler_cmd_stat[i].total_costtime);
+        pool_putbytes(&agent->port, (char *) &n64, sizeof(n64));
+
+        n64 = htobe64(g_pooler_cmd_stat[i].max_costtime);
+        pool_putbytes(&agent->port, (char *) &n64, sizeof(n64));
+
+        n64 = htobe64(g_pooler_cmd_stat[i].min_costtime);
+        pool_putbytes(&agent->port, (char *) &n64, sizeof(n64));
+    }
+
+    pool_flush(&agent->port);
+}
+
+/*
+ * handle get connections statistics
+ */
+static void
+handle_get_conn_statistics(PoolAgent *agent)
+{
+    DatabasePool     *database_pool = databasePools;
+    HASH_SEQ_STATUS  hseq_status;
+    PGXCNodePool     *node_pool = NULL;
+
+    uint32           node_cnt = 0;         /* the nodes count use the same database and username */
+    uint32           total_node_cnt = 0;   /* total nodes count */
+
+    /* var offset in buf */
+    uint32           node_cnt_offset = 0;
+    uint32           total_node_cnt_offset = 0;
+
+    uint32           exceed_keepalive_cnt = 0;
+    uint32           exceed_maxlifetime_cnt = 0;
+    int              i = 0;
+    PGXCNodePoolSlot *slot = NULL;
+    time_t           now = time(NULL);
+    StringInfoData   buf;
+
+    initStringInfo(&buf);
+    /* reserve a place for total_node_cnt, record the offset of total_node_cnt */
+    total_node_cnt_offset = buf.len;
+    pq_sendint(&buf, total_node_cnt, sizeof(uint32));
+
+    /* total node count | database | username | node count in the same database and username | node pool conn statistics | ... | database | username | ... */
+    while (database_pool)
+    {
+        pq_sendstring(&buf, database_pool->database);
+        pq_sendstring(&buf, database_pool->user_name);
+
+        /* reserve a place for node_cnt, record the offset of node_cnt */
+        node_cnt = 0;
+        node_cnt_offset = buf.len;
+        pq_sendint(&buf, node_cnt, sizeof(uint32));
+
+        /* traverse all node_pool in hashtable */
+        hash_seq_init(&hseq_status, database_pool->nodePools);
+        while ((node_pool = (PGXCNodePool *) hash_seq_search(&hseq_status)))
+        {
+            node_cnt++;
+
+            pq_sendstring(&buf, node_pool->node_name);
+            pq_sendint(&buf, node_pool->nodeoid, sizeof(Oid));
+            pq_sendint(&buf, node_pool->coord, sizeof(bool));
+            pq_sendint(&buf, node_pool->size, sizeof(uint32));
+            pq_sendint(&buf, node_pool->freeSize, sizeof(uint32));
+            pq_sendint(&buf, node_pool->nwarming, sizeof(uint32));
+            pq_sendint(&buf, node_pool->nquery, sizeof(uint32));
+
+            /* reset statistics count */
+            exceed_keepalive_cnt = 0;
+            exceed_maxlifetime_cnt = 0;
+            /* statistical connection life cycle */
+            if (node_pool->slot)
+            {
+                for (i = 0; i < node_pool->freeSize; i++)
+                {
+                    slot = node_pool->slot[i];
+                    if (difftime(now, slot->released) > PoolConnKeepAlive)
+                    {
+                        exceed_keepalive_cnt++;
+                    }
+
+                    if (difftime(now, slot->created) >= PoolConnMaxLifetime)
+                    {
+                        exceed_maxlifetime_cnt++;
+                    }
+                }
+            }
+
+            pq_sendint(&buf, exceed_keepalive_cnt, sizeof(uint32));
+            pq_sendint(&buf, exceed_maxlifetime_cnt, sizeof(uint32));
+        }
+
+
+        total_node_cnt += node_cnt;
+
+        /* change the nodes count in message buff */
+        node_cnt = htonl(node_cnt);
+        pq_updatemsgbytes(&buf, node_cnt_offset, (char*) &node_cnt, sizeof(uint32));
+        database_pool = database_pool->next;
+    }
+
+    /* change the total nodes count in message buff */
+    total_node_cnt = htonl(total_node_cnt);
+    pq_updatemsgbytes(&buf, total_node_cnt_offset, (char*) &total_node_cnt, sizeof(uint32));
+
+    /* send messages */
+    pool_putmessage(&agent->port, 'z', buf.data, buf.len);
+    pool_flush(&agent->port);
+
+    pfree(buf.data);
+}

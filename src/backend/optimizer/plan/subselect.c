@@ -98,6 +98,7 @@
 #include "pgxc/pgxc.h"
 #endif
 #ifdef __TBASE__
+#include <math.h>
 #include "nodes/pg_list.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_func.h"
@@ -126,6 +127,14 @@ typedef struct finalize_primnode_context
     Bitmapset  *paramids;        /* Non-local PARAM_EXEC paramids found */
 } finalize_primnode_context;
 
+typedef struct inline_cte_walker_context
+{
+	const char *ctename;		/* name and relative level of target CTE */
+	int			levelsup;
+	int			refcount;		/* number of remaining references */
+	Query	   *ctequery;		/* query to substitute */
+} inline_cte_walker_context;
+
 
 static Node *build_subplan(PlannerInfo *root, Plan *plan, PlannerInfo *subroot,
               List *plan_params,
@@ -143,7 +152,18 @@ static Node *convert_testexpr_mutator(Node *node,
                          convert_testexpr_context *context);
 static bool subplan_is_hashable(Plan *plan);
 static bool testexpr_is_hashable(Node *testexpr);
+#ifdef __TBASE__
+static Node *convert_joinqual_to_antiqual(Node* node, Query* parse);
+static Node *convert_opexpr_to_boolexpr_for_antijoin(Node* node, Query* parse);
+static bool var_is_nullable(Node *node, Query *parse);
+#endif
 static bool hash_ok_operator(OpExpr *expr);
+static bool contain_dml(Node *node);
+static bool contain_dml_walker(Node *node, void *context);
+static bool contain_outer_selfref(Node *node);
+static bool contain_outer_selfref_walker(Node *node, Index *depth);
+static void inline_cte(PlannerInfo *root, CommonTableExpr *cte);
+static bool inline_cte_walker(Node *node, inline_cte_walker_context *context);
 static bool simplify_EXISTS_query(PlannerInfo *root, Query *query);
 static Query *convert_EXISTS_to_ANY(PlannerInfo *root, Query *subselect,
                       Node **testexpr, List **paramIds);
@@ -158,8 +178,12 @@ static bool finalize_primnode(Node *node, finalize_primnode_context *context);
 static bool finalize_agg_primnode(Node *node, finalize_primnode_context *context);
 
 #ifdef __TBASE__
-static Expr * convert_OR_EXIST_sublink_to_join(PlannerInfo *root, SubLink *sublink, Node **jtlink);
-static Node * get_or_exist_subquery_targetlist(PlannerInfo *root, Node *node,List **targetList, List **joinClause, int *next_attno);
+static Expr * convert_OR_EXIST_sublink_to_join(PlannerInfo *root,
+			  SubLink *sublink, Node **jtlink);
+static Node * get_or_exist_subquery_targetlist(PlannerInfo *root, Node *node,
+			  List **targetList, List **joinClause, int *next_attno);
+static bool is_simple_subquery(Query *subquery, JoinExpr *lowest_outer_join,
+			  bool deletion_ok);
 #endif
 /*
  * Select a PARAM_EXEC number to identify the given Var as a parameter for
@@ -523,6 +547,140 @@ get_first_col_type(Plan *plan, Oid *coltype, int32 *coltypmod,
     *coltypmod = -1;
     *colcollation = InvalidOid;
 }
+
+#ifdef __TBASE__
+/*
+ * Check if there is a range table entry of type func expr whose arguments
+ * are correlated
+ */
+bool
+has_correlation_in_funcexpr_rte(List *rtable)
+{
+	/*
+	 * check if correlation occurs in a func expr in the from clause of the
+	 * subselect
+	 */
+	ListCell   *lc_rte;
+
+	foreach(lc_rte, rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc_rte);
+
+		if (rte->functions && contain_vars_upper_level((Node *) rte->functions, 1))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * is_simple_subquery
+ *	  Check a subquery in the range table to see if it's simple enough
+ *	  to pull up into the parent query.
+ *
+ * rte is the RTE_SUBQUERY RangeTblEntry that contained the subquery.
+ * (Note subquery is not necessarily equal to rte->subquery; it could be a
+ * processed copy of that.)
+ * lowest_outer_join is the lowest outer join above the subquery, or NULL.
+ * deletion_ok is TRUE if it'd be okay to delete the subquery entirely.
+ */
+static bool
+is_simple_subquery(Query *subquery,
+				   JoinExpr *lowest_outer_join,
+				   bool deletion_ok)
+{
+	/*
+	 * Let's just make sure it's a valid subselect ...
+	 */
+	if (!IsA(subquery, Query) ||
+		subquery->commandType != CMD_SELECT)
+		elog(ERROR, "subquery is bogus");
+
+	/*
+	 * Can't currently pull up a query with setops (unless it's simple UNION
+	 * ALL, which is handled by a different code path). Maybe after querytree
+	 * redesign...
+	 */
+	if (subquery->setOperations)
+		return false;
+
+	/*
+	 * Can't pull up a subquery involving grouping, aggregation, SRFs,
+	 * sorting, limiting, or WITH.  (XXX WITH could possibly be allowed later)
+	 *
+	 * We also don't pull up a subquery that has explicit FOR UPDATE/SHARE
+	 * clauses, because pullup would cause the locking to occur semantically
+	 * higher than it should.  Implicit FOR UPDATE/SHARE is okay because in
+	 * that case the locking was originally declared in the upper query
+	 * anyway.
+	 */
+	if (subquery->hasAggs ||
+		subquery->hasWindowFuncs ||
+		subquery->hasTargetSRFs ||
+		subquery->groupClause ||
+		subquery->groupingSets ||
+		subquery->havingQual ||
+		subquery->sortClause ||
+		subquery->distinctClause ||
+		subquery->limitOffset ||
+		subquery->limitCount ||
+		subquery->hasForUpdate ||
+		subquery->cteList)
+		return false;
+
+	/*
+	 * Don't pull up a subquery with an empty jointree, unless it has no quals
+	 * and deletion_ok is TRUE and we're not underneath an outer join.
+	 *
+	 * query_planner() will correctly generate a Result plan for a jointree
+	 * that's totally empty, but we can't cope with an empty FromExpr
+	 * appearing lower down in a jointree: we identify join rels via baserelid
+	 * sets, so we couldn't distinguish a join containing such a FromExpr from
+	 * one without it.  We can only handle such cases if the place where the
+	 * subquery is linked is a FromExpr or inner JOIN that would still be
+	 * nonempty after removal of the subquery, so that it's still identifiable
+	 * via its contained baserelids.  Safe contexts are signaled by
+	 * deletion_ok.
+	 *
+	 * But even in a safe context, we must keep the subquery if it has any
+	 * quals, because it's unclear where to put them in the upper query.
+	 *
+	 * Also, we must forbid pullup if such a subquery is underneath an outer
+	 * join, because then we might need to wrap its output columns with
+	 * PlaceHolderVars, and the PHVs would then have empty relid sets meaning
+	 * we couldn't tell where to evaluate them.  (This test is separate from
+	 * the deletion_ok flag for possible future expansion: deletion_ok tells
+	 * whether the immediate parent site in the jointree could cope, not
+	 * whether we'd have PHV issues.  It's possible this restriction could be
+	 * fixed by letting the PHVs use the relids of the parent jointree item,
+	 * but that complication is for another day.)
+	 *
+	 * Note that deletion of a subquery is also dependent on the check below
+	 * that its targetlist contains no set-returning functions.  Deletion from
+	 * a FROM list or inner JOIN is okay only if the subquery must return
+	 * exactly one row.
+	 */
+	if (subquery->jointree->fromlist == NIL &&
+		(subquery->jointree->quals != NULL ||
+		 !deletion_ok ||
+		 lowest_outer_join != NULL))
+		return false;
+
+	/*
+	 * Don't pull up a subquery that has any volatile functions in its
+	 * targetlist.  Otherwise we might introduce multiple evaluations of these
+	 * functions, if they get copied to multiple places in the upper query,
+	 * leading to surprising results.  (Note: the PlaceHolderVar mechanism
+	 * doesn't quite guarantee single evaluation; else we could pull up anyway
+	 * and just wrap such items in PlaceHolderVars ...)
+	 */
+	if (contain_volatile_functions((Node *) subquery->targetList))
+		return false;
+
+	return true;
+}
+#endif
 
 /*
  * Convert a SubLink (as created by the parser) into a SubPlan.
@@ -1189,6 +1347,98 @@ testexpr_is_hashable(Node *testexpr)
     return false;
 }
 
+#ifdef __TBASE__
+/*
+ * Rewrite qual to complete nullability check for NOT IN/ANY sublink pullup
+ */
+static Node*
+convert_joinqual_to_antiqual(Node* node, Query* parse)
+{
+	Node* antiqual = NULL;
+
+	if (node == NULL)
+		return NULL;
+
+	switch (nodeTag(node))
+	{
+		case T_OpExpr:
+			antiqual = convert_opexpr_to_boolexpr_for_antijoin(node, parse);
+			break;
+		case T_BoolExpr:
+		{
+			/* Not IN, should be and clause.*/
+            if (and_clause(node))
+            {
+            	BoolExpr* boolexpr = (BoolExpr*)node;
+            	List* andarglist = NIL;
+            	ListCell* l = NULL;
+
+            	foreach (l, boolexpr->args)
+            	{
+            		Node* andarg = (Node*)lfirst(l);
+            		Node* expr = NULL;
+
+            		/* The listcell type of args should be OpExpr. */
+            		expr = convert_opexpr_to_boolexpr_for_antijoin(andarg, parse);
+            		if (expr == NULL)
+            			return NULL;
+
+            		andarglist = lappend(andarglist, expr);
+            	}
+
+            	antiqual = (Node*)makeBoolExpr(AND_EXPR, andarglist, boolexpr->location);
+            }
+            else
+            	return NULL;
+        }
+			break;
+		case T_ScalarArrayOpExpr:
+		case T_RowCompareExpr:
+		default:
+			antiqual = NULL;
+			break;
+	}
+
+	return antiqual;
+}
+
+static Node *
+convert_opexpr_to_boolexpr_for_antijoin(Node *node, Query *parse)
+{
+	Node	*boolexpr = NULL;
+	List	*antiqual = NIL;
+	OpExpr	*opexpr = NULL;
+	Node	*larg = NULL;
+	Node	*rarg = NULL;
+
+	if (!IsA(node, OpExpr))
+		return NULL;
+	else
+		opexpr = (OpExpr*)node;
+
+	antiqual = (List*)list_make1(opexpr);
+
+	larg = (Node*)linitial(opexpr->args);
+	if (IsA(larg, RelabelType))
+		larg = (Node*)((RelabelType*)larg)->arg;
+	if (var_is_nullable(larg, parse))
+		antiqual = lappend(antiqual, makeNullTest(IS_NULL, (Expr*)copyObject(larg)));
+
+	rarg = (Node*)lsecond(opexpr->args);
+	if (IsA(rarg, RelabelType))
+		rarg = (Node*)((RelabelType*)rarg)->arg;
+	if (var_is_nullable(rarg, parse))
+		antiqual = lappend(antiqual, makeNullTest(IS_NULL, (Expr*)copyObject(rarg)));
+
+	if (list_length(antiqual) > 1)
+		boolexpr = (Node*)makeBoolExprTreeNode(OR_EXPR, antiqual);
+	else
+		boolexpr = (Node*)opexpr;
+
+	return boolexpr;
+}
+#endif
+
 /*
  * Check expression is hashable + strict
  *
@@ -1231,80 +1481,233 @@ hash_ok_operator(OpExpr *expr)
     }
 }
 
+#ifdef __TBASE__
+/*
+ * Check if total cost of inlining to multiple subquery is cheaper.
+ *
+ * There are three alternatives to optimize CTE with multiple references.
+ * XXX Keep the CTE as an optimization fence, using materialized CTE scan could
+ * 	   be cost saving. But in TBase distributed system, this will lead to more
+ * 	   executor nodes perfored in CN, which could be much slower.
+ * XXX Inline the CTE to multiple subqueries. This could leverage more join
+ *     reordering and predicate pushdown opetimization automatically.
+ * XXX Inline the CTE to some of the reference place(s). This need an overall
+ *     cost based optimizer including CTE inline and sublink pullup phase,
+ *     postgres optimizer does not support this yet.
+ */
+static bool
+is_cte_worth_inline(CommonTableExpr *cte, Plan *plan, Path *path)
+{
+	Cost 	inline_total_cost = 0;
+	Cost 	cte_total_cost = 0;
+	Cost 	material_cost = 0;
+	double 	material_bytes = 0;
+	long	work_mem_bytes = work_mem * 1024L;
+
+	/* Force pullup multi-reference CTE when enable_pullup_subquery enabled */
+	if (enable_pullup_subquery)
+		return true;
+
+	/* Num bytes to be materialized by CTE */
+	material_bytes = plan->plan_rows * plan->plan_width;
+
+	/*
+	 * Whether spilling or not, charge 2x cpu_operator_cost per tuple to
+	 * reflect bookkeeping overhead.  (This rate must be more than what
+	 * cost_rescan charges for materialize, ie, cpu_operator_cost per tuple;
+	 * if it is exactly the same then there will be a cost tie between
+	 * nestloop with A outer, materialized B inner and nestloop with B outer,
+	 * materialized A inner.  The extra cost ensures we'll prefer
+	 * materializing the smaller rel.)	Note that this is normally a good deal
+	 * less than cpu_tuple_cost; which is OK because a Material plan node
+	 * doesn't do qual-checking or projection, so it's got less overhead than
+	 * most plan nodes.
+	 */
+	material_cost += 2 * cpu_operator_cost * plan->plan_rows;
+
+	/*
+	 * If we will spill to disk, charge at the rate of seq_page_cost per page.
+	 * This cost is assumed to be evenly spread through the plan run phase,
+	 * which isn't exactly accurate but our cost model doesn't allow for
+	 * nonuniform costs within the run phase.
+	 */
+	if (material_bytes > work_mem_bytes)
+	{
+		double npages = ceil(material_bytes / BLCKSZ);
+
+		material_bytes += seq_page_cost * npages;
+	}
+
+	/* Calculate total costs for different options */
+	cte_total_cost = plan->total_cost + material_cost;
+	inline_total_cost = plan->total_cost * cte->cterefcount;
+
+	/*
+	 * In a distributed system like TBase, the inline one could leverage more
+	 * optimizations like subquery pullup, predicate pushdown, etc. We add a
+	 * optimization factor 0.5 here to show case these cost saves.
+	 */
+	inline_total_cost = inline_total_cost * 0.5;
+
+	if (inline_total_cost <= cte_total_cost)
+		return true;
+	else
+		return false;
+}
+#endif
 
 /*
  * SS_process_ctes: process a query's WITH list
  *
- * We plan each interesting WITH item and convert it to an initplan.
+ * Consider each CTE in the WITH list and either ignore it (if it's an
+ * unreferenced SELECT), "inline" it to create a regular sub-SELECT-in-FROM,
+ * or convert it to an initplan.
+ *
  * A side effect is to fill in root->cte_plan_ids with a list that
  * parallels root->parse->cteList and provides the subplan ID for
- * each CTE's initplan.
+ * each CTE's initplan, or a dummy ID (-1) if we didn't make an initplan.
  */
 void
 SS_process_ctes(PlannerInfo *root)
 {
-    ListCell   *lc;
+	ListCell   *lc;
 
-    Assert(root->cte_plan_ids == NIL);
+	Assert(root->cte_plan_ids == NIL);
 
-    foreach(lc, root->parse->cteList)
-    {
-        CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
-        CmdType        cmdType = ((Query *) cte->ctequery)->commandType;
-        Query       *subquery;
-        PlannerInfo *subroot;
-        RelOptInfo *final_rel;
-        Path       *best_path;
-        Plan       *plan;
-        SubPlan    *splan;
-        int            paramid;
+	foreach(lc, root->parse->cteList)
+	{
+		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+		CmdType		cmdType = ((Query *) cte->ctequery)->commandType;
+		Query	   *subquery;
+		PlannerInfo *subroot;
+		RelOptInfo *final_rel;
+		Path	   *best_path;
+		Plan	   *plan;
+		SubPlan    *splan;
+		int			paramid;
 
-        /*
-         * Ignore SELECT CTEs that are not actually referenced anywhere.
-         */
-        if (cte->cterefcount == 0 && cmdType == CMD_SELECT)
-        {
-            /* Make a dummy entry in cte_plan_ids */
-            root->cte_plan_ids = lappend_int(root->cte_plan_ids, -1);
-            continue;
-        }
+		/*
+		 * Ignore SELECT CTEs that are not actually referenced anywhere.
+		 */
+		if (cte->cterefcount == 0 && cmdType == CMD_SELECT)
+		{
+			/* Make a dummy entry in cte_plan_ids */
+			root->cte_plan_ids = lappend_int(root->cte_plan_ids, -1);
+			continue;
+		}
 
-        /*
-         * Copy the source Query node.  Probably not necessary, but let's keep
-         * this similar to make_subplan.
-         */
-        subquery = (Query *) copyObject(cte->ctequery);
+ 		/*
+		 * Consider inlining the CTE (creating RTE_SUBQUERY RTE(s)) instead of
+		 * implementing it as a separately-planned CTE.
+		 *
+		 * We cannot inline if any of these conditions hold:
+		 *
+		 * 1. The user said not to (the CTEMaterializeAlways option).
+		 *
+		 * 2. The CTE is recursive.
+		 *
+		 * 3. The CTE has side-effects; this includes either not being a plain
+		 * SELECT, or containing volatile functions.  Inlining might change
+		 * the side-effects, which would be bad.
+		 *
+		 * 4. The CTE is multiply-referenced and contains a self-reference to
+		 * a recursive CTE outside itself.  Inlining would result in multiple
+		 * recursive self-references, which we don't support.
+		 *
+		 * Otherwise, we have an option whether to inline or not.  That should
+		 * always be a win if there's just a single reference, but if the CTE
+		 * is multiply-referenced then it's unclear: inlining adds duplicate
+		 * computations, but the ability to absorb restrictions from the outer
+		 * query level could outweigh that.  We do not have nearly enough
+		 * information at this point to tell whether that's true, so we let
+		 * the user express a preference.  Our default behavior is to inline
+		 * only singly-referenced CTEs, but a CTE marked CTEMaterializeNever
+		 * will be inlined even if multiply referenced.
+		 *
+		 * Note: we check for volatile functions last, because that's more
+		 * expensive than the other tests needed.
+		 */
+		if ((cte->ctematerialized == CTEMaterializeNever ||
+			 (cte->ctematerialized == CTEMaterializeDefault &&
+			  cte->cterefcount == 1)) &&
+			!cte->cterecursive &&
+			cmdType == CMD_SELECT &&
+			!contain_dml(cte->ctequery) &&
+			(cte->cterefcount <= 1 ||
+			 !contain_outer_selfref(cte->ctequery)) &&
+			!contain_volatile_functions(cte->ctequery))
+		{
+			inline_cte(root, cte);
+			/* Make a dummy entry in cte_plan_ids */
+			root->cte_plan_ids = lappend_int(root->cte_plan_ids, -1);
+			continue;
+		}
 
-        /* plan_params should not be in use in current query level */
-        Assert(root->plan_params == NIL);
+		/*
+		 * Copy the source Query node.  Probably not necessary, but let's keep
+		 * this similar to make_subplan.
+		 */
+		subquery = (Query *) copyObject(cte->ctequery);
 
-        /*
-         * Generate Paths for the CTE query.  Always plan for full retrieval
-         * --- we don't have enough info to predict otherwise.
-         */
-        subroot = subquery_planner(root->glob, subquery,
-                                   root,
-                                   cte->cterecursive, 0.0);
+		/* plan_params should not be in use in current query level */
+		Assert(root->plan_params == NIL);
 
-        /*
-         * Since the current query level doesn't yet contain any RTEs, it
-         * should not be possible for the CTE to have requested parameters of
-         * this level.
-         */
-        if (root->plan_params)
-            elog(ERROR, "unexpected outer reference in CTE query");
+		/*
+		 * Generate Paths for the CTE query.  Always plan for full retrieval
+		 * --- we don't have enough info to predict otherwise.
+		 */
+		subroot = subquery_planner(root->glob, subquery,
+								   root,
+								   cte->cterecursive, 0.0);
 
-        /*
-         * Select best Path and turn it into a Plan.  At least for now, there
-         * seems no reason to postpone doing that.
-         */
-        final_rel = fetch_upper_rel(subroot, UPPERREL_FINAL, NULL);
-        best_path = final_rel->cheapest_total_path;
+		/*
+		 * Since the current query level doesn't yet contain any RTEs, it
+		 * should not be possible for the CTE to have requested parameters of
+		 * this level.
+		 */
+		if (root->plan_params)
+			elog(ERROR, "unexpected outer reference in CTE query");
 
-        if (!subroot->distribution)
-            subroot->distribution = best_path->distribution;
+		/*
+		 * Select best Path and turn it into a Plan.  At least for now, there
+		 * seems no reason to postpone doing that.
+		 */
+		final_rel = fetch_upper_rel(subroot, UPPERREL_FINAL, NULL);
+		best_path = final_rel->cheapest_total_path;
 
-        plan = create_plan(subroot, best_path);
+		if (!subroot->distribution)
+			subroot->distribution = best_path->distribution;
+
+		plan = create_plan(subroot, best_path);
+
+#ifdef __TBASE__
+		/*
+		 * Handle the CTE with multiple references in the main query. Since we
+		 * need to compare the cost between CTE Scan and inline subquery Scan,
+		 * perform the inline check after we got the best path of CTE subquery.
+		 */
+		if ((cte->ctematerialized == CTEMaterializeNever ||
+			 (cte->ctematerialized == CTEMaterializeDefault &&
+			  cte->cterefcount > 1)) &&
+			!cte->cterecursive &&
+			cmdType == CMD_SELECT &&
+			!contain_dml(cte->ctequery) &&
+			(cte->cterefcount <= 1 ||
+			 !contain_outer_selfref(cte->ctequery)) &&
+			!contain_volatile_functions(cte->ctequery))
+		{
+			/*
+			 * Check if total cost of inlining to multiple subquery is cheaper.
+			 */
+			if (is_cte_worth_inline(cte, plan, best_path))
+			{
+				inline_cte(root, cte);
+				/* Make a dummy entry in cte_plan_ids */
+				root->cte_plan_ids = lappend_int(root->cte_plan_ids, -1);
+				continue;
+			}
+		}
+#endif
 
 #ifdef XCP
         /* Add a remote subplan, if redistribution is needed. */
@@ -1390,12 +1793,6 @@ SS_process_ctes(PlannerInfo *root)
 
 #ifdef __TBASE__
 static bool
-simplify_ANY_query(PlannerInfo *root, Query *query)
-{
-    return false;
-}
-
-static bool
 simplify_EXPR_query(PlannerInfo *root, Query *query)
 {// #lizard forgives
     Node *whereclause = NULL;
@@ -1413,6 +1810,7 @@ simplify_EXPR_query(PlannerInfo *root, Query *query)
         query->hasModifyingCTE ||
         query->havingQual ||
         query->limitOffset ||
+		query->limitCount ||
         query->rowMarks ||
         query->hasSubLinks ||
         query->cteList ||
@@ -1452,9 +1850,8 @@ simplify_ALL_query(PlannerInfo *root, Query *query)
 }
 
 /* 
-  * if whereclause contains 'not' boolexpr or not equal opexpr,
-  * return true.
-  */
+ * If where clause contains 'not' BoolExpr or not-equal OpExpr, return true.
+ */
 static bool
 contain_notexpr_or_neopexpr(Node *whereclause, bool check_or, List **joinquals)
 {// #lizard forgives
@@ -1472,7 +1869,7 @@ contain_notexpr_or_neopexpr(Node *whereclause, bool check_or, List **joinquals)
 			if(!check_or)
                 return true;
 
-			/* look for common expr */
+			/* Look for common EXPR */
 			foreach(cell, expr->args)
 			{
 				List *cur = NIL;
@@ -1497,11 +1894,11 @@ contain_notexpr_or_neopexpr(Node *whereclause, bool check_or, List **joinquals)
 			return false;
         }
 
-		/* and expr */
-        foreach(cell, expr->args)
-        {
-            bool result;
-            Node *arg = lfirst(cell);
+		/* AND EXPR */
+		foreach(cell, expr->args)
+		{
+			bool result;
+			Node *arg = lfirst(cell);
 
 			result = contain_notexpr_or_neopexpr(arg, check_or, joinquals);
 
@@ -1524,16 +1921,17 @@ contain_notexpr_or_neopexpr(Node *whereclause, bool check_or, List **joinquals)
 
         *joinquals = lappend(*joinquals, expr);
 
-		
+		/* Make sure the operator is hashjoinable */
 		if (!op_hashjoinable(expr->opno, exprType((Node *)lexpr)))
         {
 			return true;
-        }
-			
-        foreach(cell, expr->args)
-        {
-            bool result;
-            Node *arg = lfirst(cell);
+		}
+
+		/* Check the operands of the OpExpr */
+		foreach(cell, expr->args)
+		{
+			bool result;
+			Node *arg = lfirst(cell);
 
 			result = contain_notexpr_or_neopexpr(arg, check_or, joinquals);
 
@@ -1552,11 +1950,69 @@ contain_notexpr_or_neopexpr(Node *whereclause, bool check_or, List **joinquals)
         bool result;
         RelabelType *label = (RelabelType *)whereclause;
 
-		result = contain_notexpr_or_neopexpr((Node *)label->arg, check_or, joinquals);
-        if (result)
-                return true;
-        return false;
-    }
+		result = contain_notexpr_or_neopexpr((Node *)label->arg,
+											 check_or,
+											 joinquals);
+		if (result)
+				return true;
+		return false;
+	}
+	/* In case the where clause is "tbl.col_a IN ('0','1')" */
+	else if (IsA(whereclause, ScalarArrayOpExpr))
+	{
+		ListCell 		  *lc = NULL;
+		ScalarArrayOpExpr *scalarArray = (ScalarArrayOpExpr*)whereclause;
+		Expr 			  *lexpr = linitial(scalarArray->args);
+
+		if (!op_hashjoinable(scalarArray->opno, exprType((Node *)lexpr)))
+		{
+			return true;
+		}
+
+		foreach(lc, scalarArray->args)
+		{
+			if (contain_notexpr_or_neopexpr((Node *)lfirst(lc),
+											check_or,
+											joinquals))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+	/*
+	 * The right operand of ScalarArrayOpExpr, we only support array of
+	 * constant values
+	 */
+	else if (IsA(whereclause, ArrayExpr))
+	{
+		ListCell *lc = NULL;
+		ArrayExpr *arrayExpr = (ArrayExpr *)whereclause;
+
+		foreach(lc, arrayExpr->elements)
+		{
+			if (!IsA((Node *)lfirst(lc), Const))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+    /* In case the where clause is "tbl.col_a is(is not) NULL" */
+	else if (IsA(whereclause, NullTest))
+	{
+		NullTest *nullTestExpr = (NullTest *)whereclause;
+
+		if (contain_notexpr_or_neopexpr((Node *)nullTestExpr->arg,
+										check_or,
+										joinquals))
+		{
+			return true;
+		}
+		return false;
+	}
 
     return true;
 }
@@ -1577,7 +2033,9 @@ append_var_to_subquery_targetlist(Var *var, List *targetList, TargetEntry **targ
 
 	ent->resno = varno;
 	var->varattno = var->varoattno = varno;
-	*target = ent;
+
+	if(target != NULL)
+        *target = ent;
 	return targetList;
 }
 
@@ -1652,6 +2110,181 @@ add_vars_to_subquery_targetlist(Node     *whereClause, Query *subselect, int rti
 #endif
 
 /*
+ * contain_dml: is any subquery not a plain SELECT?
+ *
+ * We reject SELECT FOR UPDATE/SHARE as well as INSERT etc.
+ */
+static bool
+contain_dml(Node *node)
+{
+	return contain_dml_walker(node, NULL);
+}
+
+static bool
+contain_dml_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+	{
+		Query	   *query = (Query *) node;
+
+		if (query->commandType != CMD_SELECT ||
+			query->rowMarks != NIL)
+			return true;
+
+		return query_tree_walker(query, contain_dml_walker, context, 0);
+	}
+	return expression_tree_walker(node, contain_dml_walker, context);
+}
+
+/*
+ * contain_outer_selfref: is there an external recursive self-reference?
+ */
+static bool
+contain_outer_selfref(Node *node)
+{
+	Index		depth = 0;
+
+	/*
+	 * We should be starting with a Query, so that depth will be 1 while
+	 * examining its immediate contents.
+	 */
+	Assert(IsA(node, Query));
+
+	return contain_outer_selfref_walker(node, &depth);
+}
+
+static bool
+contain_outer_selfref_walker(Node *node, Index *depth)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, RangeTblEntry))
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) node;
+
+		/*
+		 * Check for a self-reference to a CTE that's above the Query that our
+		 * search started at.
+		 */
+		if (rte->rtekind == RTE_CTE &&
+			rte->self_reference &&
+			rte->ctelevelsup >= *depth)
+			return true;
+		return false;			/* allow range_table_walker to continue */
+	}
+	if (IsA(node, Query))
+	{
+		/* Recurse into subquery, tracking nesting depth properly */
+		Query	   *query = (Query *) node;
+		bool		result;
+
+		(*depth)++;
+
+		result = query_tree_walker(query, contain_outer_selfref_walker,
+								   (void *) depth, QTW_EXAMINE_RTES_BEFORE);
+
+		(*depth)--;
+
+		return result;
+	}
+	return expression_tree_walker(node, contain_outer_selfref_walker,
+								  (void *) depth);
+}
+
+/*
+ * inline_cte: convert RTE_CTE references to given CTE into RTE_SUBQUERYs
+ */
+static void
+inline_cte(PlannerInfo *root, CommonTableExpr *cte)
+{
+	struct inline_cte_walker_context context;
+
+	context.ctename = cte->ctename;
+	/* Start at levelsup = -1 because we'll immediately increment it */
+	context.levelsup = -1;
+	context.refcount = cte->cterefcount;
+	context.ctequery = castNode(Query, cte->ctequery);
+
+	(void) inline_cte_walker((Node *) root->parse, &context);
+
+	/* Assert we replaced all references */
+	Assert(context.refcount == 0);
+}
+
+static bool
+inline_cte_walker(Node *node, inline_cte_walker_context *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+	{
+		Query	   *query = (Query *) node;
+
+		context->levelsup++;
+
+		/*
+		 * Visit the query's RTE nodes after their contents; otherwise
+		 * query_tree_walker would descend into the newly inlined CTE query,
+		 * which we don't want.
+		 */
+		(void) query_tree_walker(query, inline_cte_walker, context,
+								 QTW_EXAMINE_RTES_AFTER);
+
+		context->levelsup--;
+
+		return false;
+	}
+	else if (IsA(node, RangeTblEntry))
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) node;
+
+		if (rte->rtekind == RTE_CTE &&
+			strcmp(rte->ctename, context->ctename) == 0 &&
+			rte->ctelevelsup == context->levelsup)
+		{
+			/*
+			 * Found a reference to replace.  Generate a copy of the CTE query
+			 * with appropriate level adjustment for outer references (e.g.,
+			 * to other CTEs).
+			 */
+			Query	   *newquery = copyObject(context->ctequery);
+
+			if (context->levelsup > 0)
+				IncrementVarSublevelsUp((Node *) newquery, context->levelsup, 1);
+
+			/*
+			 * Convert the RTE_CTE RTE into a RTE_SUBQUERY.
+			 *
+			 * Historically, a FOR UPDATE clause has been treated as extending
+			 * into views and subqueries, but not into CTEs.  We preserve this
+			 * distinction by not trying to push rowmarks into the new
+			 * subquery.
+			 */
+			rte->rtekind = RTE_SUBQUERY;
+			rte->subquery = newquery;
+			rte->security_barrier = false;
+
+			/* Zero out CTE-specific fields */
+			rte->ctename = NULL;
+			rte->ctelevelsup = 0;
+			rte->self_reference = false;
+			rte->coltypes = NIL;
+			rte->coltypmods = NIL;
+			rte->colcollations = NIL;
+
+			/* Count the number of replacements we've done */
+			context->refcount--;
+		}
+
+		return false;
+	}
+
+	return expression_tree_walker(node, inline_cte_walker, context);
+}
+
+/*
  * convert_ANY_sublink_to_join: try to convert an ANY SubLink to a join
  *
  * The caller has found an ANY SubLink at the top level of one of the query's
@@ -1706,82 +2339,69 @@ convert_ANY_sublink_to_join(PlannerInfo *root, SubLink *sublink,
     Node       *quals;
     ParseState *pstate;
 #ifdef __TBASE__
-    int            offset = 0;
-    Node       *whereClause = NULL;
+	bool		correlated = false;
 #endif
 
     Assert(sublink->subLinkType == ANY_SUBLINK);
 
 #ifdef __TBASE__
-    /*
-      * handle correlated subquery here.
-      * simple case: select * from a where a.X in (select b.X from b where a.Xx ? b.Xx.......);
-      */
-    if (simplify_ANY_query(root, subselect))
-    {
-        subselect = copyObject(subselect);
-         whereClause = subselect->jointree->quals;
-        subselect->jointree->quals = NULL;
+	if (enable_pullup_subquery)
+	{
+		/*
+		 * If there are CTEs, then the transformation does not work. Don't attempt
+		 * to pullup.
+		 */
+		if (parse->cteList)
+			return NULL;
 
-        /*
-         * The rest of the sub-select must not refer to any Vars of the parent
-         * query.  (Vars of higher levels should be okay, though.)
-         */
-        if (contain_vars_of_level((Node *) subselect, 1))
-            return NULL;
+		/*
+		 * If uncorrelated, and no Var nodes on lhs, the subquery will be executed
+		 * only once.  It should become an InitPlan, but make_subplan() doesn't
+		 * handle that case, so just flatten it for now.
+		 * TODO: Let it become an InitPlan, so its QEs can be recycled.
+		 *
+		 * We only handle level 1 correlated cases. The sub-select must not refer
+		 * to any Vars of the parent query. (Vars of higher levels should be okay,
+		 * though.)
+		 */
+		correlated = contain_vars_of_level((Node *) subselect, 1);
 
-        if (whereClause)
-        {        
+		if (correlated)
+		{
+			/*
+			 * If deeply(>1) correlated, then don't pull it up
+			 */
+			if (contain_vars_upper_level(sublink->subselect, 1))
+				return NULL;
 
-            if (contain_vars_of_level((Node *) subselect, 1))
-                return NULL;
-            /*
-             * the WHERE clause may contain some Vars of the
-             * parent query.
-             */
-            upper_varnos = pull_varnos_of_level(whereClause, 1);
+			/*
+			 * Under certain conditions, we cannot pull up the subquery as a join.
+			 */
+			if (!is_simple_subquery(subselect, NULL, false))
+				return NULL;
 
-            if (upper_varnos)
-            {
-                /* whereclause contains vars from different parent query */
-                if (bms_num_members(upper_varnos) > 1)
-                {
-                    return NULL;
-                }
-    
-                if (!bms_is_subset(upper_varnos, available_rels))
-                {
-                    return NULL;
-                }
-            }
+			/*
+			 * Do not pull subqueries with correlation in a func expr in the from
+			 * clause of the subselect
+			 */
+			if (has_correlation_in_funcexpr_rte(subselect->rtable))
+				return NULL;
 
-            /*
-             * We don't risk optimizing if the WHERE clause is volatile, either.
-             */
-            if (contain_volatile_functions(whereClause))
-                return NULL;
-        }
-    }
-    else
-    {    
-        whereClause = NULL;
-
-        if (under_not)
-        {
-            return NULL;
-        }
-
-        if (contain_vars_of_level((Node *) subselect, 1))
-            return NULL;
-    }
-    
-#else
-    /*
-     * The sub-select must not refer to any Vars of the parent query. (Vars of
-     * higher levels should be okay, though.)
-     */
-    if (contain_vars_of_level((Node *) subselect, 1))
-        return NULL;
+			if (contain_subplans(subselect->jointree->quals))
+				return NULL;
+		}
+	}
+	else
+	{
+#endif
+	/*
+	 * The sub-select must not refer to any Vars of the parent query. (Vars of
+	 * higher levels should be okay, though.)
+	 */
+	if (contain_vars_of_level((Node *) subselect, 1))
+		return NULL;
+#ifdef __TBASE__
+	}
 #endif
 
     /*
@@ -1808,50 +2428,28 @@ convert_ANY_sublink_to_join(PlannerInfo *root, SubLink *sublink,
     /* Create a dummy ParseState for addRangeTableEntryForSubquery */
     pstate = make_parsestate(NULL);
 
+	/*
+	 * Okay, pull up the sub-select into upper range table.
+	 *
+	 * We rely here on the assumption that the outer query has no references
+	 * to the inner (necessarily true, other than the Vars that we build
+	 * below). Therefore this is a lot easier than what pull_up_subqueries has
+	 * to go through.
+	 *
+	 * If the subquery is correlated, i.e. it refers to any Vars of the
+	 * parent query, mark it as lateral.
+	 */
+	rte = addRangeTableEntryForSubquery(pstate,
+										subselect,
+										makeAlias("ANY_subquery", NIL),
 #ifdef __TBASE__
-    if (whereClause)
-    {
-        rtindex = list_length(parse->rtable);
-
-        offset  = rtindex;
-
-        OffsetVarNodes(whereClause, rtindex, 0);
-
-        IncrementVarSublevelsUp(whereClause, -1, 1);
-    }
+										correlated,	/* lateral */
+#else
+										false,
 #endif
-
-    /*
-     * Okay, pull up the sub-select into upper range table.
-     *
-     * We rely here on the assumption that the outer query has no references
-     * to the inner (necessarily true, other than the Vars that we build
-     * below). Therefore this is a lot easier than what pull_up_subqueries has
-     * to go through.
-     */
-#ifdef __TBASE__
-    if (whereClause)
-    {
-#endif
-    rte = addRangeTableEntryForSubquery(pstate,
-                                        subselect,
-                                        makeAlias("ANY_subquery", NIL),
-                                        false,
-                                        false);
-#ifdef __TBASE__
-    }
-    else
-    {
-        rte = addRangeTableEntryForSubquery(pstate,
-                                    (Query *) sublink->subselect,
-                                    makeAlias("ANY_subquery", NIL),
-                                    false,
-                                    false);
-    }
-#endif
-
-    parse->rtable = lappend(parse->rtable, rte);
-    rtindex = list_length(parse->rtable);
+										false);
+	parse->rtable = lappend(parse->rtable, rte);
+	rtindex = list_length(parse->rtable);
 
     /*
      * Form a RangeTblRef for the pulled-up sub-select.
@@ -1866,105 +2464,42 @@ convert_ANY_sublink_to_join(PlannerInfo *root, SubLink *sublink,
                                            subselect->targetList,
                                            rtindex);
 
-#ifdef __TBASE__
-    /* add vars from subquery in whereclause into targetlist */
-    if (whereClause)
-    {
-        ListCell *cell;
-        List *vars = pull_vars_of_level((Node *)whereClause, 0);
+	/*
+	 * Build the new join's qual expression, replacing Params with these Vars.
+	 */
+	quals = convert_testexpr(root, sublink->testexpr, subquery_vars);
 
-        foreach(cell, vars)
-        {
-            Var *var = lfirst(cell);
-
-            if (var->varno == rtindex)
-            {
-                bool match = false;
-                ListCell *lc;
-                Var *temp_var = NULL;
-                TargetEntry *ent = NULL;
-                int varno        = 0;
-                int varlevelsup  = 0;
-
-                if (var->varlevelsup >= 1)
-                {
-                    varlevelsup = var->varlevelsup;
-                    var->varlevelsup = 0;
-                }
-                
-                temp_var = copyObject(var);
-                temp_var->varno -= offset;
-                temp_var->varnoold -= offset;
-
-                match = false;
-                foreach(lc, subselect->targetList)
-                {
-                    TargetEntry *tent = (TargetEntry *) lfirst(lc);
-
-                    if (IsA(tent->expr, Var))
-                    {
-                        if (equal(temp_var, tent->expr))
-                        {
-                            match = true;
-
-                            var->varattno = var->varoattno = tent->resno;
-                            
-                            break;
-                        }
-                    }
-                }
-
-                if (!match)
-                {
-                    ent = makeTargetEntry((Expr *)temp_var, temp_var->varoattno, NULL, false);
-        
-                    subselect->targetList = lappend(subselect->targetList, ent);
-
-                    varno = list_length(subselect->targetList);
-
-                    ent->resno = varno;
-
-                    var->varattno = var->varoattno = varno;
-                }
-
-                if (varlevelsup)
-                {
-                    var->varlevelsup = varlevelsup;
-                }
-            }
-        }
-    }
-#endif
-
-    /*
-     * Build the new join's qual expression, replacing Params with these Vars.
-     */
-    quals = convert_testexpr(root, sublink->testexpr, subquery_vars);
+	/*
+	 * And finally, build the JoinExpr node.
+	 */
+	result = makeNode(JoinExpr);
 
 #ifdef __TBASE__
-    /* make join quals with whereclause */
-    if (whereClause)
-    {
-        Expr *expr = makeBoolExpr(AND_EXPR, list_make2(quals, whereClause), 0);
+	/* Different logic for NOT IN/ANY sublink */
+	if (under_not)
+	{
+        Node* antiquals = NULL;
 
-        quals = (Node *)expr;
-    }
+        antiquals = convert_joinqual_to_antiqual(quals, parse);
+
+        if (antiquals == NULL)
+            return NULL;
+
+        result->jointype = JOIN_ANTI;
+        result->quals = antiquals;
+	}
+	else
+	{
+		/* Basic logic for IN/ANY sublink */
+		result->jointype = JOIN_SEMI;
+		result->quals = quals;
+	}
 #endif
 
-    /*
-     * And finally, build the JoinExpr node.
-     */
-    result = makeNode(JoinExpr);
-#ifdef __TBASE__
-    result->jointype = under_not ? JOIN_ANTI : JOIN_SEMI;
-#else
-    result->jointype = JOIN_SEMI;
-#endif
     result->isNatural = false;
     result->larg = NULL;        /* caller must fill this in */
     result->rarg = (Node *) rtr;
     result->usingClause = NIL;
-    result->quals = quals;
     result->alias = NULL;
     result->rtindex = 0;        /* we don't need an RTE for it */
 
@@ -2180,11 +2715,6 @@ convert_EXPR_sublink_to_join(PlannerInfo *root, OpExpr *expr,
         return NULL;
     }
 
-    if (list_length(((Query *)sublink->subselect)->rtable) > 2)
-    {
-        return NULL;
-    }
-
     subselect = (Query *)copyObject(sublink->subselect);
 
     /* we can just handle simple case now! */
@@ -2366,8 +2896,6 @@ convert_EXPR_sublink_to_join(PlannerInfo *root, OpExpr *expr,
 
 		ent->resno = varno;
 
-		//var->varattno = var->varoattno = varno;
-
 		/* determine the eqop and optional sortop */
 		get_sort_group_operators(restype,
 								 false, true, false,
@@ -2532,6 +3060,389 @@ get_or_exist_subquery_targetlist(PlannerInfo *root, Node *node, List **targetLis
 	return node;
 }
 
+#ifdef __TBASE__
+/*
+ * simplify_TargetList_query:remove any useless stuff in an TargetList's
+ * subquery
+ *
+ * For subquery in targetlist, normally we use JOIN_LEFT_SCALAR type to
+ * make sure there will be only one row found. If subquery contains
+ * aggregation clause, then we are OK with JOIN_LEFT_SEMI. Further more, if
+ * subquery got 'limit 1' or  equivalent clauses such as Oracle 'rownum = 1'.
+ * Then we can remove the limit clause and use JOIN_SEMI to simplify the
+ * subquery.
+ *
+ * Returns TRUE if was able to discard the 'LIMIT 1' cluase or the subquery
+ * already simple enough, else FALSE.
+ */
+static bool
+simplify_TargetList_query(PlannerInfo *root, Query *query, bool *useLeftSemiJoin)
+{
+	/*
+	 * We don't try to simplify at all if the query uses set operations,
+	 * aggregates, grouping sets, SRFs, modifying CTEs, HAVING, OFFSET, or FOR
+	 * UPDATE/SHARE; none of these seem likely in normal usage and their
+	 * possible effects are complex.  (Note: we could ignore an "OFFSET 0"
+	 * clause, but that traditionally is used as an optimization fence, so we
+	 * don't.)
+	 */
+	if (query->commandType != CMD_SELECT ||
+		query->setOperations ||
+		query->groupingSets ||
+		query->hasWindowFuncs ||
+		query->hasTargetSRFs ||
+		query->hasModifyingCTE ||
+		query->havingQual ||
+		query->limitOffset ||
+		query->rowMarks)
+		return false;
+
+	/* By default, use JOIN_LEFT_SCALAR. */
+	Assert(useLeftSemiJoin);
+	*useLeftSemiJoin = false;
+
+	/* Handle 'limit 1' case as described above. */
+	if (query->limitCount)
+	{
+		/*
+		 * The LIMIT clause has not yet been through eval_const_expressions,
+		 * so we have to apply that here.  It might seem like this is a waste
+		 * of cycles, since the only case plausibly worth worrying about is
+		 * "LIMIT 1" ... but what we'll actually see is "LIMIT int8(1::int4)",
+		 * so we have to fold constants or we're not going to recognize it.
+		 */
+		Node	   *node = eval_const_expressions(root, query->limitCount);
+		Const	   *limit;
+		int64		limitValue;
+
+		/* Might as well update the query if we simplified the clause. */
+		query->limitCount = node;
+
+		if (!IsA(node, Const))
+			return false;
+
+		limit = (Const *) node;
+
+		Assert(limit->consttype == INT8OID);
+		limitValue = DatumGetInt64(limit->constvalue);
+
+		/* Invalid value, we have to get at least one row. */
+		if (!limit->constisnull && limitValue <= 0)
+			return false;
+
+		/*
+		 * If the SubQuery got limit 1(actually must be limit 1), then the
+		 * join Semantic equals JOIN_SEMI. We don't need to continue when got
+		 * one LHS match.
+		 */
+		if (limitValue == 1)
+		{
+			/*
+			 * Remove the limit clause for more possible subquery pullup
+			 * optimizations.
+			 */
+			query->limitCount = NULL;
+			/* Inform caller to use JOIN_LEFT_SEMI */
+			*useLeftSemiJoin = true;
+		}
+	}
+
+	return true;
+}
+
+/*
+ * Try to convert an SubLink in targetlist to a join
+ *
+ * The sublink in targetlist has the semantic of SCALAR. Normal joins will join
+ * simply generate repeated tuples. So we add a new join type JOIN_LEFT_SCALAR
+ * which acts like left join and reports error when scalar semantics is broken.
+ *
+ * On success, it converts sublink to subquery to parent jointree and returns
+ * the converted new targetlist entry. Otherwise, it returnes NULL.
+ */
+TargetEntry *
+convert_TargetList_sublink_to_join(PlannerInfo *root, TargetEntry *entry)
+{
+	Query		*parse = root->parse;
+	Node		*whereClause = NULL;
+	Query		*subselect = NULL;
+	JoinExpr	*joinExpr = NULL;
+	ParseState	*pstate = NULL;
+	SubLink		*sublink = NULL;
+	RangeTblRef	*rtr = NULL;
+	RangeTblEntry *rte = NULL;
+	Node		*target = NULL;
+	List		*sublinks = NIL;
+    bool		 count_agg = false;
+    bool		 useLeftSemiJoin = false;
+    /* By default, JOIN_LEFT_SCALAR is the worst choice */
+    JoinType 	 finalJoinType = JOIN_LEFT_SCALAR;
+
+	/* Find sublinks in the targetlist entry */
+	find_sublink_walker((Node *)entry->expr, &sublinks);
+
+	/* Only one sublink can be handled */
+	if (list_length(sublinks) != 1)
+		return NULL;
+
+	sublink = linitial(sublinks);
+
+	if (sublink->subLinkType != EXPR_SUBLINK)
+		return NULL;
+
+	/*
+	 * Copy object so that we can modify it.
+	 */
+	subselect = copyObject((Query *) sublink->subselect);
+	whereClause = subselect->jointree->quals;
+
+	/*
+	 * Only one targetEntry can be handled.
+	 */
+	if (list_length(subselect->targetList) > 1)
+		return NULL;
+
+	/*
+	 * The SubQuery must have a non-empty JoinTree, else we won't have a join.
+	 */
+	if (subselect->jointree->fromlist == NIL)
+		return NULL;
+
+	/*
+	 * See if the subquery can be simplified. For now, we just try to remove
+	 * 'limit 1' clause. If it's been removed, we can use JOIN_LEFT_SEMI to
+	 * save more costs.
+	 */
+	if (!simplify_TargetList_query(root, subselect, &useLeftSemiJoin))
+		return NULL;
+
+	/* 'limit 1' optimized */
+	if (useLeftSemiJoin)
+		finalJoinType = JOIN_LEFT_SEMI;
+
+	/*
+	 * What we can not optimize.
+	 */
+	if (subselect->commandType != CMD_SELECT || subselect->hasDistinctOn ||
+		subselect->setOperations || subselect->groupingSets ||
+		subselect->groupClause || subselect->hasWindowFuncs ||
+		subselect->hasTargetSRFs || subselect->hasModifyingCTE ||
+		subselect->havingQual || subselect->limitOffset ||
+		subselect->limitCount || subselect->rowMarks ||
+		subselect->cteList || subselect->sortClause)
+	{
+		return NULL;
+	}
+
+	/*
+	 * On one hand, the WHERE clause must contain some Vars of the
+	 * parent query, else it's not gonna be a join.
+	 */
+	if (!contain_vars_of_level(whereClause, 1))
+		return NULL;
+
+	/*
+	 * We don't risk optimizing if the WHERE clause is volatile, either.
+	 */
+	if (contain_volatile_functions(whereClause))
+		return NULL;
+
+	/*
+	 * The rest of the sub-select must not refer to any Vars of the parent
+	 * query. (Vars of higher levels should be okay, though.)
+	 */
+	subselect->jointree->quals = NULL;
+	if (contain_vars_of_level((Node *) subselect, 1))
+		return NULL;
+	subselect->jointree->quals = whereClause;
+
+	if (subselect->hasAggs)
+	{
+        int ressortgroupref = 0;
+        int varno = 0;
+		List *joinquals  = NULL;
+		List *vars       = NULL;
+		TargetEntry *ent = NULL;
+		ListCell *cell   = NULL;
+		char  *name = NULL;
+		Aggref *agg = NULL;
+		Node  *expr = linitial(subselect->targetList);
+
+		/* process 'op' and 'bool' expr only */
+		if (contain_notexpr_or_neopexpr(whereClause, true, &joinquals))
+			return NULL;
+
+		expr = (Node *)((TargetEntry *)expr)->expr;
+		/*
+		 * First node must be Agg.
+		 * we optimize subquery only like "SELECT agg()",
+		 * others will not be optimized for now.
+		 */
+        if (!IsA(expr, Aggref))
+            return NULL;
+
+        agg = (Aggref *)expr;
+        name = get_func_name(agg->aggfnoid);
+        if(!name)
+        {
+            return NULL;
+        }
+
+        /* count agg */
+        if (pg_strcasecmp(name, "count") == 0)
+        {
+            count_agg = true;
+        }
+        /* strict aggs are allowed */
+        else if (pg_strcasecmp(name, "max") != 0    && pg_strcasecmp(name, "min") != 0 &&
+                 pg_strcasecmp(name, "stddev") != 0 && pg_strcasecmp(name, "sum") != 0 &&
+                 pg_strcasecmp(name, "avg") != 0    && pg_strcasecmp(name, "variance") != 0)
+        {
+            return NULL;
+        }
+
+		vars = pull_vars_of_level((Node *) joinquals, 0);
+
+		/* construct groupby clause */
+        foreach (cell, vars)
+        {
+        	Oid sortop;
+        	Oid eqop;
+        	bool hashable;
+        	Oid restype;
+        	SortGroupClause *grpcl;
+        	Var *var = (Var *) lfirst(cell);
+        	RangeTblEntry *tbl = (RangeTblEntry *) list_nth(subselect->rtable, var->varno - 1);
+
+        	if (tbl->rtekind != RTE_RELATION && tbl->rtekind != RTE_CTE)
+        		return NULL;
+
+        	restype = exprType((Node *) var);
+
+        	grpcl = makeNode(SortGroupClause);
+        	ressortgroupref++;
+
+        	if (tbl->rtekind == RTE_RELATION)
+        	{
+        		ent = makeTargetEntry((Expr *) copyObject(var), var->varoattno,
+        							  get_relid_attribute_name(tbl->relid, var->varoattno), false);
+        	}
+        	else
+        	{
+        		int plan_id;
+        		int ndx;
+        		ListCell *lc;
+        		Plan *cte_plan;
+        		TargetEntry *cte_ent = NULL;
+
+        		/*
+        		 * Note: cte_plan_ids can be shorter than cteList, if we are still working
+        		 * on planning the CTEs (ie, this is a side-reference from another CTE).
+        		 * So we mustn't use forboth here.
+        		 */
+        		ndx = 0;
+        		foreach (lc, root->parse->cteList)
+        		{
+        			CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+
+        			if (strcmp(cte->ctename, tbl->ctename) == 0)
+        				break;
+        			ndx++;
+        		}
+        		if (lc == NULL) /* shouldn't happen */
+        			elog(ERROR, "could not find CTE \"%s\"", tbl->ctename);
+        		if (ndx >= list_length(root->cte_plan_ids))
+        			elog(ERROR, "could not find plan for CTE \"%s\"", tbl->ctename);
+        		plan_id = list_nth_int(root->cte_plan_ids, ndx);
+        		cte_plan = (Plan *) lfirst(list_nth_cell(root->glob->subplans, plan_id - 1));
+        		cte_ent = (TargetEntry *) lfirst(list_nth_cell(cte_plan->targetlist, var->varattno - 1));
+        		ent = makeTargetEntry((Expr *) copyObject(var), var->varoattno, cte_ent->resname, false);
+        	}
+
+        	ent->ressortgroupref = ressortgroupref;
+
+        	subselect->targetList = lappend(subselect->targetList, ent);
+
+        	varno = list_length(subselect->targetList);
+        	ent->resno = varno;
+
+        	/* determine the eqop and optional sortop */
+        	get_sort_group_operators(restype,
+        							 false, true, false,
+        							 &sortop, &eqop, NULL,
+        							 &hashable);
+
+        	grpcl->tleSortGroupRef = ressortgroupref;
+        	grpcl->eqop = eqop;
+        	grpcl->sortop = sortop;
+        	grpcl->nulls_first = false; /* OK with or without sortop */
+        	grpcl->hashable = hashable;
+
+        	subselect->groupClause = lappend(subselect->groupClause, grpcl);
+        }
+
+        /*
+         * If we got Aggregation clause, since there is only one TargetList,
+         * then we can use JOIN_LEFT_SEMI over JOIN_LEFT/JOIN_LEFT_SCALAR to
+         * save more costs.
+         */
+        finalJoinType = JOIN_LEFT_SEMI;
+	}
+
+	/*
+	 * Move sub-select to the parent query.
+	 */
+	pstate = make_parsestate(NULL);
+	rte = addRangeTableEntryForSubquery(pstate,
+										subselect,
+										makeAlias("TARGETLIST_subquery", NIL),
+										true,
+										false);
+	parse->rtable = lappend(parse->rtable, rte);
+
+	rtr = makeNode(RangeTblRef);
+	rtr->rtindex = list_length(parse->rtable);
+
+	/*
+	 * Form join node.
+	 */
+	joinExpr = makeNode(JoinExpr);
+	joinExpr->jointype = finalJoinType;
+	joinExpr->isNatural = false;
+	joinExpr->larg = (Node *) root->parse->jointree;
+	joinExpr->rarg = (Node *) rtr;
+	joinExpr->usingClause = NIL;
+	joinExpr->alias   = NULL;
+	joinExpr->rtindex = 0; /* we don't need an RTE for it */
+	joinExpr->quals   = NULL;
+
+	/* Wrap join node in FromExpr as required. */
+	parse->jointree = makeFromExpr(list_make1(joinExpr), NULL);
+
+	/* Build a Var pointing to the subquery */
+	target = (Node *)makeVarFromTargetEntry(rtr->rtindex,
+											linitial(subselect->targetList));
+
+	/* Add Coalesce(count,0) */
+    if (count_agg)
+    {
+        CoalesceExpr *coalesce = makeNode(CoalesceExpr);
+        Const *constExpr = makeConst(INT8OID, -1, InvalidOid, sizeof(int64),
+        							 Int64GetDatum(0), false, true);
+
+        coalesce->args = list_make2(target, constExpr);
+        coalesce->coalescetype = INT8OID;
+        target = (Node *) coalesce;
+    }
+
+	/* Replace sublink node with Result. */
+	entry->expr = (Expr *)substitute_sublink_with_node((Node *)entry->expr,
+													   sublink,
+													   target);
+	return entry;
+}
+#endif
+
 static Expr *
 convert_OR_EXIST_sublink_to_join(PlannerInfo *root, SubLink *sublink, Node **jtlink)
 {
@@ -2586,7 +3497,9 @@ convert_OR_EXIST_sublink_to_join(PlannerInfo *root, SubLink *sublink, Node **jtl
 		Oid restype;
 		SortGroupClause *grpcl;
 		TargetEntry *entry;
-		subselect->targetList = append_var_to_subquery_targetlist((Var *)lfirst(cell), subselect->targetList, &entry);
+
+        subselect->targetList = append_var_to_subquery_targetlist((Var *)lfirst(cell),
+                                                                  subselect->targetList, &entry);
 		restype = exprType((Node *)entry->expr);
 		get_sort_group_operators(restype,
 								 false, true, false,
@@ -4795,3 +5708,131 @@ SS_make_initplan_from_plan(PlannerInfo *root,
     /* Set costs of SubPlan using info from the plan tree */
     cost_subplan(subroot, node, plan);
 }
+/*
+ * SS_remote_attach_initplans
+ *
+ * recursively look into a plantree, find any RemoteSubplan and
+ * attach params id that generated from init-plan of this query.
+ */
+void
+SS_remote_attach_initplans(PlannerInfo *root, Plan *plan)
+{
+	ListCell   *lc;
+	
+	if (plan == NULL)
+		return;
+	
+	if (IsA(plan, RemoteSubplan))
+	{
+		ListCell *plan_lc, *param_lc;
+		RemoteSubplan *rsplan = (RemoteSubplan *) plan;
+		Assert(rsplan->initPlanParams == NULL);
+		foreach(plan_lc, root->init_plans)
+		{
+			SubPlan *initplan = (SubPlan *) lfirst(plan_lc);
+			foreach(param_lc, initplan->setParam)
+			{
+				rsplan->initPlanParams = 
+					bms_add_member(rsplan->initPlanParams, lfirst_int(param_lc));
+			}
+		}
+	}
+	
+	switch (nodeTag(plan))
+	{
+		case T_SubqueryScan:
+		{
+			SubqueryScan *sscan = (SubqueryScan *) plan;
+			RelOptInfo *rel;
+			
+			rel = find_base_rel(root, sscan->scan.scanrelid);
+			SS_remote_attach_initplans(rel->subroot, sscan->subplan);
+		}
+			break;
+		case T_CustomScan:
+		{
+			foreach(lc, ((CustomScan *) plan)->custom_plans)
+				SS_remote_attach_initplans(root, (Plan *) lfirst(lc));
+		}
+			break;
+		case T_ModifyTable:
+		{
+			foreach(lc, ((ModifyTable *) plan)->plans)
+				SS_remote_attach_initplans(root, (Plan *) lfirst(lc));
+		}
+			break;
+		case T_Append:
+		{
+			foreach(lc, ((Append *) plan)->appendplans)
+				SS_remote_attach_initplans(root, (Plan *) lfirst(lc));
+		}
+			break;
+		case T_MergeAppend:
+		{
+			foreach(lc, ((MergeAppend *) plan)->mergeplans)
+				SS_remote_attach_initplans(root, (Plan *) lfirst(lc));
+		}
+			break;
+		case T_BitmapAnd:
+		{
+			foreach(lc, ((BitmapAnd *) plan)->bitmapplans)
+				SS_remote_attach_initplans(root, (Plan *) lfirst(lc));
+		}
+			break;
+		case T_BitmapOr:
+		{
+			foreach(lc, ((BitmapOr *) plan)->bitmapplans)
+				SS_remote_attach_initplans(root, (Plan *) lfirst(lc));
+		}
+			break;
+		default:
+			break;
+	}
+	
+	/* Process left and right child plans, if any */
+	SS_remote_attach_initplans(root, plan->lefttree);
+	SS_remote_attach_initplans(root, plan->righttree);
+}
+
+#ifdef __TBASE__
+static bool
+var_is_nullable(Node *node, Query *parse)
+{
+	RangeTblEntry* rte;
+	bool result = true;
+	Var *var = NULL;
+
+	if (IsA(node, Var))
+		var = (Var*) node;
+	else
+		return true;
+
+	if (IS_SPECIAL_VARNO(var->varno) ||
+		var->varno <= 0 || var->varno > list_length(parse->rtable))
+		return true;
+
+	rte = (RangeTblEntry *)list_nth(parse->rtable, var->varno - 1);
+	if (rte->rtekind == RTE_RELATION)
+	{
+		HeapTuple tp;
+
+		tp = SearchSysCache2(ATTNUM, ObjectIdGetDatum(rte->relid), Int16GetDatum(var->varattno));
+		if (!HeapTupleIsValid(tp))
+			return true;
+		result = !((Form_pg_attribute)GETSTRUCT(tp))->attnotnull;
+		ReleaseSysCache(tp);
+	}
+	else if (rte->rtekind == RTE_SUBQUERY)
+	{
+		if (rte->subquery->groupingSets == NIL)
+		{
+			TargetEntry *te = (TargetEntry *)list_nth(rte->subquery->targetList, var->varattno - 1);
+			if (IsA(te->expr, Var))
+				result = var_is_nullable((Node *)te->expr, rte->subquery);
+		}
+	}
+
+	return result;
+}
+
+#endif

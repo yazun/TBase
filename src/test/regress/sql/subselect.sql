@@ -598,3 +598,309 @@ select * from
   where tattle(x, u);
 
 drop function tattle(x int, y int);
+
+--
+-- Tests for pulling up more sublinks
+--
+
+set enable_pullup_subquery to true;
+create table tbl_a(a int,b int);
+create table tbl_b(a int,b int);
+insert into tbl_a select generate_series(1,10),1;
+insert into tbl_b select generate_series(2,11),1;
+
+-- check targetlist subquery scenario.
+set enable_nestloop to true;
+set enable_hashjoin to false;
+set enable_mergejoin to false;
+explain select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+
+set enable_nestloop to false;
+set enable_hashjoin to true;
+set enable_mergejoin to false;
+explain (costs off) select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+
+set enable_nestloop to false;
+set enable_hashjoin to false;
+set enable_mergejoin to true;
+explain (costs off) select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+
+-- check non-scalar scenario.
+insert into tbl_b values(2,2);
+
+set enable_nestloop to true;
+set enable_hashjoin to false;
+set enable_mergejoin to false;
+explain (costs off) select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+
+set enable_nestloop to false;
+set enable_hashjoin to true;
+set enable_mergejoin to false;
+explain (costs off) select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+
+set enable_nestloop to false;
+set enable_hashjoin to false;
+set enable_mergejoin to true;
+explain (costs off) select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+select a.a,(select b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+
+explain (costs off) select a.a,(select b.a from tbl_b b where b.a = a.a and b.a = 5) q from tbl_a a order by 1,2;
+select a.a,(select b.a from tbl_b b where b.a = a.a and b.a = 5) q from tbl_a a order by 1,2;
+
+-- check distinct scenario.
+set enable_nestloop to true;
+set enable_hashjoin to false;
+set enable_mergejoin to false;
+explain (costs  off) select a.a,(select distinct b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+select a.a,(select distinct b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+
+set enable_nestloop to false;
+set enable_hashjoin to true;
+set enable_mergejoin to false;
+explain (costs off) select a.a,(select distinct b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+select a.a,(select distinct b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+
+set enable_nestloop to false;
+set enable_hashjoin to false;
+set enable_mergejoin to true;
+explain (costs  off) select a.a,(select distinct b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+select a.a,(select distinct b.a from tbl_b b where b.a = a.a) q from tbl_a a order by 1,2;
+
+set enable_nestloop to true;
+set enable_hashjoin to true;
+set enable_mergejoin to true;
+
+-- targetlist sublink with agg
+explain (costs off)  select (select sum(b.a) from tbl_b b where b.a = a.a and b.b = a.b) from tbl_a a order by 1;
+select (select sum(b.a) from tbl_b b where b.a = a.a and b.b = a.b) from tbl_a a order by 1;
+explain (costs off)  select (select count(b.a) from tbl_b b where b.a = a.a) from tbl_a a order by 1;
+select (select count(b.a) from tbl_b b where b.a = a.a ) from tbl_a a order by 1;
+explain (costs off) select (select sum(b.a) from tbl_b b where b.a = a.a and b.b = a.b or b.a = 1) from tbl_a a order by 1;
+select (select sum(b.a) from tbl_b b where b.a = a.a and b.b = a.b or b.a = 1) from tbl_a a order by 1;
+
+-- targetlist sublink wrapped in expr
+explain (costs off)  select (case when a.b =1 then (select sum(b.a) from tbl_b b where b.a = a.a and b.b = a.b) else 0 end) from tbl_a a order by 1;
+select (case when a.b =1 then (select sum(b.a) from tbl_b b where b.a = a.a and b.b = a.b) else 0 end) from tbl_a a order by 1;
+explain (costs off)  select (case when a.b =1 then (select b.a from tbl_b b where b.a = a.a and b.b = a.b) else 0 end) from tbl_a a order by 1;
+select (case when a.b =1 then (select b.a from tbl_b b where b.a = a.a and b.b = a.b) else 0 end) from tbl_a a order by 1;
+explain (costs off)  select (case when a.b =1 then (select count(*) from tbl_b b where b.a = a.a and b.b = a.b and a.b in (1,2)) else 0 end) from tbl_a a order by 1;
+select (case when a.b =1 then (select count(*) from tbl_b b where b.a = a.a and b.b = a.b and a.b in (1,2)) else 0 end) from tbl_a a order by 1;
+explain (costs off)  select (case when a.b =1 then (select count(*) from tbl_b b where b.a = a.a and b.b = a.b and a.b is not null) else 0 end) from tbl_a a order by 1;
+select (case when a.b =1 then (select count(*) from tbl_b b where b.a = a.a and b.b = a.b and a.b is not null) else 0 end) from tbl_a a order by 1;
+
+-- targetlist sublink with limit 1
+explain (costs off) select a.a,(select b.a from tbl_b b where b.a = a.a limit 1) q from tbl_a a order by 1,2;
+select a.a,(select b.a from tbl_b b where b.a = a.a limit 1) q from tbl_a a order by 1,2;
+
+-- support pullup lateral ANY_SUBLINK
+explain select * from tbl_a a where a.b IN (select b.a from tbl_b b where b.b > a.b);
+select * from tbl_a a where a.b IN (select b.a from tbl_b b where b.b > a.b);
+explain select * from tbl_a a where a.b NOT IN (select b.a from tbl_b b where b.b > a.b);
+select * from tbl_a a where a.b NOT IN (select b.a from tbl_b b where b.b > a.b);
+
+drop table tbl_a;
+drop table tbl_b;
+
+-- test NOT IN/ANY with NOT NULL restriction
+create table tbl_a(a int NOT NULL, b int NOT NULL);
+create table tbl_b(a int NOT NULL, b int NOT NULL);
+insert into tbl_a select generate_series(1,10),1;
+insert into tbl_b select generate_series(2,11),1;
+
+explain select * from tbl_a a where a.b NOT IN (select b.a from tbl_b b where b.b > a.b);
+select * from tbl_a a where a.b NOT IN (select b.a from tbl_b b where b.b > a.b);
+
+drop table tbl_a;
+drop table tbl_b;
+
+-- more RTEs in subquery
+CREATE TABLE sub_t1 (a int4, b int4);
+CREATE TABLE sub_t2 (a int4, b int4);
+CREATE TABLE sub_interfere1 (a int4, b int4);
+CREATE TABLE sub_interfere2 (a int4, b int4);
+explain (costs off)
+select 1 from 
+	sub_t1 t1,
+	sub_t2 t2
+where t2.a = (
+	select 
+		min(t2.a)
+	from
+		sub_t2 t2,
+		sub_interfere1,
+		sub_interfere2
+	where
+		t1.a = t2.a
+);
+DROP TABLE sub_t1;
+DROP TABLE sub_t2;
+DROP TABLE sub_interfere1;
+DROP TABLE sub_interfere2;
+set enable_pullup_subquery to false;
+-- Test that LIMIT can be pushed to SORT through a subquery that just projects
+-- columns.  We check for that having happened by looking to see if EXPLAIN
+-- ANALYZE shows that a top-N sort was used.  We must suppress or filter away
+-- all the non-invariant parts of the EXPLAIN ANALYZE output.
+--
+create table sq_limit (pk int primary key, c1 int, c2 int);
+insert into sq_limit values
+    (1, 1, 1),
+    (2, 2, 2),
+    (3, 3, 3),
+    (4, 4, 4),
+    (5, 1, 1),
+    (6, 2, 2),
+    (7, 3, 3),
+    (8, 4, 4);
+
+create function explain_sq_limit() returns setof text language plpgsql as
+$$
+declare ln text;
+begin
+    for ln in
+        explain (analyze, summary off, timing off, costs off)
+        select * from (select pk,c2 from sq_limit order by c1,pk) as x limit 3
+    loop
+        ln := regexp_replace(ln, 'Memory: \S*',  'Memory: xxx');
+        -- this case might occur if force_parallel_mode is on:
+        ln := regexp_replace(ln, 'Worker 0:  Sort Method',  'Sort Method');
+        return next ln;
+    end loop;
+end;
+$$;
+
+--
+-- Tests for CTE inlining behavior
+--
+
+-- Basic subquery that can be inlined
+explain (verbose, costs off)
+with x as (select * from (select f1 from subselect_tbl) ss)
+select * from x where f1 = 1;
+
+-- Explicitly request materialization
+explain (verbose, costs off)
+with x as materialized (select * from (select f1 from subselect_tbl) ss)
+select * from x where f1 = 1;
+
+-- Stable functions are safe to inline
+explain (verbose, costs off)
+with x as (select * from (select f1, now() from subselect_tbl) ss)
+select * from x where f1 = 1;
+
+-- Volatile functions prevent inlining
+explain (verbose, costs off)
+with x as (select * from (select f1, random() from subselect_tbl) ss)
+select * from x where f1 = 1;
+
+-- SELECT FOR UPDATE cannot be inlined
+explain (verbose, costs off)
+with x as (select * from (select f1 from subselect_tbl for update) ss)
+select * from x where f1 = 1;
+
+-- Multiply-referenced CTEs are inlined only when requested
+explain (verbose, costs off)
+with x as (select * from (select f1, now() as n from subselect_tbl) ss)
+select * from x, x x2 where x.n = x2.n;
+
+explain (verbose, costs off)
+with x as not materialized (select * from (select f1, now() as n from subselect_tbl) ss)
+select * from x, x x2 where x.n = x2.n;
+
+-- Multiply-referenced CTEs can't be inlined if they contain outer self-refs
+explain (verbose, costs off)
+with recursive x(a) as
+  ((values ('a'), ('b'))
+   union all
+   (with z as not materialized (select * from x)
+    select z.a || z1.a as a from z cross join z as z1
+    where length(z.a || z1.a) < 5))
+select * from x;
+
+with recursive x(a) as
+  ((values ('a'), ('b'))
+   union all
+   (with z as not materialized (select * from x)
+    select z.a || z1.a as a from z cross join z as z1
+    where length(z.a || z1.a) < 5))
+select * from x;
+
+explain (verbose, costs off)
+with recursive x(a) as
+  ((values ('a'), ('b'))
+   union all
+   (with z as not materialized (select * from x)
+    select z.a || z.a as a from z
+    where length(z.a || z.a) < 5))
+select * from x;
+
+with recursive x(a) as
+  ((values ('a'), ('b'))
+   union all
+   (with z as not materialized (select * from x)
+    select z.a || z.a as a from z
+    where length(z.a || z.a) < 5))
+select * from x;
+
+-- Check handling of outer references
+explain (verbose, costs off)
+with x as (select * from int4_tbl)
+select * from (with y as (select * from x) select * from y) ss;
+
+explain (verbose, costs off)
+with x as materialized (select * from int4_tbl)
+select * from (with y as (select * from x) select * from y) ss;
+
+-- Ensure that we inline the currect CTE when there are
+-- multiple CTEs with the same name
+explain (verbose, costs off)
+with x as (select 1 as y)
+select * from (with x as (select 2 as y) select * from x) ss;
+
+-- Row marks are not pushed into CTEs
+explain (verbose, costs off)
+with x as (select * from subselect_tbl)
+select * from x for update;
+
+-- test subquery pathkey
+CREATE TABLE catalog_sales (
+    cs_sold_date_sk integer,
+    cs_item_sk integer NOT NULL,
+    cs_order_number integer NOT NULL
+);
+CREATE TABLE catalog_returns (
+    cr_returned_date_sk integer,
+    cr_item_sk integer NOT NULL,
+    cr_order_number integer NOT NULL
+);
+CREATE TABLE date_dim (
+    d_date_sk integer NOT NULL,
+    d_year integer
+);
+with cs as
+(
+    select d_year AS cs_sold_year, cs_item_sk
+    from catalog_sales
+        left join catalog_returns on cr_order_number=cs_order_number and cs_item_sk=cr_item_sk
+        join date_dim on cs_sold_date_sk = d_date_sk
+    order by d_year, cs_item_sk
+)
+select 1
+from date_dim
+    join cs on (cs_sold_year=d_year and cs_item_sk=cs_item_sk);
+drop table catalog_sales, catalog_returns, date_dim;
+
+-- not in optimization
+create table notin_t1 (id1 int, num1 int not null);
+create table notin_t2 (id2 int, num2 int not null);
+explain(costs off) select num1 from notin_t1 where num1 not in (select num2 from notin_t2);
+drop table notin_t1;
+drop table notin_t2;
+drop function explain_sq_limit();
+
+drop table sq_limit;

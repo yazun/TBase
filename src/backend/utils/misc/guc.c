@@ -39,6 +39,7 @@
 #include "access/xact.h"
 #include "access/xlog_internal.h"
 #include "access/heapam_xlog.h"
+#include "access/lru.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "commands/async.h"
@@ -178,6 +179,7 @@ extern char *default_tablespace;
 extern char *temp_tablespaces;
 extern bool ignore_checksum_failure;
 extern bool synchronize_seqscans;
+extern bool enable_cold_hot_router_print;
 #ifdef _PUB_SUB_RELIABLE_
 static char * g_wal_stream_type_str;
 #endif
@@ -198,6 +200,7 @@ extern BackendId CoordSessionBackendId;
 extern bool    PlpgsqlDebugPrint;
 /* used for get total size of session */
 static int32 g_TotalMemorySize = 0;
+extern bool    enable_parallel_ddl;
 #endif
 static int    GUC_check_errcode_value;
 
@@ -1020,105 +1023,116 @@ static const unit_conversion time_unit_conversion_table[] =
 
 static struct config_bool ConfigureNamesBool[] =
 {
-    {
-        {"enable_seqscan", PGC_USERSET, QUERY_TUNING_METHOD,
-            gettext_noop("Enables the planner's use of sequential-scan plans."),
-            NULL
-        },
-        &enable_seqscan,
-        true,
-        NULL, NULL, NULL
-    },
-    {
-        {"enable_indexscan", PGC_USERSET, QUERY_TUNING_METHOD,
-            gettext_noop("Enables the planner's use of index-scan plans."),
-            NULL
-        },
-        &enable_indexscan,
-        true,
-        NULL, NULL, NULL
-    },
-    {
-        {"enable_indexonlyscan", PGC_USERSET, QUERY_TUNING_METHOD,
-            gettext_noop("Enables the planner's use of index-only-scan plans."),
-            NULL
-        },
-        &enable_indexonlyscan,
-        true,
-        NULL, NULL, NULL
-    },
-    {
-        {"enable_bitmapscan", PGC_USERSET, QUERY_TUNING_METHOD,
-            gettext_noop("Enables the planner's use of bitmap-scan plans."),
-            NULL
-        },
-        &enable_bitmapscan,
-        true,
-        NULL, NULL, NULL
-    },
-    {
-        {"enable_tidscan", PGC_USERSET, QUERY_TUNING_METHOD,
-            gettext_noop("Enables the planner's use of TID scan plans."),
-            NULL
-        },
-        &enable_tidscan,
-        true,
-        NULL, NULL, NULL
-    },
-    {
-        {"enable_sort", PGC_USERSET, QUERY_TUNING_METHOD,
-            gettext_noop("Enables the planner's use of explicit sort steps."),
-            NULL
-        },
-        &enable_sort,
-        true,
-        NULL, NULL, NULL
-    },
-    {
-        {"enable_hashagg", PGC_USERSET, QUERY_TUNING_METHOD,
-            gettext_noop("Enables the planner's use of hashed aggregation plans."),
-            NULL
-        },
-        &enable_hashagg,
-        true,
-        NULL, NULL, NULL
-    },
-    {
-        {"enable_material", PGC_USERSET, QUERY_TUNING_METHOD,
-            gettext_noop("Enables the planner's use of materialization."),
-            NULL
-        },
-        &enable_material,
-        true,
-        NULL, NULL, NULL
-    },
-    {
-        {"enable_nestloop", PGC_USERSET, QUERY_TUNING_METHOD,
-            gettext_noop("Enables the planner's use of nested-loop join plans."),
-            NULL
-        },
-        &enable_nestloop,
-        true,
-        NULL, NULL, NULL
-    },
-    {
-        {"enable_mergejoin", PGC_USERSET, QUERY_TUNING_METHOD,
-            gettext_noop("Enables the planner's use of merge join plans."),
-            NULL
-        },
-        &enable_mergejoin,
-        true,
-        NULL, NULL, NULL
-    },
-    {
-        {"enable_hashjoin", PGC_USERSET, QUERY_TUNING_METHOD,
-            gettext_noop("Enables the planner's use of hash join plans."),
-            NULL
-        },
-        &enable_hashjoin,
-        true,
-        NULL, NULL, NULL
-    },
+	{
+		{"enable_seqscan", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the planner's use of sequential-scan plans."),
+			NULL
+		},
+		&enable_seqscan,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_indexscan", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the planner's use of index-scan plans."),
+			NULL
+		},
+		&enable_indexscan,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_indexonlyscan", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the planner's use of index-only-scan plans."),
+			NULL
+		},
+		&enable_indexonlyscan,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_bitmapscan", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the planner's use of bitmap-scan plans."),
+			NULL
+		},
+		&enable_bitmapscan,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_tidscan", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the planner's use of TID scan plans."),
+			NULL
+		},
+		&enable_tidscan,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_sort", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the planner's use of explicit sort steps."),
+			NULL
+		},
+		&enable_sort,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_hashagg", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the planner's use of hashed aggregation plans."),
+			NULL
+		},
+		&enable_hashagg,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_material", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the planner's use of materialization."),
+			NULL
+		},
+		&enable_material,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_nestloop", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the planner's use of nested-loop join plans."),
+			NULL
+		},
+		&enable_nestloop,
+		true,
+		NULL, NULL, NULL
+	},
+#ifdef __TBASE__
+	{
+		{"enable_nestloop_suppression", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the selectivity hints when planning nested-loop joins."),
+			NULL
+		},
+		&enable_nestloop_suppression,
+		false,
+		NULL, NULL, NULL
+	},
+#endif
+	{
+		{"enable_mergejoin", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the planner's use of merge join plans."),
+			NULL
+		},
+		&enable_mergejoin,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_hashjoin", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the planner's use of hash join plans."),
+			NULL
+		},
+		&enable_hashjoin,
+		true,
+		NULL, NULL, NULL
+	},
 #ifdef PGXC
     {
         {"enable_fast_query_shipping", PGC_USERSET, QUERY_TUNING_METHOD,
@@ -2042,25 +2056,15 @@ static struct config_bool ConfigureNamesBool[] =
     },
 
 #ifdef __TBASE__
-    {
-        {"enable_statistic", PGC_SIGHUP, STATS_COLLECTOR,
-            gettext_noop("collect statistic information for debug."),
-            NULL
-        },
-        &enable_statistic,
-        false,
-        NULL, NULL, NULL
-    },
-    
-    {
-        {"use_data_pump", PGC_SIGHUP, CUSTOM_OPTIONS,
-            gettext_noop("use datapump to make data transfer more efficient."),
-            NULL
-        },
-        &g_UseDataPump,
-        true,
-        NULL, NULL, NULL
-    },
+	{
+		{"enable_statistic", PGC_SIGHUP, STATS_COLLECTOR,
+			gettext_noop("collect statistic information for debug."),
+			NULL
+		},
+		&enable_statistic,
+		false,
+		NULL, NULL, NULL
+	},
 
     {
         {"debug_data_pump", PGC_SIGHUP, CUSTOM_OPTIONS,
@@ -2097,16 +2101,16 @@ static struct config_bool ConfigureNamesBool[] =
         NULL, NULL, NULL
     },
 
-    {
-        {
-            "enable_pgbouncer", PGC_SIGHUP, STATS_COLLECTOR,
-            gettext_noop("use pgbouncer as coordinator connection pool."),
-            NULL
-        },
-        &g_enable_bouncer,
-        false,
-        NULL, NULL, NULL
-    },    
+	{
+		{
+			"enable_pgbouncer", PGC_SIGHUP, STATS_COLLECTOR,
+			gettext_noop("use pgbouncer as coordinator connection pool."),
+			NULL
+		},
+		&g_enable_bouncer,
+		false,
+		NULL, NULL, NULL
+	},   
 
     {
         {
@@ -2194,16 +2198,6 @@ static struct config_bool ConfigureNamesBool[] =
     },
 
     {
-        {"enable_group_across_query", PGC_USERSET, CUSTOM_OPTIONS,
-            gettext_noop("enable group-across queries."),
-            NULL
-        },
-        &enable_group_across_query,
-        false,
-        NULL, NULL, NULL
-    },
-
-	{
 		{"enable_distributed_unique_plan", PGC_USERSET, CUSTOM_OPTIONS,
 			gettext_noop("enable distributed unique plan."),
 			NULL
@@ -2298,6 +2292,16 @@ static struct config_bool ConfigureNamesBool[] =
 		},
 		&g_hybrid_hash_agg_debug,
 		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"enable_subquery_shipping", PGC_USERSET, CUSTOM_OPTIONS,
+			gettext_noop("support fast query shipping for subquery"),
+			NULL
+		},
+		&enable_subquery_shipping,
+		true,
 		NULL, NULL, NULL
 	},
 #endif
@@ -2420,6 +2424,15 @@ static struct config_bool ConfigureNamesBool[] =
         NULL, NULL, NULL
     },
     {
+        {"enable_pooler_thread_log_print", PGC_USERSET, CUSTOM_OPTIONS,
+         gettext_noop("enable pooler manager sub thread log print"),
+         NULL
+        },
+        &PoolSubThreadLogPrint,
+        true,
+        NULL, NULL, NULL
+    },
+	{
         {"enable_plpgsql_debug_print", PGC_SUSET, CUSTOM_OPTIONS,
             gettext_noop("enable plpgsql debug infomation print"),
             NULL
@@ -2658,24 +2671,112 @@ static struct config_bool ConfigureNamesBool[] =
 #endif
 
 #ifdef __TBASE__
+	{
+		{"enable_lock_account", PGC_SUSET, CUSTOM_OPTIONS,
+			gettext_noop("Enable lock account when login fail serval times."),
+			NULL
+		},
+		&enable_lock_account,
+		false,
+		NULL, NULL, NULL
+	},
+	{
+		{"lock_account_print", PGC_SUSET, CUSTOM_OPTIONS,
+			gettext_noop("Enable print log in lock account procedure."),
+			NULL
+		},
+		&lock_account_print,
+		false,
+		NULL, NULL, NULL
+	},
     {
-        {"enable_lock_account", PGC_SUSET, CUSTOM_OPTIONS,
-            gettext_noop("Enable lock account when login fail serval times."),
-            NULL
+        {"enable_parallel_ddl", PGC_USERSET, CUSTOM_OPTIONS,
+             gettext_noop("Enable parallel DDL with no deadlock."),
+             NULL
         },
-        &enable_lock_account,
+        &enable_parallel_ddl,
         false,
         NULL, NULL, NULL
     },
     {
-        {"lock_account_print", PGC_SUSET, CUSTOM_OPTIONS,
-            gettext_noop("Enable print log in lock account procedure."),
-            NULL
-        },
-        &lock_account_print,
-        false,
-        NULL, NULL, NULL
-    },
+		{"enable_buffer_mprotect", PGC_POSTMASTER, CUSTOM_OPTIONS,
+			gettext_noop("Protect memory corruption for share buffer"),
+			NULL,
+			GUC_NOT_IN_SAMPLE,
+		},
+		&enable_buffer_mprotect,
+#ifdef _PG_REGRESS_
+		true,
+#else
+		false,
+#endif
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_clog_mprotect", PGC_POSTMASTER, CUSTOM_OPTIONS,
+			gettext_noop("Protect memory corruption for clog"),
+			NULL,
+			GUC_NOT_IN_SAMPLE,
+		},
+		&enable_clog_mprotect,
+#ifdef _PG_REGRESS_
+		true,
+#else
+		false,
+#endif
+		NULL, NULL, NULL
+	},
+	{
+	{"enable_tlog_mprotect", PGC_POSTMASTER, CUSTOM_OPTIONS,
+		gettext_noop("Protect memory corruption for tlog"),
+		NULL,
+		GUC_NOT_IN_SAMPLE,
+		},
+		&enable_tlog_mprotect,
+#ifdef _PG_REGRESS_
+		true,
+#else
+		false,
+#endif
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_xlog_mprotect", PGC_POSTMASTER, CUSTOM_OPTIONS,
+			gettext_noop("Protect memory corruption for xlog"),
+			NULL,
+			GUC_NOT_IN_SAMPLE,
+		},
+		&enable_xlog_mprotect,
+#ifdef _PG_REGRESS_
+		true,
+#else
+		false,
+#endif
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_cold_hot_router_print", PGC_USERSET, CUSTOM_OPTIONS,
+			 gettext_noop("Whether print cold hot router."),
+			 NULL
+		},
+		&enable_cold_hot_router_print,
+		false,
+		NULL, NULL, NULL
+	},
+    {
+		{"enable_memory_optimization", PGC_POSTMASTER, RESOURCES,
+			gettext_noop("enable session cache memory control"),
+			NULL
+		},
+		&enable_memory_optimization,
+#ifdef _PG_REGRESS_
+		true,
+#else
+		false,
+#endif
+		NULL, NULL, NULL
+	},
+
 #endif
 
     /* End-of-list marker */
@@ -3067,15 +3168,25 @@ static struct config_int ConfigureNamesInt[] =
         NULL, NULL, NULL
     },
 
-    {
-        {"max_files_per_process", PGC_POSTMASTER, RESOURCES_KERNEL,
-            gettext_noop("Sets the maximum number of simultaneously open files for each server process."),
-            NULL
-        },
-        &max_files_per_process,
-        1000, 25, INT_MAX,
-        NULL, NULL, NULL
-    },
+	{
+		{"gts_maintain_option", PGC_SIGHUP, DEVELOPER_OPTIONS,
+			gettext_noop("Enables check correctness of GTS and reseting it if it is wrong"),
+			NULL
+		},
+		&gts_maintain_option,
+		0, 0, 2,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"max_files_per_process", PGC_POSTMASTER, RESOURCES_KERNEL,
+			gettext_noop("Sets the maximum number of simultaneously open files for each server process."),
+			NULL
+		},
+		&max_files_per_process,
+		1000, 25, INT_MAX,
+		NULL, NULL, NULL
+	},
 
     /*
      * See also CheckRequiredParameterValues() if this parameter changes
@@ -3693,6 +3804,28 @@ static struct config_int ConfigureNamesInt[] =
         0, 0, 31536000,
         NULL, NULL, NULL
     },
+	{
+		{"max_relcache_relations", PGC_POSTMASTER, RESOURCES,
+			gettext_noop("max relcache relations per session."),
+			NULL
+		},
+		&max_relcache_relations,
+#ifdef _PG_REGRESS_
+		500, 500, INT_MAX,
+#else
+		2000, 500, INT_MAX,
+#endif
+		NULL, NULL, NULL
+	},
+	{
+		{"number_replaced_relations", PGC_POSTMASTER, RESOURCES,
+			gettext_noop("max relcache relations while replacing."),
+			NULL
+		},
+		&number_replaced_relations,
+		10, 1, 500,
+		NULL, NULL, NULL
+	},
 #endif
     {
         {"log_rotation_age", PGC_SIGHUP, LOGGING_WHERE,
@@ -3766,6 +3899,16 @@ static struct config_int ConfigureNamesInt[] =
         NULL, NULL, NULL
     },
     {
+		{"alog_trace_queue_size", PGC_POSTMASTER, LOGGING_WHERE,
+			gettext_noop("Size of share memory queue for each backend to store trace audit log, kilobytes."),
+			NULL,
+			GUC_UNIT_KB
+		},
+		&Maintain_trace_log_queue_size_kb,
+		64, 8, INT_MAX / 1024,
+		NULL, NULL, NULL
+	},
+    {
         {"alog_common_cache_size", PGC_POSTMASTER, LOGGING_WHERE,
             gettext_noop("Size of common audit log local buffer for each audit worker, kilobytes."),
             NULL,
@@ -3785,6 +3928,16 @@ static struct config_int ConfigureNamesInt[] =
         64, 8, INT_MAX / 1024,
         NULL, NULL, NULL
     },
+    {
+		{"alog_trace_cache_size", PGC_POSTMASTER, LOGGING_WHERE,
+			gettext_noop("Size of trace audit log local buffer for each audit worker, kilobytes."),
+			NULL,
+			GUC_UNIT_KB
+		},
+		&Maintain_trace_log_cache_size_kb,
+		64, 8, INT_MAX / 1024,
+		NULL, NULL, NULL
+	},
 #endif
     {
         {"max_function_args", PGC_INTERNAL, PRESET_OPTIONS,
@@ -4081,7 +4234,17 @@ static struct config_int ConfigureNamesInt[] =
         (512 * 1024) / BLCKSZ, 0, INT_MAX / 3,
         NULL, NULL, NULL
     },
-
+#ifdef __TBASE__
+	{
+		{"min_parallel_rows_size", PGC_USERSET, QUERY_TUNING_COST,
+			gettext_noop("Sets the minimum amount of rows for a parallel aggregate or scan."),
+			gettext_noop("If the planner estimates that it will read rows too small to reach this limit, a parallel plan will not be considered.")
+		},
+		&min_parallel_rows_size,
+		50000, 0, INT_MAX / 3,
+		NULL, NULL, NULL
+	},
+#endif
     {
         /* Can't be set in postgresql.conf */
         {"server_version_num", PGC_INTERNAL, PRESET_OPTIONS,
@@ -4216,10 +4379,10 @@ static struct config_int ConfigureNamesInt[] =
         {"pool_session_memory_limit", PGC_SIGHUP, DATA_NODES,
             gettext_noop("Datanode session max memory context size."),
             gettext_noop("Exceed limit will be closed."),
-            GUC_UNIT_S
+			GUC_UNIT_MB
         },
         &PoolMaxMemoryLimit,
-        10, 1, 10000,
+		10, -1, 10000,
         NULL, NULL, NULL
     },    
     {
@@ -4274,7 +4437,8 @@ static struct config_int ConfigureNamesInt[] =
     {
         {"session_memory_size", PGC_USERSET, RESOURCES_MEM,
             gettext_noop("Used to get the total memory size of the session, in M Bytes."),
-            gettext_noop("Used to get the total memory size of the session, in M Bytes.")
+			gettext_noop("Used to get the total memory size of the session, in M Bytes."),
+			GUC_UNIT_MB
         },
         &g_TotalMemorySize,
         0, 0, INT_MAX,
@@ -5840,7 +6004,7 @@ static struct config_enum ConfigureNamesEnum[] =
 
 #ifdef PGXC
     {
-        {"remotetype", PGC_BACKEND, CONN_AUTH,
+		{"remotetype", PGC_USERSET, CONN_AUTH,
             gettext_noop("Sets the type of Postgres-XL remote connection"),
             NULL
         },
@@ -8170,7 +8334,9 @@ set_config_option(const char *name, const char *value,
     if ((source == PGC_S_SESSION || source == PGC_S_CLIENT)
         && (IS_PGXC_DATANODE || !IsConnFromCoord())
         && (strcmp(name,"remotetype") != 0 && strcmp(name,"parentnode") != 0))
+    {
         send_to_nodes = true;
+    }
 #endif
 
 #ifdef PGXC
@@ -9033,6 +9199,7 @@ set_config_option(const char *name, const char *value,
         /* force_autocommit is actually does not start transaction on nodes */
         step->force_autocommit = true;
         step->exec_type = EXEC_ON_CURRENT;
+		step->is_set = true;
         ExecRemoteUtility(step);
         pfree(step);
         pfree(poolcmd.data);
@@ -13316,7 +13483,7 @@ show_total_memorysize(void)
     int32   size;
     static char buf[64];
     size = get_total_memory_size();
-    snprintf(buf, sizeof(buf), "%d", size);
+	snprintf(buf, sizeof(buf), "%dM", size);
     return buf;
 }
 #endif

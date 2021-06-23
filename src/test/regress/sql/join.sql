@@ -404,6 +404,8 @@ select aa, bb, unique1, unique1
 --
 -- regression test: check handling of empty-FROM subquery underneath outer join
 --
+set enable_nestloop to off;
+
 explain (costs off)
 select * from int8_tbl i1 left join (int8_tbl i2 join
   (select 123 as x) ss on i2.q1 = x) on i1.q2 = i2.q2
@@ -412,6 +414,8 @@ order by 1, 2;
 select * from int8_tbl i1 left join (int8_tbl i2 join
   (select 123 as x) ss on i2.q1 = x) on i1.q2 = i2.q2
 order by 1, 2;
+
+reset enable_nestloop;
 
 --
 -- regression test: check a case where join_clause_is_movable_into() gives
@@ -880,7 +884,7 @@ select * from int4_tbl a full join int4_tbl b on false order by 1,2;
 --
 -- test for ability to use a cartesian join when necessary
 --
-
+set enable_hashjoin = false;
 explain (num_nodes off, nodes off, costs off)
 select * from
   tenk1 join int4_tbl on f1 = twothousand,
@@ -894,15 +898,17 @@ select * from
   int4(sin(1)) q1,
   int4(sin(0)) q2
 where thousand = (q1 + q2);
+set enable_hashjoin = true;
 
 --
 -- test ability to generate a suitable plan for a star-schema query
 --
-
+set enable_mergejoin = false;
 explain (costs off)
 select * from
   tenk1, int8_tbl a, int8_tbl b
 where thousand = a.q1 and tenthous = b.q1 and a.q2 = 1 and b.q2 = 2;
+set enable_mergejoin = true;
 
 --
 -- test a corner case in which we shouldn't apply the star-schema optimization
@@ -1097,6 +1103,9 @@ using (join_key);
 --
 -- test successful handling of nested outer joins with degenerate join quals
 --
+set enable_nestloop to on;
+set enable_hashjoin to off;
+set enable_mergejoin to off;
 
 explain (verbose, costs off)
 select t1.* from
@@ -1188,6 +1197,9 @@ select * from
   left join int4_tbl i4
   on i8.q1 = i4.f1;
 
+reset enable_nestloop;
+reset enable_hashjoin;
+reset enable_mergejoin;
 --
 -- test for appropriate join order in the presence of lateral references
 --
@@ -1576,6 +1588,9 @@ select count(*) from tenk1 a,
   tenk1 b join lateral (values(a.unique1),(-1)) ss(x) on b.unique2 = ss.x;
 
 -- lateral injecting a strange outer join condition
+set enable_hashjoin to off;
+set enable_mergejoin to off;
+
 explain (num_nodes off, nodes off, costs off)
   select * from int8_tbl a,
     int8_tbl x left join lateral (select a.q1 from int4_tbl y) ss(z)
@@ -1585,6 +1600,9 @@ select * from int8_tbl a,
   int8_tbl x left join lateral (select a.q1 from int4_tbl y) ss(z)
     on x.q2 = ss.z
   order by a.q1, a.q2, x.q1, x.q2, ss.z;
+
+reset enable_hashjoin;
+reset enable_mergejoin;
 
 -- lateral reference to a join alias variable
 select * from (select f1/2 as x from int4_tbl) ss1 join int4_tbl i4 on x = f1,
@@ -1648,16 +1666,24 @@ select * from
 
 -- lateral can result in join conditions appearing below their
 -- real semantic level
+set enable_nestloop to on;
+set enable_hashjoin to off;
+set enable_mergejoin to off;
 explain (num_nodes off, nodes off, verbose, costs off)
 select * from int4_tbl i left join
   lateral (select * from int2_tbl j where i.f1 = j.f1) k on true;
 select * from int4_tbl i left join
   lateral (select * from int2_tbl j where i.f1 = j.f1) k on true order by 1;
+reset enable_nestloop;
+reset enable_hashjoin;
+reset enable_mergejoin
 explain (num_nodes off, nodes off, verbose, costs off)
 select * from int4_tbl i left join
   lateral (select coalesce(i) from int2_tbl j where i.f1 = j.f1) k on true;
 select * from int4_tbl i left join
   lateral (select coalesce(i) from int2_tbl j where i.f1 = j.f1) k on true order by 1;
+set enable_hashjoin to off;
+set enable_mergejoin to off;
 explain (num_nodes off, nodes off, verbose, costs off)
 select * from int4_tbl a,
   lateral (
@@ -1667,6 +1693,8 @@ select * from int4_tbl a,
   lateral (
     select * from int4_tbl b left join int8_tbl c on (b.f1 = q1 and a.f1 = q2)
   ) ss order by 1,2,3,4;
+reset enable_hashjoin;
+reset enable_mergejoin;
 
 -- lateral reference in a PlaceHolderVar evaluated at join level
 explain (num_nodes off, nodes off, verbose, costs off)
@@ -1961,3 +1989,273 @@ where exists (select 1 from j3
       and t1.unique1 < 1;
 
 drop table j3;
+
+--
+-- Test nestloop path suppression if the selectivity could be under estimated
+--
+create table nestloop_suppression1(a int, b int, c int, d varchar(20));
+create table nestloop_suppression2(a int, b int, c int, d varchar(20));
+create table nestloop_suppression3(a int, b int);
+
+insert into nestloop_suppression1 select i, i+1, i+2, 'char'||i from generate_series(1,10000) i;
+insert into nestloop_suppression2 select i, i+1, i+2, 'char'||i from generate_series(1,10000) i;
+insert into nestloop_suppression3 select i, i+1 from generate_series(1,100) i;
+create index idx_nestloop_suppression1_b on nestloop_suppression1(b);
+analyze nestloop_suppression1;
+analyze nestloop_suppression2;
+analyze nestloop_suppression3;
+begin;
+
+set local min_parallel_table_scan_size = 0;
+set local parallel_setup_cost = 0;
+
+-- Extract bucket and batch counts from an explain analyze plan.  In
+-- general we can't make assertions about how many batches (or
+-- buckets) will be required because it can vary, but we can in some
+-- special cases and we can check for growth.
+create or replace function find_hash(node json)
+returns json language plpgsql
+as
+$$
+declare
+  x json;
+  child json;
+begin
+  if node->>'Node Type' = 'Hash' then
+    return node;
+  else
+    for child in select json_array_elements(node->'Plans')
+    loop
+      x := find_hash(child);
+      if x is not null then
+        return x;
+      end if;
+    end loop;
+    return null;
+  end if;
+end;
+$$;
+create or replace function hash_join_batches(query text)
+returns table (original int, final int) language plpgsql
+as
+$$
+declare
+  whole_plan json;
+  hash_node json;
+begin
+  for whole_plan in
+    execute 'explain (analyze, format ''json'') ' || query
+  loop
+    hash_node := find_hash(json_extract_path(whole_plan, '0', 'Plan'));
+    original := hash_node->>'Original Hash Batches';
+    final := hash_node->>'Hash Batches';
+    return next;
+  end loop;
+end;
+$$;
+
+-- Make a simple relation with well distributed keys and correctly
+-- estimated size.
+create table simple as
+  select generate_series(1, 20000) AS id, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+alter table simple set (parallel_workers = 2);
+analyze simple;
+
+-- Make a relation whose size we will under-estimate.  We want stats
+-- to say 1000 rows, but actually there are 20,000 rows.
+create table bigger_than_it_looks as
+  select generate_series(1, 20000) as id, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+alter table bigger_than_it_looks set (autovacuum_enabled = 'false');
+alter table bigger_than_it_looks set (parallel_workers = 2);
+analyze bigger_than_it_looks;
+update pg_class set reltuples = 1000 where relname = 'bigger_than_it_looks';
+
+-- Make a relation whose size we underestimate and that also has a
+-- kind of skew that breaks our batching scheme.  We want stats to say
+-- 2 rows, but actually there are 20,000 rows with the same key.
+create table extremely_skewed (id int, t text);
+alter table extremely_skewed set (autovacuum_enabled = 'false');
+alter table extremely_skewed set (parallel_workers = 2);
+analyze extremely_skewed;
+insert into extremely_skewed
+  select 42 as id, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  from generate_series(1, 20000);
+update pg_class
+  set reltuples = 2, relpages = pg_relation_size('extremely_skewed') / 8192
+  where relname = 'extremely_skewed';
+
+-- The "optimal" case: the hash table fits in memory; we plan for 1
+-- batch, we stick to that number, and peak memory usage stays within
+-- our work_mem budget
+
+-- non-parallel
+savepoint settings;
+set local max_parallel_workers_per_gather = 0;
+set local work_mem = '4MB';
+explain (costs off)
+  select count(*) from simple r join simple s using (id);
+select count(*) from simple r join simple s using (id);
+select original > 1 as initially_multibatch, final > original as increased_batches
+  from hash_join_batches(
+$$
+  select count(*) from simple r join simple s using (id);
+$$);
+rollback to settings;
+
+-- parallel with parallel-oblivious hash join
+savepoint settings;
+set local max_parallel_workers_per_gather = 2;
+set local work_mem = '4MB';
+explain (costs off)
+  select count(*) from simple r join simple s using (id);
+select count(*) from simple r join simple s using (id);
+select original > 1 as initially_multibatch, final > original as increased_batches
+  from hash_join_batches(
+$$
+  select count(*) from simple r join simple s using (id);
+$$);
+rollback to settings;
+
+-- The "good" case: batches required, but we plan the right number; we
+-- plan for some number of batches, and we stick to that number, and
+-- peak memory usage says within our work_mem budget
+
+-- non-parallel
+savepoint settings;
+set local max_parallel_workers_per_gather = 0;
+set local work_mem = '128kB';
+explain (costs off)
+  select count(*) from simple r join simple s using (id);
+select count(*) from simple r join simple s using (id);
+select original > 1 as initially_multibatch, final > original as increased_batches
+  from hash_join_batches(
+$$
+  select count(*) from simple r join simple s using (id);
+$$);
+rollback to settings;
+
+-- parallel with parallel-oblivious hash join
+savepoint settings;
+set local max_parallel_workers_per_gather = 2;
+set local work_mem = '128kB';
+explain (costs off)
+  select count(*) from simple r join simple s using (id);
+select count(*) from simple r join simple s using (id);
+select original > 1 as initially_multibatch, final > original as increased_batches
+  from hash_join_batches(
+$$
+  select count(*) from simple r join simple s using (id);
+$$);
+rollback to settings;
+
+-- The "bad" case: during execution we need to increase number of
+-- batches; in this case we plan for 1 batch, and increase at least a
+-- couple of times, and peak memory usage stays within our work_mem
+-- budget
+
+-- non-parallel
+savepoint settings;
+set local max_parallel_workers_per_gather = 0;
+set local work_mem = '128kB';
+explain (costs off)
+  select count(*) FROM simple r JOIN bigger_than_it_looks s USING (id);
+select count(*) FROM simple r JOIN bigger_than_it_looks s USING (id);
+select original > 1 as initially_multibatch, final > original as increased_batches
+  from hash_join_batches(
+$$
+  select count(*) FROM simple r JOIN bigger_than_it_looks s USING (id);
+$$);
+rollback to settings;
+
+-- parallel with parallel-oblivious hash join
+savepoint settings;
+set local max_parallel_workers_per_gather = 2;
+set local work_mem = '128kB';
+explain (costs off)
+  select count(*) from simple r join bigger_than_it_looks s using (id);
+select count(*) from simple r join bigger_than_it_looks s using (id);
+select original > 1 as initially_multibatch, final > original as increased_batches
+  from hash_join_batches(
+$$
+  select count(*) from simple r join bigger_than_it_looks s using (id);
+$$);
+rollback to settings;
+
+-- The "ugly" case: increasing the number of batches during execution
+-- doesn't help, so stop trying to fit in work_mem and hope for the
+-- best; in this case we plan for 1 batch, increases just once and
+-- then stop increasing because that didn't help at all, so we blow
+-- right through the work_mem budget and hope for the best...
+
+-- non-parallel
+savepoint settings;
+set local max_parallel_workers_per_gather = 0;
+set local work_mem = '128kB';
+explain (costs off)
+  select count(*) from simple r join extremely_skewed s using (id);
+select count(*) from simple r join extremely_skewed s using (id);
+select * from hash_join_batches(
+$$
+  select count(*) from simple r join extremely_skewed s using (id);
+$$);
+rollback to settings;
+
+-- parallel with parallel-oblivious hash join
+savepoint settings;
+set local max_parallel_workers_per_gather = 2;
+set local work_mem = '128kB';
+explain (costs off)
+  select count(*) from simple r join extremely_skewed s using (id);
+select count(*) from simple r join extremely_skewed s using (id);
+select * from hash_join_batches(
+$$
+  select count(*) from simple r join extremely_skewed s using (id);
+$$);
+rollback to settings;
+
+-- A couple of other hash join tests unrelated to work_mem management.
+
+-- Check that EXPLAIN ANALYZE has data even if the leader doesn't participate
+savepoint settings;
+set local max_parallel_workers_per_gather = 2;
+set local work_mem = '4MB';
+set local parallel_leader_participation = off;
+select * from hash_join_batches(
+$$
+  select count(*) from simple r join simple s using (id);
+$$);
+rollback to settings;
+
+-- A full outer join where every record is matched.
+
+-- non-parallel
+savepoint settings;
+set local max_parallel_workers_per_gather = 0;
+explain (costs off)
+     select  count(*) from simple r full outer join simple s using (id);
+select  count(*) from simple r full outer join simple s using (id);
+rollback to settings;
+
+-- parallelism not possible with parallel-oblivious outer hash join
+savepoint settings;
+set local max_parallel_workers_per_gather = 2;
+explain (costs off)
+     select  count(*) from simple r full outer join simple s using (id);
+select  count(*) from simple r full outer join simple s using (id);
+rollback to settings;
+
+-- An full outer join where every record is not matched.
+
+set enable_hashjoin = false;
+explain select t3.b from nestloop_suppression1 t1, nestloop_suppression2 t2, nestloop_suppression3 t3 
+	where t1.b=2 and t1.c=3 and t1.d like 'char%' and t1.a=t2.a and t3.b>t2.a;
+set enable_nestloop_suppression = true;
+explain select t3.b from nestloop_suppression1 t1, nestloop_suppression2 t2, nestloop_suppression3 t3 
+	where t1.b=2 and t1.c=3 and t1.d like 'char%' and t1.a=t2.a and t3.b>t2.a;
+
+drop table nestloop_suppression1;
+drop table nestloop_suppression2;
+drop table nestloop_suppression3;
+
+reset enable_nestloop_suppression;
+reset enable_hashjoin;

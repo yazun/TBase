@@ -82,11 +82,10 @@ PQconnectGTM(const char *conninfo)
 {
     GTM_Conn       *conn = PQconnectGTMStart(conninfo);
 
-    if (conn && conn->status != CONNECTION_BAD)
-    {
-        (void)connectGTMComplete(conn);
-        
-    }
+	if (conn && conn->status != CONNECTION_BAD)
+	{
+		(void)connectGTMComplete(conn);
+	}
 #if 0
     else if (conn != NULL)
     {
@@ -930,76 +929,83 @@ freeGTM_Conn(GTM_Conn *conn)
     termGTMPQExpBuffer(&conn->errorMessage);
     termGTMPQExpBuffer(&conn->workBuffer);
 #ifdef XCP
-    if (conn->result)
-    {
-        /* Free last snapshot if defined */
-        if (conn->result->gr_snapshot.sn_xip)
-            free(conn->result->gr_snapshot.sn_xip);
+	if (conn->result)
+	{
+		/* Free last snapshot if defined */
+		if (conn->result->gr_snapshot.sn_xip)
+			free(conn->result->gr_snapshot.sn_xip);
 
-        /* Depending on result type there could be allocated data */
-        switch (conn->result->gr_type)
+		/* Depending on result type there could be allocated data */
+		switch (conn->result->gr_type)
+		{
+			case SEQUENCE_INIT_RESULT:
+			case SEQUENCE_RESET_RESULT:
+			case SEQUENCE_CLOSE_RESULT:
+			case SEQUENCE_RENAME_RESULT:
+			case SEQUENCE_ALTER_RESULT:
+			case SEQUENCE_SET_VAL_RESULT:
+			case MSG_DB_SEQUENCE_RENAME_RESULT:
+				if (conn->result->gr_resdata.grd_seqkey.gsk_key)
+					free(conn->result->gr_resdata.grd_seqkey.gsk_key);
+				break;
+
+			case SEQUENCE_GET_NEXT_RESULT:
+			case SEQUENCE_GET_LAST_RESULT:
+				if (conn->result->gr_resdata.grd_seq.seqkey.gsk_key)
+					free(conn->result->gr_resdata.grd_seq.seqkey.gsk_key);
+				break;
+				
+			default:
+				break;
+		}
+
+		
+#ifdef __TBASE__					
+		if (conn->result->grd_storage_data.len && conn->result->grd_storage_data.data)
+		{
+			free(conn->result->grd_storage_data.data);
+			conn->result->grd_storage_data.data = NULL;
+			conn->result->grd_storage_data.len  = 0;
+		}
+
+		if (conn->result->grd_store_seq.count && conn->result->grd_store_seq.seqs)
+		{
+			free(conn->result->grd_store_seq.seqs);
+			conn->result->grd_store_seq.seqs = NULL;
+			conn->result->grd_store_seq.count  = 0;
+		}
+
+		if (conn->result->grd_store_txn.count && conn->result->grd_store_txn.txns)
+		{
+			free(conn->result->grd_store_txn.txns);
+			conn->result->grd_store_txn.txns   = NULL;
+			conn->result->grd_store_txn.count  = 0;
+		}	
+
+		if (conn->result->grd_store_check_seq.count && conn->result->grd_store_check_seq.seqs)
+		{
+			free(conn->result->grd_store_check_seq.seqs);
+			conn->result->grd_store_check_seq.seqs   = NULL;
+			conn->result->grd_store_check_seq.count  = 0;
+		}
+
+		if (conn->result->grd_store_check_txn.count && conn->result->grd_store_check_txn.txns)
+		{
+			free(conn->result->grd_store_check_txn.txns);
+			conn->result->grd_store_check_txn.txns   = NULL;
+			conn->result->grd_store_check_txn.count  = 0;
+		}
+
+		if (conn->result->grd_errlog.len && conn->result->grd_errlog.errlog)
         {
-            case SEQUENCE_INIT_RESULT:
-            case SEQUENCE_RESET_RESULT:
-            case SEQUENCE_CLOSE_RESULT:
-            case SEQUENCE_RENAME_RESULT:
-            case SEQUENCE_ALTER_RESULT:
-            case SEQUENCE_SET_VAL_RESULT:
-            case MSG_DB_SEQUENCE_RENAME_RESULT:
-                if (conn->result->gr_resdata.grd_seqkey.gsk_key)
-                    free(conn->result->gr_resdata.grd_seqkey.gsk_key);
-                break;
-
-            case SEQUENCE_GET_NEXT_RESULT:
-            case SEQUENCE_GET_LAST_RESULT:
-                if (conn->result->gr_resdata.grd_seq.seqkey.gsk_key)
-                    free(conn->result->gr_resdata.grd_seq.seqkey.gsk_key);
-                break;
-                
-            default:
-                break;
+		    free(conn->result->grd_errlog.errlog);
+            conn->result->grd_errlog.errlog = NULL;
+            conn->result->grd_errlog.len = 0;
         }
-
-        
-#ifdef __TBASE__                    
-        if (conn->result->grd_storage_data.len && conn->result->grd_storage_data.data)
-        {
-            free(conn->result->grd_storage_data.data);
-            conn->result->grd_storage_data.data = NULL;
-            conn->result->grd_storage_data.len  = 0;
-        }
-
-        if (conn->result->grd_store_seq.count && conn->result->grd_store_seq.seqs)
-        {
-            free(conn->result->grd_store_seq.seqs);
-            conn->result->grd_store_seq.seqs = NULL;
-            conn->result->grd_store_seq.count  = 0;
-        }
-
-        if (conn->result->grd_store_txn.count && conn->result->grd_store_txn.txns)
-        {
-            free(conn->result->grd_store_txn.txns);
-            conn->result->grd_store_txn.txns   = NULL;
-            conn->result->grd_store_txn.count  = 0;
-        }    
-
-        if (conn->result->grd_store_check_seq.count && conn->result->grd_store_check_seq.seqs)
-        {
-            free(conn->result->grd_store_check_seq.seqs);
-            conn->result->grd_store_check_seq.seqs   = NULL;
-            conn->result->grd_store_check_seq.count  = 0;
-        }
-
-        if (conn->result->grd_store_check_txn.count && conn->result->grd_store_check_txn.txns)
-        {
-            free(conn->result->grd_store_check_txn.txns);
-            conn->result->grd_store_check_txn.txns   = NULL;
-            conn->result->grd_store_check_txn.count  = 0;
-        }
-        
-#endif    
-        free(conn->result);
-    }
+		
+#endif	
+		free(conn->result);
+	}
 #endif
 
     free(conn);
@@ -1422,4 +1428,67 @@ GTMPQuntrace(GTM_Conn *conn)
         fflush(conn->Pfdebug);
         conn->Pfdebug = NULL;
     }
+}
+
+/*
+ * Set socket keepalive and user_timeout.
+ * We can use this to detect the broken connection quickly.
+ */
+bool
+GTMSetSockKeepAlive(GTM_Conn *conn, int tcp_keepalives_idle,
+	int tcp_keepalives_interval, int tcp_keepalives_count)
+{
+	int sock = conn->sock;
+	int keepalive = 1;
+	/* user_timeout in ms */
+	uint32 user_timeout = UINT32_MAX / 1000 < tcp_keepalives_idle ?
+						  0 : tcp_keepalives_idle * (uint32)1000;
+	struct tcp_info info;
+	int len = sizeof(info);
+	/* check sock */
+	getsockopt(sock, IPPROTO_TCP, TCP_INFO, &info, (socklen_t *)&len);
+	if (info.tcpi_state != TCP_ESTABLISHED)
+	{
+		/* No need to set */
+		return true;
+	}
+
+	/* set keepalive */
+	if (setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE,
+				   (char *)&keepalive, sizeof(keepalive)) < 0)
+	{
+		return false;
+	}
+	if (tcp_keepalives_idle > 0 &&
+		setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE,
+				   (char *)&tcp_keepalives_idle,
+				   sizeof(tcp_keepalives_idle)) < 0)
+	{
+		return false;
+	}
+	if (tcp_keepalives_interval > 0 &&
+		setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL,
+				   (char *)&tcp_keepalives_interval,
+				   sizeof(tcp_keepalives_interval)) < 0)
+	{
+		return false;
+	}
+	if (tcp_keepalives_count > 0 &&
+		setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT,
+				   (char *)&tcp_keepalives_count,
+				   sizeof(tcp_keepalives_count)) < 0)
+	{
+		return false;
+	}
+
+	/* set user_timeout */
+	if (user_timeout > 0 &&
+		setsockopt(sock, IPPROTO_TCP, TCP_USER_TIMEOUT,
+				   (char *)&user_timeout,
+				   sizeof(user_timeout)) < 0)
+	{
+		return false;
+	}
+
+	return true;
 }

@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * clauses.h
- *      prototypes for clauses.c.
+ *	  prototypes for clauses.c.
  *
  *
  * Portions Copyright (c) 1996-2017, PostgreSQL Global Development Group
@@ -14,22 +14,22 @@
 #ifndef CLAUSES_H
 #define CLAUSES_H
 
+#include "access/htup.h"
 #include "nodes/relation.h"
 
-
-#define is_opclause(clause)        ((clause) != NULL && IsA(clause, OpExpr))
-#define is_funcclause(clause)    ((clause) != NULL && IsA(clause, FuncExpr))
+#define is_opclause(clause)		((clause) != NULL && IsA(clause, OpExpr))
+#define is_funcclause(clause)	((clause) != NULL && IsA(clause, FuncExpr))
 
 typedef struct
 {
-    int            numWindowFuncs; /* total number of WindowFuncs found */
-    Index        maxWinRef;        /* windowFuncs[] is indexed 0 .. maxWinRef */
-    List      **windowFuncs;    /* lists of WindowFuncs for each winref */
+	int			numWindowFuncs; /* total number of WindowFuncs found */
+	Index		maxWinRef;		/* windowFuncs[] is indexed 0 .. maxWinRef */
+	List	  **windowFuncs;	/* lists of WindowFuncs for each winref */
 } WindowFuncLists;
 
 extern Expr *make_opclause(Oid opno, Oid opresulttype, bool opretset,
-              Expr *leftop, Expr *rightop,
-              Oid opcollid, Oid inputcollid);
+			  Expr *leftop, Expr *rightop,
+			  Oid opcollid, Oid inputcollid);
 extern Node *get_leftop(const Expr *clause);
 extern Node *get_rightop(const Expr *clause);
 
@@ -50,7 +50,7 @@ extern List *make_ands_implicit(Expr *clause);
 
 extern bool contain_agg_clause(Node *clause);
 extern void get_agg_clause_costs(PlannerInfo *root, Node *clause,
-                     AggSplit aggsplit, AggClauseCosts *costs);
+					 AggSplit aggsplit, AggClauseCosts *costs);
 
 extern bool contain_window_function(Node *clause);
 extern WindowFuncLists *find_window_functions(Node *clause, Index maxWinRef);
@@ -75,7 +75,7 @@ extern Var *find_forced_null_var(Node *clause);
 extern bool is_pseudo_constant_clause(Node *clause);
 extern bool is_pseudo_constant_clause_relids(Node *clause, Relids relids);
 
-extern int    NumRelids(Node *clause);
+extern int	NumRelids(Node *clause);
 
 extern void CommuteOpExpr(OpExpr *clause);
 extern void CommuteRowCompareExpr(RowCompareExpr *clause);
@@ -85,10 +85,14 @@ extern Node *eval_const_expressions(PlannerInfo *root, Node *node);
 extern Node *estimate_expression_value(PlannerInfo *root, Node *node);
 
 extern Query *inline_set_returning_function(PlannerInfo *root,
-                              RangeTblEntry *rte);
+							  RangeTblEntry *rte);
 
 extern Node *substitute_sublink_with_node(Node *expr, SubLink *sublink,
-		                                                               Node *node);
+										 Node *node);
 extern bool find_sublink_walker(Node *node, List **list);
 
-#endif                            /* CLAUSES_H */
+extern Node *replace_distribkey_func(Node *node);
+
+extern Node *replace_eval_sql_value_function(Node *node);
+
+#endif							/* CLAUSES_H */

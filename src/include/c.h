@@ -667,6 +667,7 @@ typedef NameData *Name;
 #define MAXALIGN(LEN)            TYPEALIGN(MAXIMUM_ALIGNOF, (LEN))
 /* MAXALIGN covers only built-in types, not buffers */
 #define BUFFERALIGN(LEN)        TYPEALIGN(ALIGNOF_BUFFER, (LEN))
+#define BLOCKALIGN(LEN)			TYPEALIGN(BLCKSZ, (LEN))
 #define CACHELINEALIGN(LEN)        TYPEALIGN(PG_CACHE_LINE_SIZE, (LEN))
 
 #define TYPEALIGN_DOWN(ALIGNVAL,LEN)  \
@@ -1063,6 +1064,9 @@ typedef NameData *Name;
 /* msb for char */
 #define HIGHBIT                    (0x80)
 #define IS_HIGHBIT_SET(ch)        ((unsigned char)(ch) & HIGHBIT)
+#define GB18030_2ND_MIX			(0x30)
+#define GB18030_2ND_MAX			(0x39)
+#define IS_GB18030_SET(ch)		((ch) <= GB18030_2ND_MAX && (ch) >= GB18030_2ND_MIX)
 
 #define STATUS_OK                (0)
 #define STATUS_ERROR            (-1)

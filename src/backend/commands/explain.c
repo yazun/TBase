@@ -20,7 +20,7 @@
 #include "commands/createas.h"
 #include "commands/defrem.h"
 #include "commands/prepare.h"
-#include "executor/hashjoin.h"
+#include "executor/nodeHash.h"
 #include "foreign/fdwapi.h"
 #include "nodes/extensible.h"
 #include "nodes/nodeFuncs.h"
@@ -47,6 +47,7 @@
 #include "pgxc/execRemote.h"
 #endif
 #ifdef __TBASE__
+#include "commands/explain_dist.h"
 #include "commands/vacuum.h"
 #endif
 
@@ -146,6 +147,7 @@ static void ExplainDummyGroup(const char *objtype, const char *labelname,
 static void ExplainExecNodes(ExecNodes *en, ExplainState *es);
 static void ExplainRemoteQuery(RemoteQuery *plan, PlanState *planstate,
                                 List *ancestors, ExplainState *es);
+static char **StrSplit(const char *str, const char *delimiter, int *n);
 #endif
 static void ExplainXMLTag(const char *tagname, int flags, ExplainState *es);
 static void ExplainJSONLineEnding(ExplainState *es);
@@ -1312,255 +1314,267 @@ ExplainNode(PlanState *planstate, List *ancestors,
             }
             break;
 #endif /* XCP */
-        case T_IndexScan:
-            {
-                IndexScan  *indexscan = (IndexScan *) plan;
+		case T_IndexScan:
+			{
+				IndexScan  *indexscan = (IndexScan *) plan;
 
-                ExplainIndexScanDetails(indexscan->indexid,
-                                        indexscan->indexorderdir,
-                                        es);
-                ExplainScanTarget((Scan *) indexscan, es);
-            }
-            break;
-        case T_IndexOnlyScan:
-            {
-                IndexOnlyScan *indexonlyscan = (IndexOnlyScan *) plan;
+				ExplainIndexScanDetails(indexscan->indexid,
+										indexscan->indexorderdir,
+										es);
+				ExplainScanTarget((Scan *) indexscan, es);
+			}
+			break;
+		case T_IndexOnlyScan:
+			{
+				IndexOnlyScan *indexonlyscan = (IndexOnlyScan *) plan;
 
-                ExplainIndexScanDetails(indexonlyscan->indexid,
-                                        indexonlyscan->indexorderdir,
-                                        es);
-                ExplainScanTarget((Scan *) indexonlyscan, es);
-            }
-            break;
-        case T_BitmapIndexScan:
-            {
-                BitmapIndexScan *bitmapindexscan = (BitmapIndexScan *) plan;
-                const char *indexname =
-                explain_get_index_name(bitmapindexscan->indexid);
+				ExplainIndexScanDetails(indexonlyscan->indexid,
+										indexonlyscan->indexorderdir,
+										es);
+				ExplainScanTarget((Scan *) indexonlyscan, es);
+			}
+			break;
+		case T_BitmapIndexScan:
+			{
+				BitmapIndexScan *bitmapindexscan = (BitmapIndexScan *) plan;
+				const char *indexname =
+				explain_get_index_name(bitmapindexscan->indexid);
 
-                if (es->format == EXPLAIN_FORMAT_TEXT)
-                    appendStringInfo(es->str, " on %s", indexname);
-                else
-                    ExplainPropertyText("Index Name", indexname, es);
-            }
-            break;
-        case T_ModifyTable:
-            ExplainModifyTarget((ModifyTable *) plan, es);
-            break;
-        case T_NestLoop:
-        case T_MergeJoin:
-        case T_HashJoin:
-            {
-                const char *jointype;
+				if (es->format == EXPLAIN_FORMAT_TEXT)
+					appendStringInfo(es->str, " on %s", indexname);
+				else
+					ExplainPropertyText("Index Name", indexname, es);
+			}
+			break;
+		case T_ModifyTable:
+			ExplainModifyTarget((ModifyTable *) plan, es);
+			break;
+		case T_NestLoop:
+		case T_MergeJoin:
+		case T_HashJoin:
+			{
+				const char *jointype;
 
-                switch (((Join *) plan)->jointype)
-                {
-                    case JOIN_INNER:
-                        jointype = "Inner";
-                        break;
-                    case JOIN_LEFT:
-                        jointype = "Left";
-                        break;
-                    case JOIN_FULL:
-                        jointype = "Full";
-                        break;
-                    case JOIN_RIGHT:
-                        jointype = "Right";
-                        break;
-                    case JOIN_SEMI:
-                        jointype = "Semi";
-                        break;
-                    case JOIN_ANTI:
-                        jointype = "Anti";
-                        break;
-                    default:
-                        jointype = "???";
-                        break;
-                }
-                if (es->format == EXPLAIN_FORMAT_TEXT)
-                {
-                    /*
-                     * For historical reasons, the join type is interpolated
-                     * into the node type name...
-                     */
-                    if (((Join *) plan)->jointype != JOIN_INNER)
-                        appendStringInfo(es->str, " %s Join", jointype);
-                    else if (!IsA(plan, NestLoop))
-                        appendStringInfoString(es->str, " Join");
-                }
-                else
-                    ExplainPropertyText("Join Type", jointype, es);
-            }
-            break;
-        case T_SetOp:
-            {
-                const char *setopcmd;
+				switch (((Join *) plan)->jointype)
+				{
+					case JOIN_INNER:
+						jointype = "Inner";
+						break;
+					case JOIN_LEFT:
+						jointype = "Left";
+						break;
+					case JOIN_FULL:
+						jointype = "Full";
+						break;
+					case JOIN_RIGHT:
+						jointype = "Right";
+						break;
+					case JOIN_SEMI:
+						jointype = "Semi";
+						break;
+					case JOIN_ANTI:
+						jointype = "Anti";
+						break;
+#ifdef __TBASE__
+					case JOIN_LEFT_SCALAR:
+						jointype = "Left Scalar";
+						break;
+					case JOIN_LEFT_SEMI:
+						jointype = "Left Semi";
+						break;
+#endif
+					default:
+						jointype = "???";
+						break;
+				}
+				if (es->format == EXPLAIN_FORMAT_TEXT)
+				{
+					/*
+					 * For historical reasons, the join type is interpolated
+					 * into the node type name...
+					 */
+					if (((Join *) plan)->jointype != JOIN_INNER)
+						appendStringInfo(es->str, " %s Join", jointype);
+					else if (!IsA(plan, NestLoop))
+						appendStringInfoString(es->str, " Join");
+				}
+				else
+					ExplainPropertyText("Join Type", jointype, es);
+			}
+			break;
+		case T_SetOp:
+			{
+				const char *setopcmd;
 
-                switch (((SetOp *) plan)->cmd)
-                {
-                    case SETOPCMD_INTERSECT:
-                        setopcmd = "Intersect";
-                        break;
-                    case SETOPCMD_INTERSECT_ALL:
-                        setopcmd = "Intersect All";
-                        break;
-                    case SETOPCMD_EXCEPT:
-                        setopcmd = "Except";
-                        break;
-                    case SETOPCMD_EXCEPT_ALL:
-                        setopcmd = "Except All";
-                        break;
-                    default:
-                        setopcmd = "???";
-                        break;
-                }
-                if (es->format == EXPLAIN_FORMAT_TEXT)
-                    appendStringInfo(es->str, " %s", setopcmd);
-                else
-                    ExplainPropertyText("Command", setopcmd, es);
-            }
-            break;
-        default:
-            break;
-    }
+				switch (((SetOp *) plan)->cmd)
+				{
+					case SETOPCMD_INTERSECT:
+						setopcmd = "Intersect";
+						break;
+					case SETOPCMD_INTERSECT_ALL:
+						setopcmd = "Intersect All";
+						break;
+					case SETOPCMD_EXCEPT:
+						setopcmd = "Except";
+						break;
+					case SETOPCMD_EXCEPT_ALL:
+						setopcmd = "Except All";
+						break;
+					default:
+						setopcmd = "???";
+						break;
+				}
+				if (es->format == EXPLAIN_FORMAT_TEXT)
+					appendStringInfo(es->str, " %s", setopcmd);
+				else
+					ExplainPropertyText("Command", setopcmd, es);
+			}
+			break;
+		default:
+			break;
+	}
 
-    if (es->costs)
-    {
-        if (es->format == EXPLAIN_FORMAT_TEXT)
-        {
-            appendStringInfo(es->str, "  (cost=%.2f..%.2f rows=%.0f width=%d)",
-                             plan->startup_cost, plan->total_cost,
-                             plan->plan_rows, plan->plan_width);
-        }
-        else
-        {
-            ExplainPropertyFloat("Startup Cost", plan->startup_cost, 2, es);
-            ExplainPropertyFloat("Total Cost", plan->total_cost, 2, es);
-            ExplainPropertyFloat("Plan Rows", plan->plan_rows, 0, es);
-            ExplainPropertyInteger("Plan Width", plan->plan_width, es);
-        }
-    }
+	if (es->costs)
+	{
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+		{
+			appendStringInfo(es->str, "  (cost=%.2f..%.2f rows=%.0f width=%d)",
+							 plan->startup_cost, plan->total_cost,
+							 plan->plan_rows, plan->plan_width);
+		}
+		else
+		{
+			ExplainPropertyFloat("Startup Cost", plan->startup_cost, 2, es);
+			ExplainPropertyFloat("Total Cost", plan->total_cost, 2, es);
+			ExplainPropertyFloat("Plan Rows", plan->plan_rows, 0, es);
+			ExplainPropertyInteger("Plan Width", plan->plan_width, es);
+		}
+	}
 
-    /*
-     * We have to forcibly clean up the instrumentation state because we
-     * haven't done ExecutorEnd yet.  This is pretty grotty ...
-     *
-     * Note: contrib/auto_explain could cause instrumentation to be set up
-     * even though we didn't ask for it here.  Be careful not to print any
-     * instrumentation results the user didn't ask for.  But we do the
-     * InstrEndLoop call anyway, if possible, to reduce the number of cases
-     * auto_explain has to contend with.
-     */
-    if (planstate->instrument)
-        InstrEndLoop(planstate->instrument);
+	/*
+	 * We have to forcibly clean up the instrumentation state because we
+	 * haven't done ExecutorEnd yet.  This is pretty grotty ...
+	 *
+	 * Note: contrib/auto_explain could cause instrumentation to be set up
+	 * even though we didn't ask for it here.  Be careful not to print any
+	 * instrumentation results the user didn't ask for.  But we do the
+	 * InstrEndLoop call anyway, if possible, to reduce the number of cases
+	 * auto_explain has to contend with.
+	 */
+	if (planstate->instrument)
+		InstrEndLoop(planstate->instrument);
 
-    if (es->analyze &&
-        planstate->instrument && planstate->instrument->nloops > 0)
-    {
-        double        nloops = planstate->instrument->nloops;
-        double        startup_sec = 1000.0 * planstate->instrument->startup / nloops;
-        double        total_sec = 1000.0 * planstate->instrument->total / nloops;
-        double        rows = planstate->instrument->ntuples / nloops;
+	if (es->analyze &&
+		planstate->instrument && planstate->instrument->nloops > 0)
+	{
+		double		nloops = planstate->instrument->nloops;
+		double		startup_sec = 1000.0 * planstate->instrument->startup / nloops;
+		double		total_sec = 1000.0 * planstate->instrument->total / nloops;
+		double		rows = planstate->instrument->ntuples / nloops;
 
-        if (es->format == EXPLAIN_FORMAT_TEXT)
-        {
-            if (es->timing)
-                appendStringInfo(es->str,
-                                 " (actual time=%.3f..%.3f rows=%.0f loops=%.0f)",
-                                 startup_sec, total_sec, rows, nloops);
-            else
-                appendStringInfo(es->str,
-                                 " (actual rows=%.0f loops=%.0f)",
-                                 rows, nloops);
-        }
-        else
-        {
-            if (es->timing)
-            {
-                ExplainPropertyFloat("Actual Startup Time", startup_sec, 3, es);
-                ExplainPropertyFloat("Actual Total Time", total_sec, 3, es);
-            }
-            ExplainPropertyFloat("Actual Rows", rows, 0, es);
-            ExplainPropertyFloat("Actual Loops", nloops, 0, es);
-        }
-    }
-    else if (es->analyze)
-    {
-        if (es->format == EXPLAIN_FORMAT_TEXT)
-            appendStringInfoString(es->str, " (never executed)");
-        else
-        {
-            if (es->timing)
-            {
-                ExplainPropertyFloat("Actual Startup Time", 0.0, 3, es);
-                ExplainPropertyFloat("Actual Total Time", 0.0, 3, es);
-            }
-            ExplainPropertyFloat("Actual Rows", 0.0, 0, es);
-            ExplainPropertyFloat("Actual Loops", 0.0, 0, es);
-        }
-    }
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+		{
+			if (es->timing)
+				appendStringInfo(es->str,
+								 " (actual time=%.3f..%.3f rows=%.0f loops=%.0f)",
+								 startup_sec, total_sec, rows, nloops);
+			else
+				appendStringInfo(es->str,
+								 " (actual rows=%.0f loops=%.0f)",
+								 rows, nloops);
+		}
+		else
+		{
+			if (es->timing)
+			{
+				ExplainPropertyFloat("Actual Startup Time", startup_sec, 3, es);
+				ExplainPropertyFloat("Actual Total Time", total_sec, 3, es);
+			}
+			ExplainPropertyFloat("Actual Rows", rows, 0, es);
+			ExplainPropertyFloat("Actual Loops", nloops, 0, es);
+		}
+	}
+	else if (es->analyze && planstate->dn_instrument)
+	{
+		ExplainCommonRemoteInstr(planstate, es);
+	}
+	else if (es->analyze)
+	{
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+			appendStringInfoString(es->str, " (never executed)");
+		else
+		{
+			if (es->timing)
+			{
+				ExplainPropertyFloat("Actual Startup Time", 0.0, 3, es);
+				ExplainPropertyFloat("Actual Total Time", 0.0, 3, es);
+			}
+			ExplainPropertyFloat("Actual Rows", 0.0, 0, es);
+			ExplainPropertyFloat("Actual Loops", 0.0, 0, es);
+		}
+	}
 
-    /* in text format, first line ends here */
-    if (es->format == EXPLAIN_FORMAT_TEXT)
-        appendStringInfoChar(es->str, '\n');
+	/* in text format, first line ends here */
+	if (es->format == EXPLAIN_FORMAT_TEXT)
+		appendStringInfoChar(es->str, '\n');
 
-    /* target list */
-    if (es->verbose)
-        show_plan_tlist(planstate, ancestors, es);
+	/* target list */
+	if (es->verbose)
+		show_plan_tlist(planstate, ancestors, es);
 
-    /* unique join */
-    switch (nodeTag(plan))
-    {
-        case T_NestLoop:
-        case T_MergeJoin:
-        case T_HashJoin:
-            /* try not to be too chatty about this in text mode */
-            if (es->format != EXPLAIN_FORMAT_TEXT ||
-                (es->verbose && ((Join *) plan)->inner_unique))
-                ExplainPropertyBool("Inner Unique",
-                                    ((Join *) plan)->inner_unique,
-                                    es);
-            break;
-        default:
-            break;
-    }
+	/* unique join */
+	switch (nodeTag(plan))
+	{
+		case T_NestLoop:
+		case T_MergeJoin:
+		case T_HashJoin:
+			/* try not to be too chatty about this in text mode */
+			if (es->format != EXPLAIN_FORMAT_TEXT ||
+				(es->verbose && ((Join *) plan)->inner_unique))
+				ExplainPropertyBool("Inner Unique",
+									((Join *) plan)->inner_unique,
+									es);
+			break;
+		default:
+			break;
+	}
 
-    /* quals, sort keys, etc */
-    switch (nodeTag(plan))
-    {
-        case T_IndexScan:
-            show_scan_qual(((IndexScan *) plan)->indexqualorig,
-                           "Index Cond", planstate, ancestors, es);
-            if (((IndexScan *) plan)->indexqualorig)
-                show_instrumentation_count("Rows Removed by Index Recheck", 2,
-                                           planstate, es);
-            show_scan_qual(((IndexScan *) plan)->indexorderbyorig,
-                           "Order By", planstate, ancestors, es);
-            show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
-            if (plan->qual)
-                show_instrumentation_count("Rows Removed by Filter", 1,
-                                           planstate, es);
-            break;
-        case T_IndexOnlyScan:
-            show_scan_qual(((IndexOnlyScan *) plan)->indexqual,
-                           "Index Cond", planstate, ancestors, es);
-            if (((IndexOnlyScan *) plan)->indexqual)
-                show_instrumentation_count("Rows Removed by Index Recheck", 2,
-                                           planstate, es);
-            show_scan_qual(((IndexOnlyScan *) plan)->indexorderby,
-                           "Order By", planstate, ancestors, es);
-            show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
-            if (plan->qual)
-                show_instrumentation_count("Rows Removed by Filter", 1,
-                                           planstate, es);
-            if (es->analyze)
-                ExplainPropertyLong("Heap Fetches",
-                                    ((IndexOnlyScanState *) planstate)->ioss_HeapFetches, es);
-            break;
-        case T_BitmapIndexScan:
-            show_scan_qual(((BitmapIndexScan *) plan)->indexqualorig,
-                           "Index Cond", planstate, ancestors, es);
-            break;
+	/* quals, sort keys, etc */
+	switch (nodeTag(plan))
+	{
+		case T_IndexScan:
+			show_scan_qual(((IndexScan *) plan)->indexqualorig,
+						   "Index Cond", planstate, ancestors, es);
+			if (((IndexScan *) plan)->indexqualorig)
+				show_instrumentation_count("Rows Removed by Index Recheck", 2,
+										   planstate, es);
+			show_scan_qual(((IndexScan *) plan)->indexorderbyorig,
+						   "Order By", planstate, ancestors, es);
+			show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
+			if (plan->qual)
+				show_instrumentation_count("Rows Removed by Filter", 1,
+										   planstate, es);
+			break;
+		case T_IndexOnlyScan:
+			show_scan_qual(((IndexOnlyScan *) plan)->indexqual,
+						   "Index Cond", planstate, ancestors, es);
+			if (((IndexOnlyScan *) plan)->indexqual)
+				show_instrumentation_count("Rows Removed by Index Recheck", 2,
+										   planstate, es);
+			show_scan_qual(((IndexOnlyScan *) plan)->indexorderby,
+						   "Order By", planstate, ancestors, es);
+			show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
+			if (plan->qual)
+				show_instrumentation_count("Rows Removed by Filter", 1,
+										   planstate, es);
+			if (es->analyze)
+				ExplainPropertyLong("Heap Fetches",
+									((IndexOnlyScanState *) planstate)->ioss_HeapFetches, es);
+			break;
+		case T_BitmapIndexScan:
+			show_scan_qual(((BitmapIndexScan *) plan)->indexqualorig,
+						   "Index Cond", planstate, ancestors, es);
+			break;
 #ifdef PGXC
         case T_RemoteQuery:
             /* Remote query */
@@ -2526,15 +2540,21 @@ show_tablesample(TableSampleClause *tsc, PlanState *planstate,
 static void
 show_sort_info(SortState *sortstate, ExplainState *es)
 {
-    if (es->analyze && sortstate->sort_Done &&
-        sortstate->tuplesortstate != NULL)
+	if (!es->analyze)
+		return;
+
+	if (sortstate->sort_Done && sortstate->tuplesortstate != NULL)
     {
         Tuplesortstate *state = (Tuplesortstate *) sortstate->tuplesortstate;
+		TuplesortInstrumentation stats;
         const char *sortMethod;
         const char *spaceType;
         long        spaceUsed;
 
-        tuplesort_get_stats(state, &sortMethod, &spaceType, &spaceUsed);
+		tuplesort_get_stats(state, &stats);
+		sortMethod = tuplesort_method_name(stats.sortMethod);
+		spaceType = tuplesort_space_type_name(stats.spaceType);
+		spaceUsed = stats.spaceUsed;
 
         if (es->format == EXPLAIN_FORMAT_TEXT)
         {
@@ -2549,6 +2569,77 @@ show_sort_info(SortState *sortstate, ExplainState *es)
             ExplainPropertyText("Sort Space Type", spaceType, es);
         }
     }
+
+	if (sortstate->shared_info != NULL)
+	{
+		int			n;
+		bool		opened_group = false;
+
+		for (n = 0; n < sortstate->shared_info->num_workers; n++)
+		{
+			TuplesortInstrumentation *sinstrument;
+			const char *sortMethod;
+			const char *spaceType;
+			long		spaceUsed;
+
+			sinstrument = &sortstate->shared_info->sinstrument[n];
+			if (sinstrument->sortMethod == SORT_TYPE_STILL_IN_PROGRESS)
+				continue;		/* ignore any unfilled slots */
+			sortMethod = tuplesort_method_name(sinstrument->sortMethod);
+			spaceType = tuplesort_space_type_name(sinstrument->spaceType);
+			spaceUsed = sinstrument->spaceUsed;
+
+			if (es->format == EXPLAIN_FORMAT_TEXT)
+			{
+				appendStringInfoSpaces(es->str, es->indent * 2);
+				appendStringInfo(es->str,
+								 "Worker %d:  Sort Method: %s  %s: %ldkB\n",
+								 n, sortMethod, spaceType, spaceUsed);
+			}
+			else
+			{
+				if (!opened_group)
+				{
+					ExplainOpenGroup("Workers", "Workers", false, es);
+					opened_group = true;
+				}
+				ExplainOpenGroup("Worker", NULL, true, es);
+				ExplainPropertyInteger("Worker Number", n, es);
+				ExplainPropertyText("Sort Method", sortMethod, es);
+				ExplainPropertyLong("Sort Space Used", spaceUsed, es);
+				ExplainPropertyText("Sort Space Type", spaceType, es);
+				ExplainCloseGroup("Worker", NULL, true, es);
+			}
+		}
+		if (opened_group)
+			ExplainCloseGroup("Workers", "Workers", false, es);
+	}
+#ifdef __TBASE__
+	else if (sortstate->instrument.spaceType != -1)
+	{
+		/* try our cached distributed instrument */
+		/* same logic above */
+		const char *sortMethod = tuplesort_method_name(sortstate->instrument.sortMethod);
+		const char *spaceType = tuplesort_space_type_name(sortstate->instrument.spaceType);
+		long        spaceUsed = sortstate->instrument.spaceUsed;
+		
+		/* -1 means invalid value, indicate that this node executed by ourself */
+		Assert(sortstate->instrument.sortMethod != -1);
+		
+		if (es->format == EXPLAIN_FORMAT_TEXT)
+		{
+			appendStringInfoSpaces(es->str, es->indent * 2);
+			appendStringInfo(es->str, "Sort Method: %s  %s: %ldkB\n",
+			                 sortMethod, spaceType, spaceUsed);
+		}
+		else
+		{
+			ExplainPropertyText("Sort Method", sortMethod, es);
+			ExplainPropertyLong("Sort Space Used", spaceUsed, es);
+			ExplainPropertyText("Sort Space Type", spaceType, es);
+		}
+	}
+#endif
 }
 
 /*
@@ -2557,34 +2648,62 @@ show_sort_info(SortState *sortstate, ExplainState *es)
 static void
 show_hash_info(HashState *hashstate, ExplainState *es)
 {
-    HashJoinTable hashtable;
+	HashInstrumentation *hinstrument = NULL;
 
-    hashtable = hashstate->hashtable;
+	/*
+	 * In a parallel query, the leader process may or may not have run the
+	 * hash join, and even if it did it may not have built a hash table due to
+	 * timing (if it started late it might have seen no tuples in the outer
+	 * relation and skipped building the hash table).  Therefore we have to be
+	 * prepared to get instrumentation data from a worker if there is no hash
+	 * table.
+	 */
+	if (hashstate->hashtable)
+	{
+		hinstrument = (HashInstrumentation *)
+			palloc(sizeof(HashInstrumentation));
+		ExecHashGetInstrumentation(hinstrument, hashstate->hashtable);
+	}
+	else if (hashstate->shared_info)
+	{
+		SharedHashInfo *shared_info = hashstate->shared_info;
+		int		i;
 
-    if (hashtable)
+		/* Find the first worker that built a hash table. */
+		for (i = 0; i < shared_info->num_workers; ++i)
+		{
+			if (shared_info->hinstrument[i].nbatch > 0)
+			{
+				hinstrument = &shared_info->hinstrument[i];
+				break;
+			}
+		}
+	}
+
+	if (hinstrument)
     {
-        long        spacePeakKb = (hashtable->spacePeak + 1023) / 1024;
+		long		spacePeakKb = (hinstrument->space_peak + 1023) / 1024;
 
         if (es->format != EXPLAIN_FORMAT_TEXT)
         {
-            ExplainPropertyLong("Hash Buckets", hashtable->nbuckets, es);
+			ExplainPropertyLong("Hash Buckets", hinstrument->nbuckets, es);
             ExplainPropertyLong("Original Hash Buckets",
-                                hashtable->nbuckets_original, es);
-            ExplainPropertyLong("Hash Batches", hashtable->nbatch, es);
+								hinstrument->nbuckets_original, es);
+			ExplainPropertyLong("Hash Batches", hinstrument->nbatch, es);
             ExplainPropertyLong("Original Hash Batches",
-                                hashtable->nbatch_original, es);
+								hinstrument->nbatch_original, es);
             ExplainPropertyLong("Peak Memory Usage", spacePeakKb, es);
         }
-        else if (hashtable->nbatch_original != hashtable->nbatch ||
-                 hashtable->nbuckets_original != hashtable->nbuckets)
+		else if (hinstrument->nbatch_original != hinstrument->nbatch ||
+				 hinstrument->nbuckets_original != hinstrument->nbuckets)
         {
             appendStringInfoSpaces(es->str, es->indent * 2);
             appendStringInfo(es->str,
                              "Buckets: %d (originally %d)  Batches: %d (originally %d)  Memory Usage: %ldkB\n",
-                             hashtable->nbuckets,
-                             hashtable->nbuckets_original,
-                             hashtable->nbatch,
-                             hashtable->nbatch_original,
+							 hinstrument->nbuckets,
+							 hinstrument->nbuckets_original,
+							 hinstrument->nbatch,
+							 hinstrument->nbatch_original,
                              spacePeakKb);
         }
         else
@@ -2592,7 +2711,7 @@ show_hash_info(HashState *hashstate, ExplainState *es)
             appendStringInfoSpaces(es->str, es->indent * 2);
             appendStringInfo(es->str,
                              "Buckets: %d  Batches: %d  Memory Usage: %ldkB\n",
-                             hashtable->nbuckets, hashtable->nbatch,
+							 hinstrument->nbuckets, hinstrument->nbatch,
                              spacePeakKb);
         }
     }
@@ -3375,6 +3494,74 @@ ExplainPropertyListNested(const char *qlabel, List *data, ExplainState *es)
     }
 }
 
+/* split a string based on a delimiter */
+static char **
+StrSplit(const char *str, const char *delimiter, int *n)
+{
+	char *tmp = NULL;
+	char **rtn = NULL;
+	char *token = NULL;
+
+	*n = 0;
+	if (!str)
+		return NULL;
+
+	/* copy str to tmp as strtok will mangle the string */
+	tmp = pstrdup(str);
+
+	if (!strlen(tmp) || !delimiter || !strlen(delimiter))
+	{
+		*n = 1;
+		rtn = (char **) palloc(*n * sizeof(char *));
+		rtn[0] = pstrdup(tmp);
+		pfree(tmp);
+		return rtn;
+	}
+
+	token = strtok(tmp, delimiter);
+	while (token != NULL)
+	{
+		if (*n < 1)
+		{
+			rtn = (char **) palloc(sizeof(char *));
+		}
+		else
+		{
+			rtn = (char **) repalloc(rtn, (*n + 1) * sizeof(char *));
+		}
+
+		rtn[*n] = NULL;
+		rtn[*n] = pstrdup(token);
+		*n = *n + 1;
+
+		token = strtok(NULL, delimiter);
+	}
+
+	pfree(tmp);
+	return rtn;
+}
+
+static void
+DealRemoteJson(StringInfo explainResult, const char *value, int spaceLen)
+{
+	int i = 0;
+	int num = 0;
+	char **result = NULL;
+	result = StrSplit(value, "\n", &num);
+	for (i = 0; i < num; i++)
+	{
+		if (i > 0)
+		{
+			appendStringInfo(explainResult, "\n");
+			appendStringInfoSpaces(explainResult, spaceLen);
+		}
+		appendStringInfo(explainResult, "%s", result[i]);			
+		pfree(result[i]);
+	}
+	if (result)
+		pfree(result);
+}
+
 /*
  * Explain a simple property.
  *
@@ -3752,6 +3939,7 @@ ExplainRemoteQuery(RemoteQuery *plan, PlanState *planstate, List *ancestors, Exp
 {// #lizard forgives
     ExecNodes    *en = plan->exec_nodes;
     /* add names of the nodes if they exist */
+
     if (en && es->nodes)
     {
         StringInfo node_names = makeStringInfo();
@@ -3795,6 +3983,14 @@ ExplainRemoteQuery(RemoteQuery *plan, PlanState *planstate, List *ancestors, Exp
             ExplainPropertyText("Node/s", node_names->data, es);
         }
     }
+
+	/*
+	 * if required, skip executing remote query, this
+	 * is happened when a backend report planstate it
+	 * processing, shouldn't execute it again.
+	 */
+	if (es->skip_remote_query)
+		return;
 
     if (en && en->en_expr)
         show_expression((Node *)en->en_expr, "Node expr", planstate, ancestors,
@@ -3870,7 +4066,7 @@ ExplainRemoteQuery(RemoteQuery *plan, PlanState *planstate, List *ancestors, Exp
         estate = planstate->state;
         oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
 
-        node = ExecInitRemoteQuery(step, estate, 0);
+		node = ExecInitRemoteQuery(step, estate, EXEC_FLAG_EXPLAIN_ONLY);
         MemoryContextSwitchTo(oldcontext);
         result = ExecRemoteQuery((PlanState *) node);
         while (result != NULL && !TupIsNull(result))
@@ -3880,9 +4076,18 @@ ExplainRemoteQuery(RemoteQuery *plan, PlanState *planstate, List *ancestors, Exp
             value = slot_getattr(result, 1, &isnull);
             if (!isnull)
             {
+				if (es->format == EXPLAIN_FORMAT_JSON)
+				{
+					if (!firstline)
+						appendStringInfo(&explainResult, "\n");
+					DealRemoteJson(&explainResult, TextDatumGetCString(value), 2 * es->indent);
+				}
+				else
+				{
                 if (!firstline)
                     appendStringInfoSpaces(&explainResult, 2 * es->indent);
                 appendStringInfo(&explainResult, "%s\n", TextDatumGetCString(value));
+				}
                 firstline = false;
             }
 
@@ -3893,9 +4098,17 @@ ExplainRemoteQuery(RemoteQuery *plan, PlanState *planstate, List *ancestors, Exp
 
         if (es->format == EXPLAIN_FORMAT_TEXT)
             appendStringInfo(es->str, "%s", explainResult.data);
+		else if (es->format == EXPLAIN_FORMAT_JSON)
+		{
+			appendStringInfoChar(es->str, '\n');
+			appendStringInfoSpaces(es->str, es->indent * 2);
+			appendStringInfo(es->str, "%s: %s", "\"Remote plan\"", explainResult.data);
+		}
         else
+		{
             ExplainPropertyText("Remote plan", explainResult.data, es);
     }
+}
 }
 #endif
 

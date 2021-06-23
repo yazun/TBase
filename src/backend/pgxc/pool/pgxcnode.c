@@ -161,6 +161,9 @@ static int    get_char(PGXCNodeHandle * conn, char *out);
 static ParamEntry * paramlist_get_paramentry(List *param_list, const char *name);
 static ParamEntry * paramentry_copy(ParamEntry * src_entry);
 static void PGXCNodeHandleError(PGXCNodeHandle *handle, char *msg_body, int len);
+static PGXCNodeAllHandles * get_empty_handles(void);
+static void get_current_dn_handles_internal(PGXCNodeAllHandles *result);
+static void get_current_cn_handles_internal(PGXCNodeAllHandles *result);
 #endif
 
 /*
@@ -237,7 +240,7 @@ InitMultinodeExecutor(bool is_force)
         return;
 
     /* Update node table in the shared memory */
-    PgxcNodeListAndCount();
+	PgxcNodeListAndCountWrapTransaction();
 
     /* Get classified list of node Oids */
     PgxcNodeGetOidsExtend(&coOids, &dnOids, &sdnOids, &NumCoords, &NumDataNodes, &NumSlaveDataNodes, true);
@@ -313,6 +316,10 @@ InitMultinodeExecutor(bool is_force)
         {
             node_handle_ent->nodeoid = dn_handles[count].nodeoid;
             node_handle_ent->nodeidx = count;
+
+			elog(DEBUG5,
+				"node_handles_hash enter primary datanode nodeoid: %d",
+				node_handle_ent->nodeoid);
         }
 #endif        
         
@@ -339,6 +346,10 @@ InitMultinodeExecutor(bool is_force)
         {
             node_handle_ent->nodeoid = sdn_handles[count].nodeoid;
             node_handle_ent->nodeidx = count;
+
+			elog(DEBUG5,
+				"node_handles_hash enter slave datanode nodeoid: %d",
+				node_handle_ent->nodeoid);
         }
 #endif        
         
@@ -364,6 +375,10 @@ InitMultinodeExecutor(bool is_force)
         {
             node_handle_ent->nodeoid = co_handles[count].nodeoid;
             node_handle_ent->nodeidx = count;
+
+			elog(DEBUG5,
+				"node_handles_hash enter coordinator nodeoid: %d",
+				node_handle_ent->nodeoid);
         }
 #endif    
     }
@@ -375,6 +390,8 @@ InitMultinodeExecutor(bool is_force)
 
     MemoryContextSwitchTo(oldcontext);
 
+	PGXCSessionId[0] = '\0';
+	
     if (IS_PGXC_COORDINATOR)
     {
         for (count = 0; count < NumCoords; count++)
@@ -383,6 +400,8 @@ InitMultinodeExecutor(bool is_force)
                        get_pgxc_nodename(co_handles[count].nodeoid)) == 0)
                 PGXCNodeId = count + 1;
         }
+		
+		sprintf(PGXCSessionId, "%s_%d_%ld", PGXCNodeName, MyProcPid, GetCurrentTimestamp());
     }
     else /* DataNode */
     {
@@ -407,7 +426,8 @@ InitMultinodeExecutor(bool is_force)
     
 }
 
-Oid get_nodeoid_from_nodeid(int nodeid, char node_type)
+Oid
+get_nodeoid_from_nodeid(int nodeid, char node_type)
 {
     if (PGXC_NODE_COORDINATOR == node_type)
     {
@@ -489,14 +509,19 @@ PGXCNodeConnStr(char *host, int port, char *dbname,
 #ifdef _MLS_
     }
 #endif    
-    /* Check for overflow */
-    if (num > 0 && num < sizeof(connstr))
-    {
-        /* Output result */
-        out = (char *) palloc(num + 1);
-        strcpy(out, connstr);
-        return out;
-    }
+	if (tcp_keepalives_idle > 0)
+	{
+		num += snprintf(connstr + num, sizeof(connstr) - num,
+					   " connect_timeout=%d", tcp_keepalives_idle);
+	}
+	/* Check for overflow */
+	if (num > 0 && num < sizeof(connstr))
+	{
+		/* Output result */
+		out = (char *) palloc(num + 1);
+		strcpy(out, connstr);
+		return out;
+	}
 
     /* return NULL if we have problem */
     return NULL;
@@ -516,7 +541,8 @@ PGXCNodeConnect(char *connstr)
     return (NODE_CONNECTION *) conn;
 }
 
-int PGXCNodePing(const char *connstr)
+int
+PGXCNodePing(const char *connstr)
 {
     if (connstr[0])
     {
@@ -641,7 +667,7 @@ pgxc_node_init(PGXCNodeHandle *handle, int sock, bool global_session, int pid)
 #ifdef DN_CONNECTION_DEBUG
     handle->have_row_desc = false;
 #endif
-    memset(handle->error, 0X00, MAX_ERROR_MSG_LENGTH);
+	handle->error[0] = '\0';
     handle->outEnd = 0;
     handle->inStart = 0;
     handle->inEnd = 0;
@@ -708,10 +734,15 @@ pgxc_node_init(PGXCNodeHandle *handle, int sock, bool global_session, int pid)
 #endif    
 }
 
-
 /*
  * Wait while at least one of specified connections has data available and read
  * the data into the buffer
+ *
+ * Returning state code
+ * 		DNStatus_OK      = 0,
+ *		DNStatus_ERR     = 1,
+ *		DNStatus_EXPIRED = 2,
+ *		DNStatus_BUTTY
  */
 #ifdef __TBASE__
 int
@@ -809,7 +840,7 @@ pgxc_node_receive(const int conn_count,
     }
 
 retry:
-    CHECK_FOR_INTERRUPTS();
+	CHECK_FOR_INTERRUPTS();
     poll_val  = poll(pool_fd, conn_count, timeout_ms);
     if (poll_val < 0)
     {
@@ -930,8 +961,9 @@ retry:
 }
 
 
-void pgxc_print_pending_data(PGXCNodeHandle *handle, bool reset)
-{// #lizard forgives
+void
+pgxc_print_pending_data(PGXCNodeHandle *handle, bool reset)
+{
     char       *msg;
     int32       ret;
     //DNConnectionState estate = 0;
@@ -1352,23 +1384,17 @@ get_message(PGXCNodeHandle *conn, int *len, char **msg)
  */
 void
 release_handles(bool force)
-{// #lizard forgives
-    bool        destroy = false;
-    int            i;
-    int             nbytes    = 0;    
-    if (!force)
-    {
-        if (HandlesInvalidatePending)
-        {
-            DoInvalidateRemoteHandles();
-            return;
-        }
-
-        /* don't free connection if holding a cluster lock */
-        if (cluster_ex_lock_held)
-        {
-            return;
-        }
+{
+	bool		destroy = false;
+	int			i;
+	int		 	nbytes	= 0;	
+	if (!force)
+	{
+		/* don't free connection if holding a cluster lock */
+		if (cluster_ex_lock_held)
+		{
+			return;
+		}
 
         if (datanode_count == 0 && coord_count == 0 && slavedatanode_count == 0)
         {
@@ -1391,7 +1417,7 @@ release_handles(bool force)
         {
             /*
              * Connections at this point should be completely inactive,
-             * otherwise abaandon them. We can not allow not cleaned up
+			 * otherwise abandon them. We can not allow not cleaned up
              * connection is returned to pool.
              */
             if (handle->state != DN_CONNECTION_STATE_IDLE ||
@@ -1412,34 +1438,33 @@ release_handles(bool force)
 #ifndef __USE_GLOBAL_SNAPSHOT__
         handle->sendGxidVersion = 0;
 #endif
-        nbytes = pgxc_node_is_data_enqueued(handle);
-        if (nbytes)
-        {
-            elog(PANIC, "Connection to Datanode %s has data %d pending",
-                     handle->nodename, nbytes);
-        }
-    }
-
-    
-    for (i = 0; i < NumSlaveDataNodes; i++)
-    {
-        PGXCNodeHandle *handle = &sdn_handles[i];
-        
-        if (handle->sock != NO_SOCKET)
-        {
-            /*
-             * Connections at this point should be completely inactive,
-             * otherwise abaandon them. We can not allow not cleaned up
-             * connection is returned to pool.
-             */
-            if (handle->state != DN_CONNECTION_STATE_IDLE ||
-                    handle->transaction_status != 'I')
-            {
-                destroy = true;
-                elog(DEBUG1, "Connection to Datanode %d has unexpected state %d and will be dropped",
-                     handle->nodeoid, handle->state);
-            }
-            
+		nbytes = pgxc_node_is_data_enqueued(handle);
+		if (nbytes)
+		{
+			elog(PANIC, "Connection to Datanode %s has data %d pending",
+					 handle->nodename, nbytes);
+		}
+	}
+	
+	for (i = 0; i < NumSlaveDataNodes; i++)
+	{
+		PGXCNodeHandle *handle = &sdn_handles[i];
+		
+		if (handle->sock != NO_SOCKET)
+		{
+			/*
+			 * Connections at this point should be completely inactive,
+			 * otherwise abandon them. We can not allow not cleaned up
+			 * connection is returned to pool.
+			 */
+			if (handle->state != DN_CONNECTION_STATE_IDLE ||
+					handle->transaction_status != 'I')
+			{
+				destroy = true;
+				elog(DEBUG1, "Connection to Datanode %d has unexpected state %d and will be dropped",
+					 handle->nodeoid, handle->state);
+			}
+			
 #ifdef _PG_REGRESS_
             elog(LOG, "release_handles release a connection with datanode %s"
                       "remote backend PID %d",
@@ -1500,8 +1525,7 @@ release_handles(bool force)
         }
     }
 
-	//destroy = true;
-    /* And finally release all the connections on pooler */
+	/* And finally release all the connections on pooler */
 	PoolManagerReleaseConnections(destroy);
 
     datanode_count = 0;
@@ -1510,10 +1534,72 @@ release_handles(bool force)
 }
 
 /*
+ * Reset all Datanode and Coordinator connections occupied memory.
+ */
+void
+reset_handles(void)
+{
+	int			i;
+
+	/* don't reset connection if holding a cluster lock */
+	if (cluster_ex_lock_held)
+	{
+		return;
+	}
+
+	if (datanode_count == 0 && coord_count == 0 && slavedatanode_count == 0)
+	{
+		return;
+	}
+
+	/* Do not reset connections if we have prepared statements on nodes */
+	if (HaveActiveDatanodeStatements())
+	{
+		return;
+	}
+
+	/* Reset Datanodes handles occupied memory */
+	for (i = 0; i < NumDataNodes; i++)
+	{
+		PGXCNodeHandle *handle = &dn_handles[i];
+
+		if (handle->sock != NO_SOCKET)
+		{
+			pgxc_node_init(handle, handle->sock, true, handle->backend_pid);
+		}
+	}
+
+	for (i = 0; i < NumSlaveDataNodes; i++)
+	{
+		PGXCNodeHandle *handle = &sdn_handles[i];
+
+		if (handle->sock != NO_SOCKET)
+		{
+			pgxc_node_init(handle, handle->sock, true, handle->backend_pid);
+		}
+	}
+
+	if (IS_PGXC_COORDINATOR)
+	{
+		/* Collect Coordinator handles */
+		for (i = 0; i < NumCoords; i++)
+		{
+			PGXCNodeHandle *handle = &co_handles[i];
+
+			if (handle->sock != NO_SOCKET)
+			{
+				pgxc_node_init(handle, handle->sock, true, handle->backend_pid);
+			}
+		}
+	}
+}
+
+/*
  * Check whether there bad connections to remote nodes when abort transactions.
  */
-bool validate_handles(void)
-{// #lizard forgives
+bool
+validate_handles(void)
+{
     int            i;    
     int            ret;
     
@@ -1986,6 +2072,10 @@ pgxc_node_send_parse(PGXCNodeHandle * handle, const char* statement,
     size_t        old_outEnd = handle->outEnd;
 #endif
 
+	ResponseCombiner	*combiner = handle->combiner;
+	bool				need_rewrite = false;
+	int					rewriteLen = 1;
+
     /* if there are parameters, param_types should exist */
     Assert(num_params <= 0 || param_types);
     /* 2 bytes for number of parameters, preceding the type names */
@@ -2005,8 +2095,8 @@ pgxc_node_send_parse(PGXCNodeHandle * handle, const char* statement,
         paramTypeLen += strlen(paramTypes[cnt_params]) + 1;
     }
 
-    /* size + stmtLen + strlen + paramTypeLen */
-    msgLen = 4 + stmtLen + strLen + paramTypeLen;
+	/* size + rewriteLen + stmtLen + strlen + paramTypeLen */
+	msgLen = 4 + rewriteLen + stmtLen + strLen + paramTypeLen;
 
     /* msgType + msgLen */
     if (ensure_out_buffer_capacity(handle->outEnd + 1 + msgLen, handle) != 0)
@@ -2020,6 +2110,7 @@ pgxc_node_send_parse(PGXCNodeHandle * handle, const char* statement,
     msgLen = htonl(msgLen);
     memcpy(handle->outBuffer + handle->outEnd, &msgLen, 4);
     handle->outEnd += 4;
+
     /* statement name */
     if (statement)
     {
@@ -2048,6 +2139,29 @@ pgxc_node_send_parse(PGXCNodeHandle * handle, const char* statement,
         pfree(paramTypes[cnt_params]);
     }
     pfree(paramTypes);
+
+	/*
+	 * If the extended query contains an insert sql command whose
+	 * distribute key's value is a function, we caculte the function
+	 * and rewrite the insert sql with the const result. So after send
+	 * the sql to datanode, it will be cached, However, the sql command
+	 * changes as the result of the function, so datanode should use
+	 * the new sql instead of cached sql. The we send a 'need_rewrite'
+	 * flag to tell the datanode to use new sql.
+	 */
+	if (IsA((combiner->ss.ps.plan), RemoteQuery))
+	{
+		RemoteQuery *plan = (RemoteQuery *)(combiner->ss.ps.plan);
+		ExecNodes *exec_nodes = plan->exec_nodes;
+		if (exec_nodes && exec_nodes->need_rewrite)
+		{
+			handle->outBuffer[handle->outEnd++] = 'Y';
+			need_rewrite = true;
+		}
+	}
+	if (!need_rewrite)
+		handle->outBuffer[handle->outEnd++] = 'N';
+
     Assert(old_outEnd + ntohl(msgLen) + 1 == handle->outEnd);
 
      return 0;
@@ -2059,7 +2173,7 @@ pgxc_node_send_parse(PGXCNodeHandle * handle, const char* statement,
 int
 pgxc_node_send_plan(PGXCNodeHandle * handle, const char *statement,
                     const char *query, const char *planstr,
-                    short num_params, Oid *param_types)
+					short num_params, Oid *param_types, int instrument_options)
 {
     int            stmtLen;
     int            queryLen;
@@ -2088,8 +2202,8 @@ pgxc_node_send_plan(PGXCNodeHandle * handle, const char *statement,
         paramTypes[i] = format_type_be(param_types[i]);
         paramTypeLen += strlen(paramTypes[i]) + 1;
     }
-    /* size + pnameLen + queryLen + parameters */
-    msgLen = 4 + queryLen + stmtLen + planLen + paramTypeLen;
+	/* size + pnameLen + queryLen + parameters + instrument_options */
+	msgLen = 4 + queryLen + stmtLen + planLen + paramTypeLen + 4;
 
     /* msgType + msgLen */
     if (ensure_out_buffer_capacity(handle->outEnd + 1 + msgLen, handle) != 0)
@@ -2129,6 +2243,10 @@ pgxc_node_send_plan(PGXCNodeHandle * handle, const char *statement,
         pfree(paramTypes[i]);
     }
     pfree(paramTypes);
+	/* instrument_options */
+	instrument_options = htonl(instrument_options);
+	memcpy(handle->outBuffer + handle->outEnd, &instrument_options, 4);
+	handle->outEnd += 4;
 
     handle->last_command = 'a';
 
@@ -2141,13 +2259,15 @@ pgxc_node_send_plan(PGXCNodeHandle * handle, const char *statement,
  */
 int
 pgxc_node_send_bind(PGXCNodeHandle * handle, const char *portal,
-                    const char *statement, int paramlen, char *params)
-{// #lizard forgives
+					const char *statement, int paramlen, const char *params,
+					int epqctxlen, const char *epqctx)
+{
     int            pnameLen;
     int            stmtLen;
     int         paramCodeLen;
     int         paramValueLen;
     int         paramOutLen;
+	int         epqCtxLen;
     int            msgLen;
 
     /* Invalid connection state, return error */
@@ -2164,8 +2284,10 @@ pgxc_node_send_bind(PGXCNodeHandle * handle, const char *portal,
     paramValueLen = paramlen ? paramlen : 2;
     /* size of output parameter codes array (always empty for now) */
     paramOutLen = 2;
+	/* size of epq context, 2 if not epq */
+	epqCtxLen = epqctxlen ? epqctxlen : 2;
     /* size + pnameLen + stmtLen + parameters */
-    msgLen = 4 + pnameLen + stmtLen + paramCodeLen + paramValueLen + paramOutLen;
+	msgLen = 4 + pnameLen + stmtLen + paramCodeLen + paramValueLen + paramOutLen + epqCtxLen;
 
     /* msgType + msgLen */
     if (ensure_out_buffer_capacity(handle->outEnd + 1 + msgLen, handle) != 0)
@@ -2212,6 +2334,17 @@ pgxc_node_send_bind(PGXCNodeHandle * handle, const char *portal,
     /* output parameter codes (none) */
     handle->outBuffer[handle->outEnd++] = 0;
     handle->outBuffer[handle->outEnd++] = 0;
+	/* output epq context */
+	if (epqctxlen)
+	{
+		memcpy(handle->outBuffer + handle->outEnd, epqctx, epqctxlen);
+		handle->outEnd += epqctxlen;
+	}
+	else
+	{
+		handle->outBuffer[handle->outEnd++] = 0;
+		handle->outBuffer[handle->outEnd++] = 0;
+	}
 
     handle->in_extended_query = true;
      return 0;
@@ -2410,7 +2543,8 @@ pgxc_node_send_sync(PGXCNodeHandle * handle)
 /*
  * Send logical apply message down to the Datanode
  */
-int pgxc_node_send_apply(PGXCNodeHandle * handle, char * buf, int len, bool ignore_pk_conflict)
+int
+pgxc_node_send_apply(PGXCNodeHandle * handle, char * buf, int len, bool ignore_pk_conflict)
 {
     int    msgLen = 0;
 
@@ -2459,7 +2593,7 @@ pgxc_node_send_query_extended(PGXCNodeHandle *handle, const char *query,
     if (query)
         if (pgxc_node_send_parse(handle, statement, query, num_params, param_types))
             return EOF;
-    if (pgxc_node_send_bind(handle, portal, statement, paramlen, params))
+	if (pgxc_node_send_bind(handle, portal, statement, paramlen, params, 0, NULL))
         return EOF;
     if (send_describe)
         if (pgxc_node_send_describe(handle, false, portal))
@@ -2991,8 +3125,6 @@ int
 pgxc_node_send_snapshot(PGXCNodeHandle *handle, Snapshot snapshot)
 {// #lizard forgives
     int            msglen PG_USED_FOR_ASSERTS_ONLY;
-    int            nval PG_USED_FOR_ASSERTS_ONLY;
-    int            i PG_USED_FOR_ASSERTS_ONLY;
 
     /* Invalid connection state, return error */
     if (handle->state != DN_CONNECTION_STATE_IDLE)
@@ -3211,7 +3343,10 @@ pgxc_node_send_timestamp(PGXCNodeHandle *handle, TimestampTz timestamp)
     /* Invalid connection state, return error */
     if (handle->state != DN_CONNECTION_STATE_IDLE)
     {
-        elog(WARNING, "pgxc_node_send_timestamp datanode:%u invalid stauts:%d, no need to send data, return NOW", handle->nodeoid, handle->state);
+		elog(WARNING,
+			"pgxc_node_send_timestamp datanode:%u invalid stauts:%d, "
+			"no need to send data, return NOW",
+			handle->nodeoid, handle->state);
         return EOF;
     }
 
@@ -3250,7 +3385,7 @@ pgxc_node_send_timestamp(PGXCNodeHandle *handle, TimestampTz timestamp)
 /*
  * Send the Coordinator info down to the PGXC node at the beginning of transaction,
  * In this way, Datanode can print this Coordinator info into logfile, 
- * and those infos can be found in Datanode logifile if needed during debugging
+ * and those infos can be found in Datanode logfile if needed during debugging
  */
 int
 pgxc_node_send_coord_info(PGXCNodeHandle * handle, int coord_pid, TransactionId coord_vxid)
@@ -3288,28 +3423,58 @@ pgxc_node_send_coord_info(PGXCNodeHandle * handle, int coord_pid, TransactionId 
 	return 0;
 }
 
-inline void pgxc_set_coordinator_proc_pid(int proc_pid)
+void
+pgxc_set_coordinator_proc_pid(int proc_pid)
 {
 	pgxc_coordinator_proc_pid = (IS_PGXC_COORDINATOR ? MyProcPid : proc_pid);
 }
 
-inline void pgxc_set_coordinator_proc_vxid(TransactionId proc_vxid)
+void
+pgxc_set_coordinator_proc_vxid(TransactionId proc_vxid)
 {
 	TransactionId lxid = (MyProc != NULL ? MyProc->lxid : InvalidTransactionId);
 
 	pgxc_coordinator_proc_vxid = (IS_PGXC_COORDINATOR ? lxid : proc_vxid);
 }
 
-inline int pgxc_get_coordinator_proc_pid(void)
+int
+pgxc_get_coordinator_proc_pid(void)
 {
 	return (IS_PGXC_COORDINATOR ? MyProcPid : pgxc_coordinator_proc_pid);
 }
 
-inline TransactionId pgxc_get_coordinator_proc_vxid(void)
+TransactionId
+pgxc_get_coordinator_proc_vxid(void)
 {
 	TransactionId lxid = (MyProc != NULL ? MyProc->lxid : InvalidTransactionId);
 
 	return (IS_PGXC_COORDINATOR ? lxid : pgxc_coordinator_proc_vxid);
+}
+
+int
+pgxc_node_send_sessionid(PGXCNodeHandle * handle)
+{
+	int	msgLen = 0;
+	
+	/* size + sessionid_str + '\0' */
+	msgLen = 4 + strlen(PGXCSessionId) + 1;
+	
+	/* msgType + msgLen */
+	if (ensure_out_buffer_capacity(handle->outEnd + 1 + msgLen, handle) != 0)
+	{
+		add_error_message(handle, "pgxc_node_send_sessionid out of memory");
+		return EOF;
+	}
+	
+	handle->outBuffer[handle->outEnd++] = 'o';		/* session id */
+	
+	msgLen = htonl(msgLen);
+	memcpy(handle->outBuffer + handle->outEnd, &msgLen, 4);
+	handle->outEnd += 4;
+	
+	memcpy(handle->outBuffer + handle->outEnd, PGXCSessionId, strlen(PGXCSessionId) + 1);
+	handle->outEnd += strlen(PGXCSessionId) + 1;
+	return 0;
 }
 #endif
 
@@ -3364,8 +3529,9 @@ add_error_message(PGXCNodeHandle *handle, const char *message)
     }
 }
 #ifdef __TBASE__
-void add_error_message_from_combiner(PGXCNodeHandle *handle, void *combiner_input)
-{// #lizard forgives
+void
+add_error_message_from_combiner(PGXCNodeHandle *handle, void *combiner_input)
+{
     ResponseCombiner *combiner;
 
     combiner = (ResponseCombiner*)combiner_input;
@@ -3523,7 +3689,7 @@ get_any_handle(List *datanodelist)
                     //char   *init_str = NULL;
                     List   *allocate = list_make1_int(node);
                     int       *pids;
-                    int    *fds = PoolManagerGetConnections(allocate, NIL,
+					int    *fds = PoolManagerGetConnections(allocate, NIL, true,
                             &pids);
                     PGXCNodeHandle        *node_handle;
 
@@ -3593,8 +3759,8 @@ get_any_handle(List *datanodelist)
  * Coordinator fds is returned only if transaction uses a DDL
  */
 PGXCNodeAllHandles *
-get_handles(List *datanodelist, List *coordlist, bool is_coord_only_query, bool is_global_session)
-{// #lizard forgives
+get_handles(List *datanodelist, List *coordlist, bool is_coord_only_query, bool is_global_session, bool raise_error)
+{
     PGXCNodeAllHandles    *result;
     ListCell        *node_list_item;
     List            *dn_allocate = NIL;
@@ -3772,7 +3938,7 @@ get_handles(List *datanodelist, List *coordlist, bool is_coord_only_query, bool 
     {
         int    j = 0;
         int *pids;
-        int    *fds = PoolManagerGetConnections(dn_allocate, co_allocate, &pids);
+		int	*fds = PoolManagerGetConnections(dn_allocate, co_allocate, raise_error, &pids);
 
         if (!fds)
         {
@@ -3835,6 +4001,13 @@ get_handles(List *datanodelist, List *coordlist, bool is_coord_only_query, bool 
                 }
 
                 node_handle = &dn_handles[node];
+				
+				if (be_pid == 0 && !raise_error)
+				{
+					PGXCNodeSetConnectionState(node_handle, DN_CONNECTION_STATE_ERROR_FATAL);
+					continue;
+				}
+				
                 pgxc_node_init(node_handle, fdsock, is_global_session, be_pid);
                 dn_handles[node] = *node_handle;
                 datanode_count++;
@@ -3850,6 +4023,30 @@ get_handles(List *datanodelist, List *coordlist, bool is_coord_only_query, bool 
                         is_global_session ? 'T' : 'F');
 #endif
 
+				if (IS_PGXC_COORDINATOR)
+				{
+					char nodetype = PGXC_NODE_DATANODE;
+					int nodeidx = PGXCNodeGetNodeId(node_handle->nodeoid, &nodetype);
+					if (PGXC_NODE_DATANODE != nodetype)
+					{
+						elog(ERROR, "Unexpected node type %c, name %s, index %d, "
+								"oid %d, max nodes %d", nodetype,
+								node_handle->nodename, nodeidx,
+								node_handle->nodeoid, NumDataNodes);
+					}
+					if (nodeidx < 0  || nodeidx >= NumDataNodes)
+					{
+						elog(ERROR, "Invalid datanode index %d, name %s, oid %d, "
+								"type %c, max nodes %d", nodeidx,
+								node_handle->nodename, node_handle->nodeoid,
+								nodetype, NumDataNodes);
+					}
+
+					InactivateDatanodeStatementOnNode(nodeidx);
+					elog(DEBUG5, "Inactivate statement on datanode %s, nodeidx %d, "
+							"oid %d, type %c, max nodes %d", node_handle->nodename,
+							nodeidx, node_handle->nodeoid, nodetype, NumDataNodes);
+				}
             }
         }
         /* Initialisation for Coordinators */
@@ -3869,6 +4066,13 @@ get_handles(List *datanodelist, List *coordlist, bool is_coord_only_query, bool 
                 }
 
                 node_handle = &co_handles[node];
+				
+				if (be_pid == 0 && !raise_error)
+				{
+					PGXCNodeSetConnectionState(node_handle, DN_CONNECTION_STATE_ERROR_FATAL);
+					continue;
+				}
+				
                 pgxc_node_init(node_handle, fdsock, is_global_session, be_pid);
                 co_handles[node] = *node_handle;
                 coord_count++;
@@ -3898,33 +4102,51 @@ get_handles(List *datanodelist, List *coordlist, bool is_coord_only_query, bool 
     return result;
 }
 
-PGXCNodeAllHandles *
-get_current_handles(void)
-{// #lizard forgives
+#ifdef __TBASE__
+static PGXCNodeAllHandles *
+get_empty_handles(void)
+{
     PGXCNodeAllHandles *result;
-    PGXCNodeHandle       *node_handle;
-    int                    i;
-
-    result = (PGXCNodeAllHandles *) palloc(sizeof(PGXCNodeAllHandles));
+    result = (PGXCNodeAllHandles *) palloc0(sizeof(PGXCNodeAllHandles));
     if (!result)
     {
         ereport(ERROR,
                 (errcode(ERRCODE_OUT_OF_MEMORY),
-                 errmsg("out of memory")));
+                        errmsg("out of memory")));
     }
 
-    result->primary_handle = NULL;
-    result->co_conn_count = 0;
-    result->dn_conn_count = 0;
+    return result;
+}
+#endif
 
-    result->datanode_handles = (PGXCNodeHandle **)
-                               palloc(NumDataNodes * sizeof(PGXCNodeHandle *));
-    if (!result->datanode_handles)
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_OUT_OF_MEMORY),
-                 errmsg("out of memory")));
-    }
+PGXCNodeAllHandles *
+get_current_handles(void)
+{
+#ifdef __TBASE__
+    PGXCNodeAllHandles *result = get_empty_handles();
+#else
+	PGXCNodeAllHandles *result;
+	PGXCNodeHandle	   *node_handle;
+	int					i;
+
+	result = (PGXCNodeAllHandles *) palloc0(sizeof(PGXCNodeAllHandles));
+	if (!result)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory")));
+	}
+#endif
+
+#ifndef __TBASE__
+	result->datanode_handles = (PGXCNodeHandle **)
+							   palloc(NumDataNodes * sizeof(PGXCNodeHandle *));
+	if (!result->datanode_handles)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory")));
+	}
 
     for (i = 0; i < NumDataNodes; i++)
     {
@@ -3942,17 +4164,93 @@ get_current_handles(void)
                  errmsg("out of memory")));
     }
 
-    for (i = 0; i < NumCoords; i++)
-    {
-        node_handle = &co_handles[i];
-        if (node_handle->sock != NO_SOCKET)
-            result->coord_handles[result->co_conn_count++] = node_handle;
-    }
+	for (i = 0; i < NumCoords; i++)
+	{
+		node_handle = &co_handles[i];
+		if (node_handle->sock != NO_SOCKET)
+			result->coord_handles[result->co_conn_count++] = node_handle;
+	}
+#else
+    get_current_cn_handles_internal(result);
+    get_current_dn_handles_internal(result);
+#endif
 
     return result;
 }
 
 #ifdef __TBASE__
+
+
+PGXCNodeAllHandles *
+get_current_cn_handles(void)
+{
+    PGXCNodeAllHandles *result = get_empty_handles();
+
+    get_current_cn_handles_internal(result);
+    return result;
+}
+
+PGXCNodeAllHandles *
+get_current_dn_handles(void)
+{
+    PGXCNodeAllHandles *result = get_empty_handles();
+
+    get_current_dn_handles_internal(result);
+    return result;
+}
+
+static void
+get_current_dn_handles_internal(PGXCNodeAllHandles *result)
+{
+    PGXCNodeHandle	   *node_handle;
+    int					i;
+
+    result->datanode_handles = (PGXCNodeHandle **)
+            palloc(NumDataNodes * sizeof(PGXCNodeHandle *));
+    if (!result->datanode_handles)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_OUT_OF_MEMORY),
+                        errmsg("out of memory")));
+    }
+
+    result->dn_conn_count = 0;
+    for (i = 0; i < NumDataNodes; i++)
+    {
+        node_handle = &dn_handles[i];
+        if (node_handle->sock != NO_SOCKET)
+        {
+            result->datanode_handles[result->dn_conn_count++] = node_handle;
+        }
+    }
+}
+
+static void
+get_current_cn_handles_internal(PGXCNodeAllHandles *result)
+{
+    PGXCNodeHandle	   *node_handle;
+    int					i;
+
+    result->coord_handles = (PGXCNodeHandle **)
+            palloc(NumCoords * sizeof(PGXCNodeHandle *));
+    if (!result->coord_handles)
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_OUT_OF_MEMORY),
+                        errmsg("out of memory")));
+    }
+
+    result->co_conn_count = 0;
+    for (i = 0; i < NumCoords; i++)
+    {
+        node_handle = &co_handles[i];
+        if (node_handle->sock != NO_SOCKET)
+        {
+            result->coord_handles[result->co_conn_count++] = node_handle;
+        }
+    }
+}
+
 PGXCNodeAllHandles *
 get_sock_fatal_handles(void)
 {
@@ -4025,18 +4323,28 @@ pfree_pgxc_all_handles(PGXCNodeAllHandles *pgxc_handles)
 #endif
 
     if (pgxc_handles->primary_handle)
+	{
         pfree(pgxc_handles->primary_handle);
+		pgxc_handles->primary_handle = NULL;
+	}
     if (pgxc_handles->datanode_handles)
+	{
         pfree(pgxc_handles->datanode_handles);
+		pgxc_handles->datanode_handles = NULL;
+	}
     if (pgxc_handles->coord_handles)
+	{
         pfree(pgxc_handles->coord_handles);
+		pgxc_handles->coord_handles = NULL;
+	}
 
     pfree(pgxc_handles);
+	pgxc_handles = NULL;
 }
 
 /* Do translation for non-main cluster */
-
-Oid PGXCGetLocalNodeOid(Oid nodeoid)
+Oid
+PGXCGetLocalNodeOid(Oid nodeoid)
 {
     
     if(false == IsPGXCMainCluster)
@@ -4054,7 +4362,8 @@ Oid PGXCGetLocalNodeOid(Oid nodeoid)
     return nodeoid;
 }
 
-Oid PGXCGetMainNodeOid(Oid nodeoid)
+Oid
+PGXCGetMainNodeOid(Oid nodeoid)
 {
 
     if(false == IsPGXCMainCluster)
@@ -4089,13 +4398,15 @@ PGXCNodeGetNodeId(Oid nodeoid, char *node_type)
     
     if (NULL == node_handles_hash)
     {
+		elog(DEBUG5, "node_handles_hash is null.");
         goto NOT_FOUND;
     }
-    nodeoid = PGXCGetLocalNodeOid(nodeoid);
     
+	nodeoid = PGXCGetLocalNodeOid(nodeoid);
     entry = (PGXCNodeHandlesLookupEnt *) hash_search(node_handles_hash, &nodeoid, HASH_FIND, &found);
     if (false == found)
     {
+		elog(DEBUG5, "node_handles_hash does not has %d", nodeoid);
         goto NOT_FOUND;
     }
 
@@ -4250,7 +4561,9 @@ paramlist_delete_param(List *param_list, const char *name)
 
        return param_list;
 }
-static ParamEntry * paramlist_get_paramentry(List *param_list, const char *name)
+
+static ParamEntry *
+paramlist_get_paramentry(List *param_list, const char *name)
 {
     ListCell   *cur_item;
 
@@ -4269,7 +4582,9 @@ static ParamEntry * paramlist_get_paramentry(List *param_list, const char *name)
 
     return NULL;
 }
-static ParamEntry * paramentry_copy(ParamEntry * src_entry)
+
+static ParamEntry *
+paramentry_copy(ParamEntry * src_entry)
 {
     ParamEntry *dst_entry = NULL;
     if (src_entry)
@@ -4492,11 +4807,23 @@ get_set_command(List *param_list, StringInfo command, bool local)
             {
                 search_path_value[index++] = '"';
             }
+
+			if ((char *) strstr(search_path_value, "public") ||
+				(char *) strstr(search_path_value, "PUBLIC"))
+			{
             appendStringInfo(command, "SET %s %s TO %s;", local ? "LOCAL" : "",
              NameStr(entry->name), search_path_value);
         }
         else
         {
+				appendStringInfo(command, "SET %s %s TO %s, public;", local ? "LOCAL" : "",
+					NameStr(entry->name), search_path_value);
+			}
+
+			elog(DEBUG5, "get_set_command: %s", command->data);
+		}
+		else
+		{
             appendStringInfo(command, "SET %s %s TO %s;", local ? "LOCAL" : "",
              NameStr(entry->name), value);
         }
@@ -4506,7 +4833,7 @@ get_set_command(List *param_list, StringInfo command, bool local)
 
 /*
  * Returns SET commands needed to initialize remote session.
- * The command may already be biult and valid, return it right away if the case.
+ * The command may already be built and valid, return it right away if the case.
  * Otherwise build it up.
  * To support Distributed Session machinery coordinator should generate and
  * send a distributed session identifier to remote nodes. Generate it here.
@@ -4533,8 +4860,11 @@ PGXCNodeGetSessionParamStr(void)
     if (session_params->len == 0)
     {
         if (IS_PGXC_COORDINATOR)
+		{
             appendStringInfo(session_params, "SET global_session TO %s_%d;",
                              PGXCNodeName, MyProcPid);
+		}
+
         get_set_command(session_param_list, session_params, false);
         appendStringInfo(session_params, "SET parentPGXCPid TO %d;",
                              MyProcPid);
@@ -4545,7 +4875,7 @@ PGXCNodeGetSessionParamStr(void)
 
 /*
  * Returns SET commands needed to initialize transaction on a remote session.
- * The command may already be biult and valid, return it right away if the case.
+ * The command may already be built and valid, return it right away if the case.
  * Otherwise build it up.
  */
 char *
@@ -4688,12 +5018,16 @@ DoInvalidateRemoteHandles(void)
 {
     bool            result = false;
 
-    HandlesInvalidatePending = false;
-    HandlesRefreshPending = false;
+	HOLD_INTERRUPTS();
 
-    InitMultinodeExecutor(true);
+	InitMultinodeExecutor(true);
 
-    return result;
+	HandlesInvalidatePending = false;
+	HandlesRefreshPending = false;
+
+	RESUME_INTERRUPTS();
+
+	return result;
 }
 
 /*
@@ -4706,6 +5040,8 @@ DoRefreshRemoteHandles(void)
     Oid                *coOids, *dnOids, *sdnOids;
     int                numCoords, numDNodes, numSlaveDNodes, total_nodes;
     bool            res = true;
+
+	HOLD_INTERRUPTS();
 
     HandlesRefreshPending = false;
 
@@ -4857,6 +5193,8 @@ DoRefreshRemoteHandles(void)
     list_free(added);
     list_free(deleted);
 
+	RESUME_INTERRUPTS();
+
     return res;
 }
 
@@ -4974,8 +5312,16 @@ PgxcNodeDiffBackendHandles(List **nodes_alter,
         Oid nodeoid;
         char ntype = PGXC_NODE_NONE;
 
-        if(enable_multi_cluster && strcmp(NameStr(nodeForm->node_cluster_name), PGXCClusterName))
+		if (enable_multi_cluster &&
+			strcmp(NameStr(nodeForm->node_cluster_name), PGXCClusterName))
+		{
+			continue;
+		}
+
+		if (PGXC_NODE_GTM == nodeForm->node_type)
+		{
             continue;
+		}
         
         nodeoid = HeapTupleGetOid(tuple);
         catoids = lappend_oid(catoids, nodeoid);
@@ -5186,9 +5532,11 @@ PGXCNodeSendShowQuery(NODE_CONNECTION *conn, const char *sql_command)
     resStatus = PQresultStatus(result);
     if (resStatus == PGRES_TUPLES_OK || resStatus == PGRES_COMMAND_OK)
     {           
-        snprintf(number, 128, "%s", PQgetvalue(result, 0, 0));            
+		/* ignore unit */
+		snprintf(number, result->tuples[0][0].len, "%s", PQgetvalue(result, 0, 0));
     }    
     PQclear(result);    
+
     return number;
 }
 
@@ -5251,7 +5599,8 @@ PGXCNodeSendSetQuery(NODE_CONNECTION *conn, const char *sql_command, char *errms
     return error ? -1 : 0;
 }
 
-bool node_ready_for_query(PGXCNodeHandle *conn) 
+bool
+node_ready_for_query(PGXCNodeHandle *conn) 
 {
     return ('Z' == (conn)->last_command);
 }
@@ -5430,7 +5779,8 @@ void PGXCGetCoordOidOthers(Oid **nodelist)
 
 }
 
-void PGXCGetAllDnOid(Oid *nodelist)
+void
+PGXCGetAllDnOid(Oid *nodelist)
 {
     Oid     node_oid;
     int     i;
@@ -5445,4 +5795,77 @@ void PGXCGetAllDnOid(Oid *nodelist)
 
 }
 
+#ifdef __TBASE__
+/*
+ * Return the name of ascii-minimized coordinator as ddl leader cn
+ */
+inline char*
+find_ddl_leader_cn(void)
+{
+    int i = 0;
+    char* result = NULL;
+
+    for (i = 0; i < NumCoords; i++)
+    {
+        if(result == NULL || strcmp(co_handles[i].nodename, result) < 0)
+        {
+            result = co_handles[i].nodename;
+        }
+    }
+
+    if(result)
+        result = pstrdup(result);
+
+    return result;
+}
+
+/*
+ * Return whether I am the leader cn
+ */
+inline bool
+is_ddl_leader_cn(char *first_cn)
+{
+    if(first_cn == NULL)
+        return false;
+
+    return strcmp(first_cn, PGXCNodeName) == 0;
+}
+#endif
+
+/*
+ * SerializeSessionId
+ *		Dumps the serialized session id onto the memory location at 
+ *		start_address for parallel workers
+ */
+void
+SerializeSessionId(Size maxsize, char *start_address)
+{
+	
+	if(PGXCSessionId[0] == '\0')
+	{
+		*(int *) start_address = 0;
+	}
+	else
+	{
+		int len = strlen(PGXCSessionId) + 1;
+		
+		*(int *) start_address = len;
+		memcpy(start_address + sizeof(int), PGXCSessionId, len);
+	}
+}
+
+/*
+ * StartParallelWorkerSessionId
+ *		Reads the serialized session id and set it on parallel workers
+ */
+void
+StartParallelWorkerSessionId(char *address)
+{
+	char *sidspace = address + sizeof(int);
+	
+	if (*(int *) address == 0) /* len */
+		PGXCSessionId[0] = '\0';
+	else
+		strncpy((char *) PGXCSessionId, sidspace, NAMEDATALEN);
+}
 #endif

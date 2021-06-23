@@ -550,6 +550,20 @@ typedef struct AggStatePerHashData
     Agg           *aggnode;        /* original Agg node, for numGroups etc. */
 }            AggStatePerHashData;
 
+#ifdef __TBASE__
+/*
+ * used in ReDistributeInitializeDSM and ReDistributeInitializeWorker
+ * to distinguish keys between shared memory for parallel and
+ * shared memory for redistributed optimization, for parallel it's
+ * plan_node_id the same as PG, for redistributed optimization, we
+ * use plan_node_id + this macro
+ *
+ * Node: refer to execParallel.c, only the first 4 bits been occupied
+ * for specific use, now we have to use an extra bit, but it's fine
+ * since plan_node_id is only a 32bit integer.
+ */
+#define PARALLEL_REDISTRIBUTE_OFFSET UINT64CONST(0xE800000000000000)
+#endif
 
 static void select_current_set(AggState *aggstate, int setno, bool is_hash);
 static void initialize_phase(AggState *aggstate, int newphase);
@@ -3394,65 +3408,71 @@ agg_retrieve_direct(AggState *aggstate)
  */
 static void
 agg_fill_hash_table(AggState *aggstate)
-{// #lizard forgives
+{
     TupleTableSlot *outerslot;
     ExprContext *tmpcontext = aggstate->tmpcontext;
 #ifdef __TBASE__
-    AttrNumber varattno = 0;
-    Oid           dataType = 0;
-    aggstate->tmpcxt    = NULL;
-    
+    AttrNumber varattno = InvalidAttrNumber;
+    Oid                dataType = InvalidOid;
+
+    aggstate->tmpcxt = NULL;
+
+    /* get the redistribution hashfunc for parallel execution */
     if (IsParallelWorker() && aggstate->state)
     {
-        AttrNumber group_col = 0;
-        TargetEntry *en      = NULL;
+        AttrNumber group_col = InvalidAttrNumber;
+        TargetEntry *tle      = NULL;
             
         if (aggstate->aggstrategy != AGG_HASHED || 
             list_length(aggstate->all_grouped_cols) == 0)
         {
-            elog(ERROR, "mismatch plan while ReDistribute-Data.");
+            elog(ERROR, "plan mismatched while redistributing data across "
+                          "parallel workers.");
         }
         
-        /* get first groupby column in targetlist */
+        /*
+        * all_grouped_cols was sorted by AttributeNum in descending order, get
+        * first group-by column in targetlist .
+        *
+        * TODO: choose column with better distribution to avoid data skew
+        * within parallel workers
+        */
         group_col = llast_int(aggstate->all_grouped_cols);
 
         if (group_col < 1)
         {
-            elog(ERROR, "group column AttrNumber is smaller than 1.");
+            elog(ERROR, "invalid group by AttrNumber %d found while "
+                         "redistributing data across parallel workers.", group_col);
         }
 
-        /* get the groupby column's datatype and AttrNumber of input from outer plan */
-        en = (TargetEntry *)lfirst(list_nth_cell(aggstate->ss.ps.plan->lefttree->targetlist, group_col - 1));
+		/*
+		 * get DataType and AttrNumber of the redistribution group-by column
+		 * from outer plan
+		 */
+		tle = (TargetEntry *) lfirst(list_nth_cell(
+				   aggstate->ss.ps.plan->lefttree->targetlist, group_col - 1));
 
-        if (IsA(en->expr, Var))
-        {
-            Var *var = (Var *)en->expr;
+		dataType = exprType((Node*) tle->expr);
+		varattno = group_col;
 
-            dataType = var->vartype;
-            varattno = group_col;
+		aggstate->hashfunc = hash_func_ptr(dataType);
+		aggstate->dataType = dataType;
 
-            aggstate->hashfunc = hash_func_ptr(dataType);
-            aggstate->dataType = dataType;
+		/* could not find hash function for given data type */
+		if (!aggstate->hashfunc)
+		{
+			elog(ERROR, "could not find hash function for given data type:%u",
+					dataType);
+		}
 
-            /* could not find hash function for given data type */
-            if (!aggstate->hashfunc)
-            {
-                elog(ERROR, "could not find hash function for given data type:%u", dataType);
-            }
-        }
-        else
-        {
-            elog(ERROR, "could not get AttrNumber and data type of group column.");
-        }
+		/* initialize resources */
+		InitializeReDistribute(aggstate->state, &aggstate->file);
 
-        /* initialize resources */
-        InitializeReDistribute(aggstate->state, &aggstate->file);
+		aggstate->tmpcxt = AllocSetContextCreate(CurrentMemoryContext,
+												 "ExecAgg temp memoryContext",
+												 ALLOCSET_DEFAULT_SIZES);
 
-        aggstate->tmpcxt = AllocSetContextCreate(CurrentMemoryContext,
-                                             "ExecAgg temp memoryContext",
-                                             ALLOCSET_DEFAULT_SIZES);
-
-        elog(LOG, "worker:%d redistributed in HashAgg.", ParallelWorkerNumber);
+		elog(LOG, "worker:%d redistributed in HashAgg.", ParallelWorkerNumber);
     }
 #endif
 
@@ -5424,20 +5444,21 @@ ReDistributeInitializeDSM(PlanState *node, ParallelContext *pcxt)
         state->buf[i]->dataType      = DT_None;
     }
     
-    shm_toc_insert(pcxt->toc, node->plan->plan_node_id, state);
+	shm_toc_insert(pcxt->toc, node->plan->plan_node_id + PARALLEL_REDISTRIBUTE_OFFSET, state);
     *state_ptr = state;
 }
 
 void
-ReDistributeInitializeWorker(PlanState *node, shm_toc *toc)
+ReDistributeInitializeWorker(PlanState *node, ParallelWorkerContext *pwcxt)
 {
     int offset = 0;
     int i = 0;
+	shm_toc *toc = pwcxt->toc;
     ReDistributeState *state = NULL;
     ReDistributeState *rd_state = NULL;
     volatile ParallelWorkerStatus *numParallelWorkers = NULL;
 
-    state = shm_toc_lookup(toc, node->plan->plan_node_id, false);
+	state = shm_toc_lookup(toc, node->plan->plan_node_id + PARALLEL_REDISTRIBUTE_OFFSET, false);
     numParallelWorkers = GetParallelWorkerStatusInfo(toc);
 
     rd_state = (ReDistributeState *)palloc0(sizeof(ReDistributeState));
@@ -6039,7 +6060,7 @@ READ_LENGTH:
         }
         else
         {
-            data = (char *)palloc0(nread);
+			data = (char *)palloc0(dataLen);
         }
     
 READ_DATA:
@@ -6116,16 +6137,19 @@ ReDistributeHash(Oid dataType, int numWorkers, Datum value, LocatorHashFunc hash
                 int64 val = DatumGetInt64(value);
                 result = (val % num) % numWorkers;
             }
+			break;
         case INT2OID:
             {
                 int16 val = DatumGetInt16(value);
                 result = (val % num) % numWorkers;
             }
+			break;
         case OIDOID:
             {
                 uint32 val = (uint32)DatumGetObjectId(value);
                 result = (val % num) % numWorkers;
             }
+			break;
         case INT4OID:
         case ABSTIMEOID:
         case RELTIMEOID:
@@ -6134,12 +6158,14 @@ ReDistributeHash(Oid dataType, int numWorkers, Datum value, LocatorHashFunc hash
                 int32 val = DatumGetInt32(value);
                 result = (val % num) % numWorkers;
             }
+			break;
         case BOOLOID:
         case CHAROID:
             {
                 int32 val = (int32)DatumGetChar(value);
                 result = (val % num) % numWorkers;
             }
+			break;
         case TIMEOID:
         case TIMESTAMPOID:
         case TIMESTAMPTZOID:
@@ -6147,6 +6173,7 @@ ReDistributeHash(Oid dataType, int numWorkers, Datum value, LocatorHashFunc hash
                 int64 val = DatumGetInt64(value);
                 result = (val % num) % numWorkers;
             }
+			break;
         default:
             {
                 unsigned int hashvalue = 0;
